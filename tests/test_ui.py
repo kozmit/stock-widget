@@ -337,8 +337,7 @@ class MainWindowTests(AppTestCase):
         self.ctl.quotes.pop("AAPL")
         self.ctl.changed.emit()
         card = self.main.cards["AAPL"]
-        self.assertTrue(card.day.isHidden())
-        self.assertTrue(card.pos.isHidden())
+        self.assertEqual((card.price.text(), card.day.text(), card.pl.text()), ("", "", ""))
 
     def test_negative_change_uses_down_arrow(self):
         self.ctl.quotes["AAPL"]["change_pct"] = -2.0
@@ -347,19 +346,48 @@ class MainWindowTests(AppTestCase):
 
     def test_card_shows_position_and_profit_only_when_held(self):
         card = self.main.cards["AAPL"]
-        self.assertTrue(card.pos.isHidden())
+        self.assertEqual((card.shares.text(), card.pl.text(), card.amount.text()), ("", "", ""))
         self.ctl.record_trade("AAPL", "buy", 10, 80, 0, TODAY)
-        self.assertFalse(card.pos.isHidden())
-        self.assertEqual(card.pos.text(), "10 Stk · +25.00 %")
-        self.assertTrue(self.main.cards["MSFT"].pos.isHidden())
+        self.assertEqual((card.shares.text(), card.pl.text(), card.amount.text()), ("10", "+25.00 %", "+200.00"))
+        self.assertEqual(self.main.cards["MSFT"].shares.text(), "")
 
     def test_card_shows_next_event(self):
         self.ctl.events["AAPL"] = [(TODAY + dt.timedelta(days=5), "Ex-Dividende")]
         self.ctl.changed.emit()
-        self.assertTrue(self.main.cards["AAPL"].sub.text().startswith("Ex-Div."))
+        self.assertTrue(self.main.cards["AAPL"].event.text().startswith("Ex-Div."))
         self.ctl.events["MSFT"] = []
         self.ctl.changed.emit()
-        self.assertEqual(self.main.cards["MSFT"].sub.text(), "kein Termin")
+        self.assertEqual(self.main.cards["MSFT"].event.text(), "kein Termin")
+
+    def symbols_on_screen(self):
+        """Die Zeilen in der Reihenfolge, in der sie im Layout stehen."""
+        cards = [self.main.list.itemAt(i).widget() for i in range(self.main.list.count())]
+        return [c.symbol for c in cards if isinstance(c, w.StockCard)]
+
+    def test_each_column_sorts_ascending_then_descending(self):
+        self.ctl.quotes["AAPL"]["price"], self.ctl.quotes["MSFT"]["price"], self.ctl.quotes["DELL"]["price"] = 30, 10, 20
+        self.ctl.changed.emit()
+        self.main.heads["price"].click()
+        self.assertEqual(self.symbols_on_screen(), ["MSFT", "DELL", "AAPL"])
+        self.main.heads["price"].click()
+        self.assertEqual(self.symbols_on_screen(), ["AAPL", "DELL", "MSFT"])
+        self.main.heads["symbol"].click()
+        self.assertEqual(self.symbols_on_screen(), ["AAPL", "DELL", "MSFT"])
+
+    def test_empty_cells_sort_last_in_both_directions(self):
+        self.ctl.record_trade("DELL", "buy", 10, 80, 0, TODAY)
+        self.main.heads["pl"].click()
+        self.assertEqual(self.symbols_on_screen()[0], "DELL")
+        self.main.heads["pl"].click()
+        self.assertEqual(self.symbols_on_screen()[0], "DELL")
+
+    def test_sort_survives_refresh_and_marks_the_active_header(self):
+        self.main.heads["symbol"].click()
+        self.main.heads["symbol"].click()
+        self.ctl.changed.emit()
+        self.assertEqual(self.symbols_on_screen(), ["MSFT", "DELL", "AAPL"])
+        self.assertTrue(self.main.heads["symbol"].text().endswith("▼"))
+        self.assertEqual(self.main.heads["price"].text(), "Kurs")
 
     def test_removed_symbol_loses_its_card_and_empty_hint_appears_at_the_end(self):
         for symbol in list(self.ctl.symbols):
@@ -662,13 +690,35 @@ class AddSymbolUiTests(AppTestCase):
         self.main = w.MainWindow(self.ctl)
 
     def add(self, text):
-        self.main.entry.setText(text)
-        self.main.add_symbol()
+        self.main.add_symbol(text)
 
-    def test_entry_is_cleared_and_asks_for_symbol_or_name(self):
-        self.assertIn("Name", self.main.entry.placeholderText())
-        self.add("ORA.US")
-        self.assertEqual(self.main.entry.text(), "")
+    def test_plus_button_opens_a_small_dialog_that_adds_the_symbol(self):
+        self.main.add_button.click()
+        dialog = self.main.add_dialog
+        dialog.entries[0].setText("NVDA")
+        dialog.submit()
+        self.assertFalse(dialog.isVisible())
+        self.assertTrue(wait_until(lambda: self.main.status.text() == "NVDA gefunden"))
+
+    def test_plus_dialog_is_not_modal_so_other_windows_stay_usable(self):
+        self.main.add_button.click()
+        dialog = self.main.add_dialog
+        self.assertTrue(dialog.isVisible())
+        self.assertFalse(dialog.isModal())
+        self.assertIsNone(QApplication.activeModalWidget())
+        self.main.add_button.click()  # kein zweiter Dialog
+        self.assertIs(self.main.add_dialog, dialog)
+        dialog.reject()
+        self.assertNotIn(dialog, w.Dock.windows)
+
+    def test_plus_dialog_rejects_empty_input_and_stays_open(self):
+        self.main.add_button.click()
+        dialog = self.main.add_dialog
+        dialog.submit()
+        self.assertFalse(dialog.error.isHidden())
+        self.assertTrue(dialog.isVisible())
+        dialog.reject()
+        self.assertEqual(self.ctl.symbols, ["AAPL", "MSFT", "DELL"])
 
     def test_status_line_shows_found_after_adding(self):
         self.add("NVDA")

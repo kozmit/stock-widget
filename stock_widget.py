@@ -28,7 +28,7 @@ STYLE = f"""
 * {{ font-family: "Segoe UI Variable Text", "Segoe UI"; font-size: 13px; color: {TEXT}; }}
 QLabel {{ background: transparent; }}
 QFrame#panel {{ background: {BG}; border: 1px solid #2b2f3d; border-radius: 20px; }}
-QFrame#card {{ background: {SURFACE}; border-radius: 16px; }}
+QFrame#card {{ background: {SURFACE}; border-radius: 10px; }}
 QFrame#card:hover {{ background: {SURFACE2}; }}
 QFrame#plain {{ background: {SURFACE}; border-radius: 16px; }}
 QWidget#clear {{ background: transparent; }}
@@ -44,6 +44,8 @@ QPushButton#icon {{ background: transparent; border-radius: 12px; padding: 0; mi
                     min-height: 30px; max-height: 30px; color: {MUTED}; font-size: 14px; }}
 QPushButton#icon:hover {{ background: {SURFACE2}; color: {TEXT}; }}
 QPushButton#icon:checked {{ color: {ACCENT}; }}
+QPushButton#head {{ background: transparent; border-radius: 6px; padding: 2px 0; color: {MUTED}; font-size: 10px; font-weight: 700; }}
+QPushButton#head:hover {{ color: {TEXT}; }}
 QPushButton#option {{ text-align: left; padding: 11px 16px; background: {SURFACE}; font-weight: 600; }}
 QPushButton#option:hover {{ background: {SURFACE2}; }}
 QPushButton#option:focus {{ border: 1px solid {ACCENT}; }}
@@ -426,10 +428,10 @@ class Controller(QObject):
 class FieldDialog(QDialog):
     """Dialog mit Zahlenfeldern. apply(werte) darf ValueError werfen; die Meldung erscheint im Dialog."""
 
-    def __init__(self, title, intro, fields, apply=lambda values: None, ok_text="OK", cancel=True):
+    def __init__(self, title, intro, fields, apply=lambda values: None, ok_text="OK", cancel=True, modal=True):
         super().__init__()
         self.apply = apply
-        self.setModal(True)
+        self.setModal(modal)
         body = make_panel(self, title, self.reject, always_on_top=True)
         intro_label = QLabel(intro)
         intro_label.setWordWrap(True)
@@ -510,6 +512,12 @@ class FieldDialog(QDialog):
         accepted = bool(self.exec())
         Dock.remove(self)
         return accepted
+
+    def show_docked(self):
+        """Zeigt den Dialog, ohne die übrigen Fenster zu sperren (für modal=False)."""
+        Dock.add(self)
+        self.finished.connect(lambda _: Dock.remove(self))
+        self.show()
 
 
 class ChoiceDialog(QDialog):
@@ -603,64 +611,78 @@ def trade_dialog(ctl, symbol, mode):
 
 # ---------- Hauptfenster ----------
 
+# Spalten der Watchlist: Schlüssel, Überschrift, Breite (None = nimmt den Rest) und Ausrichtung
+COLUMNS = (
+    ("symbol", "Symbol", 70, Qt.AlignLeft),
+    ("price", "Kurs", 62, Qt.AlignRight),
+    ("day", "Tag", 74, Qt.AlignRight),
+    ("shares", "Stk", 44, Qt.AlignRight),
+    ("pl", "G/V %", 74, Qt.AlignRight),
+    ("amount", "G/V", 80, Qt.AlignRight),
+    ("event", "Termin", None, Qt.AlignLeft),
+)
+ROW_MARGINS = (12, 0, 12, 0)
+ROW_SPACING = 8
+
+
 class StockCard(QFrame):
+    """Eine Zeile der Watchlist; jede Spalte steht in einem eigenen Label mit fester Breite."""
     clicked = Signal(str)
     menu_requested = Signal(str)
 
     def __init__(self, symbol):
         super().__init__()
         self.symbol = symbol
+        self.values = {"symbol": symbol}  # Sortierwerte je Spalte; None = leer, kommt beim Sortieren ans Ende
         self.setObjectName("card")
         self.setCursor(Qt.PointingHandCursor)
+        self.setFixedHeight(32)
         row = QHBoxLayout(self)
-        row.setContentsMargins(16, 12, 14, 12)
-
-        left = QVBoxLayout()
-        left.setSpacing(2)
-        title = QLabel(symbol)
-        title.setStyleSheet("font-size: 16px; font-weight: 700;")
-        self.sub = QLabel("…")
-        self.sub.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
-        left.addWidget(title)
-        left.addWidget(self.sub)
-        row.addLayout(left)
-        row.addStretch()
-
-        right = QVBoxLayout()
-        right.setSpacing(5)
-        self.price = QLabel("…")
-        self.price.setAlignment(Qt.AlignRight)
-        self.price.setStyleSheet("font-size: 16px; font-weight: 700;")
-        pills = QHBoxLayout()
-        pills.setSpacing(6)
-        pills.addStretch()
-        self.day = QLabel()
-        self.pos = QLabel()
-        pills.addWidget(self.day)
-        pills.addWidget(self.pos)
-        right.addWidget(self.price)
-        right.addLayout(pills)
-        row.addLayout(right)
+        row.setContentsMargins(*ROW_MARGINS)
+        row.setSpacing(ROW_SPACING)
+        self.labels = {}
+        for key, _, width, align in COLUMNS:
+            label = QLabel()
+            label.setAlignment(align | Qt.AlignVCenter)
+            if width:
+                label.setFixedWidth(width)
+            self.labels[key] = label
+            row.addWidget(label, 0 if width else 1)
+        self.price, self.day = self.labels["price"], self.labels["day"]
+        self.shares, self.pl = self.labels["shares"], self.labels["pl"]
+        self.amount, self.event = self.labels["amount"], self.labels["event"]
+        self.labels["symbol"].setText(symbol)
+        self.labels["symbol"].setStyleSheet("font-weight: 700;")
+        self.price.setStyleSheet("font-weight: 700;")
+        self.event.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
 
     def set_data(self, quote, position, events):
         if events:
-            self.sub.setText(sd.format_event(events[0], short=True))
+            self.event.setText(sd.format_event(events[0], short=True))
+            self.values["event"] = events[0][0]
         else:
-            self.sub.setText("kein Termin" if events is not None else "…")
-        self.pos.hide()
-        self.day.hide()
+            self.event.setText("kein Termin" if events is not None else "…")
+            self.values["event"] = None
+        for key in ("price", "day", "shares", "pl", "amount"):
+            self.labels[key].setText("")
+            self.values[key] = None
         if not quote:
             return
         self.price.setText(f"{quote['price']:.2f}")
+        self.values["price"] = quote["price"]
         change = quote["change_pct"]
         self.day.setText(f"{arrow(change)} {change:+.2f} %")
-        style_pill(self.day, sign_color(change))
-        self.day.show()
+        self.day.setStyleSheet(f"color: {sign_color(change)}; font-weight: 600;")
+        self.values["day"] = change
         if position:
             pl = sd.pl_percent(position, quote["price"])
-            self.pos.setText(f"{position['shares']:g} Stk · {pl:+.2f} %")
-            style_pill(self.pos, sign_color(pl), strong=True)
-            self.pos.show()
+            amount = sd.pl_amount(position, quote["price"])
+            self.shares.setText(f"{position['shares']:g}")
+            self.pl.setText(f"{pl:+.2f} %")
+            self.pl.setStyleSheet(f"color: {sign_color(pl)}; font-weight: 600;")
+            self.amount.setText(f"{amount:+.2f}")
+            self.amount.setStyleSheet(f"color: {sign_color(amount)};")
+            self.values.update(shares=position["shares"], pl=pl, amount=amount)
 
     def flash(self, color):
         flash(self, color)
@@ -679,8 +701,10 @@ class MainWindow(QWidget):
         self.ctl = ctl
         self.cards = {}
         self.details = {}
+        self.add_dialog = None
+        self.sort_key, self.sort_desc = None, False  # None = Reihenfolge der Watchlist
 
-        self.pin = QPushButton("◉")
+        self.pin =QPushButton("◉")
         self.pin.setObjectName("icon")
         self.pin.setCheckable(True)
         self.pin.setChecked(PIN["on"])
@@ -688,21 +712,33 @@ class MainWindow(QWidget):
         self.pin.setCursor(Qt.PointingHandCursor)
         self.pin.clicked.connect(self.toggle_pin)
 
-        body = make_panel(self, "Watchlist", self.hide_docked, extras=[self.pin])
-        add_row = QHBoxLayout()
-        self.entry = QLineEdit()
-        self.entry.setPlaceholderText("Kürzel oder Name, z. B. AAPL")
-        self.entry.returnPressed.connect(self.add_symbol)
-        add = QPushButton("Hinzufügen")
-        add.setObjectName("primary")
-        add.setCursor(Qt.PointingHandCursor)
-        add.clicked.connect(self.add_symbol)
-        add_row.addWidget(self.entry)
-        add_row.addWidget(add)
-        body.addLayout(add_row)
+        self.add_button = QPushButton("+")
+        self.add_button.setObjectName("icon")
+        self.add_button.setToolTip("Aktie hinzufügen")
+        self.add_button.setCursor(Qt.PointingHandCursor)
+        self.add_button.clicked.connect(self.ask_symbol)
+
+        body = make_panel(self, "Watchlist", self.hide_docked, extras=[self.add_button, self.pin])
+
+        self.header = QWidget()
+        header = QHBoxLayout(self.header)
+        header.setContentsMargins(ROW_MARGINS[0], 0, ROW_MARGINS[2] + 12, 0)  # 12 = Rand und Scrollleiste rechts
+        header.setSpacing(ROW_SPACING)
+        self.heads = {}
+        for key, title, width, align in COLUMNS:
+            button = QPushButton(title)
+            button.setObjectName("head")
+            button.setCursor(Qt.PointingHandCursor)
+            button.setToolTip("Nach dieser Spalte sortieren")
+            if width:
+                button.setFixedWidth(width)
+            button.clicked.connect(lambda _=False, k=key: self.sort_by(k))
+            self.heads[key] = button
+            header.addWidget(button, 0 if width else 1)
+        body.addWidget(self.header)
 
         self.area, self.list = scroll_area()
-        self.empty = QLabel("Noch keine Aktien.\nOben ein Kürzel oder einen Namen eingeben.")
+        self.empty = QLabel("Noch keine Aktien.\nMit + oben ein Kürzel oder einen Namen eingeben.")
         self.empty.setAlignment(Qt.AlignCenter)
         self.empty.setStyleSheet(f"color: {MUTED};")
         self.list.addWidget(self.empty)
@@ -714,7 +750,7 @@ class MainWindow(QWidget):
         body.addWidget(self.status)
 
         screen = QApplication.primaryScreen().availableGeometry()
-        self.setFixedSize(420, min(640, screen.height() - 20))
+        self.setFixedSize(600, min(640, screen.height() - 20))
 
         ctl.changed.connect(self.sync)
         ctl.status.connect(self.status.setText)
@@ -735,9 +771,26 @@ class MainWindow(QWidget):
         PIN["on"] = self.pin.isChecked()
         apply_pin()
 
-    def add_symbol(self):
-        text = self.entry.text()
-        self.entry.clear()
+    def ask_symbol(self):
+        """Kleiner Dialog mit Eingabefeld, nicht modal: die anderen Fenster bleiben bedienbar.
+        Das Hinzufügen selbst läuft in add_symbol."""
+        if self.add_dialog is not None and self.add_dialog.isVisible():
+            self.add_dialog.raise_()
+            self.add_dialog.activateWindow()
+            return
+
+        def parse(text):
+            text = text.strip()
+            if not text:
+                raise ValueError("Bitte ein Kürzel oder einen Namen eingeben.")
+            return text
+
+        self.add_dialog = FieldDialog("Aktie hinzufügen", "Kürzel oder Name, z. B. AAPL oder Droneshield.",
+                                      [("Kürzel / Name", "", parse)], lambda values: self.add_symbol(values[0]),
+                                      ok_text="Hinzufügen", modal=False)
+        self.add_dialog.show_docked()
+
+    def add_symbol(self, text):
         self.ctl.add_symbol(text, self.symbol_not_found, self.choose_symbol)
 
     def symbol_not_found(self, text):
@@ -766,6 +819,37 @@ class MainWindow(QWidget):
             card.set_data(self.ctl.quotes.get(symbol), self.ctl.positions.get(symbol),
                           self.ctl.events.get(symbol))
         self.empty.setVisible(not self.cards)
+        self.header.setVisible(bool(self.cards))
+        self.reorder()
+
+    def sort_by(self, key):
+        """Erster Klick sortiert aufsteigend, jeder weitere auf dieselbe Spalte kehrt die Richtung um."""
+        self.sort_desc = (not self.sort_desc) if key == self.sort_key else False
+        self.sort_key = key
+        self.reorder()
+
+    def ordered_symbols(self):
+        symbols = [s for s in self.ctl.symbols if s in self.cards]
+        key = self.sort_key
+        if key is None:
+            return symbols
+        filled = [s for s in symbols if self.cards[s].values.get(key) is not None]
+        empty = [s for s in symbols if self.cards[s].values.get(key) is None]  # leere Zellen immer zuletzt
+        filled.sort(key=lambda s: self.cards[s].values[key], reverse=self.sort_desc)
+        return filled + empty
+
+    def reorder(self):
+        for index, symbol in enumerate(self.ordered_symbols()):
+            card = self.cards[symbol]
+            if self.list.indexOf(card) != index + 1:  # Platz 0 hält den Leer-Hinweis
+                self.list.removeWidget(card)
+                self.list.insertWidget(index + 1, card)
+        for key, title, _, align in COLUMNS:
+            active = key == self.sort_key
+            button = self.heads[key]
+            button.setText(f"{title} {'▼' if self.sort_desc else '▲'}" if active else title)
+            button.setStyleSheet(f"QPushButton#head {{ text-align: {'left' if align == Qt.AlignLeft else 'right'};"
+                                 f"{f' color: {ACCENT};' if active else ''} }}")
 
     def flash_card(self, symbol, kind):
         """Kauf und Startbestand leuchten grün, Verkauf rot."""
