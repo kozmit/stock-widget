@@ -10,7 +10,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 
 from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPointF, Qt, QTimer, QUrl, QVariantAnimation, Signal
-from PySide6.QtGui import QColor, QCursor, QDesktopServices, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtGui import QColor, QCursor, QDesktopServices, QIcon, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (QApplication, QDialog, QFrame, QGraphicsDropShadowEffect, QGridLayout,
                                QHBoxLayout, QLabel, QLineEdit, QMenu, QPushButton, QScrollArea, QSystemTrayIcon, QVBoxLayout, QWidget)
 
@@ -19,10 +19,12 @@ import stock_data as sd
 from store import Store
 
 REFRESH_SECONDS = 60
+STALE_SECONDS = 3 * REFRESH_SECONDS          # so lange gilt ein Kurs ohne neuen Abruf als aktuell
+INSTRUMENT_MAX_AGE = dt.timedelta(days=7)    # danach werden die Stammdaten neu geladen
 
 BG, SURFACE, SURFACE2 = "#14161c", "#1d2029", "#272b39"
 TEXT, MUTED, ACCENT = "#eceef4", "#8a90a6", "#6c8cff"
-GREEN, RED = "#34d399", "#f87171"
+GREEN, RED, AMBER = "#34d399", "#f87171", "#fbbf24"
 
 STYLE = f"""
 * {{ font-family: "Segoe UI Variable Text", "Segoe UI"; font-size: 13px; color: {TEXT}; }}
@@ -205,6 +207,25 @@ def flash(widget, color, base=SURFACE):
     animation.start()
 
 
+def freshness_text(freshness):
+    """Text zu einem Kurs: Stand, Quelle und ob er veraltet ist."""
+    if not freshness:
+        return ""
+    parts = []
+    fetched = freshness["fetched_at"]
+    if fetched:
+        same_day = fetched.date() == dt.date.today()
+        parts.append("Stand " + fetched.strftime("%H:%M:%S" if same_day else "%d.%m. %H:%M"))
+    if freshness["source"]:
+        parts.append(freshness["source"])
+    text = " · ".join(parts)
+    if freshness["error"]:
+        text += f"\nVeraltet: letzter Abruf fehlgeschlagen ({freshness['error']})"
+    elif freshness["stale"]:
+        text += "\nVeraltet: länger nicht aktualisiert"
+    return text
+
+
 def caption_label(text):
     label = QLabel(text.upper())
     label.setStyleSheet(f"color: {MUTED}; font-size: 10px; font-weight: 700; letter-spacing: 1px;")
@@ -266,6 +287,9 @@ class Controller(QObject):
         self.quotes, self.events = {}, {}
         self.transactions, self.positions, self.realized, self.sales = {}, {}, {}, {}
         self.reload_ledger()
+        self.quote_times, self.quote_errors, self.instruments = {}, {}, {}
+        self.instrument_tried = set()  # Stammdaten werden je Start höchstens einmal je Aktie versucht
+        self.load_persisted()
         self.pool = ThreadPoolExecutor(max_workers=6)
         self.closed = False
         self._result.connect(self._deliver)
@@ -297,6 +321,16 @@ class Controller(QObject):
         elif fail:
             fail(error)
 
+    def load_persisted(self):
+        """Zeigt sofort die zuletzt gespeicherten Kurse und Stammdaten. Ob ein Kurs noch gilt, entscheidet sein Alter."""
+        for symbol, snapshot in self.store.snapshots().items():
+            if symbol in self.symbols:
+                self.quote_times[symbol] = snapshot.pop("fetched_at")
+                self.quotes[symbol] = snapshot
+        for symbol, info in self.store.instruments().items():
+            if symbol in self.symbols:
+                self.instruments[symbol] = info
+
     def reload_ledger(self):
         """Berechnet Bestände und realisierte Gewinne neu aus den gespeicherten Transaktionen."""
         self.transactions = {}
@@ -321,15 +355,61 @@ class Controller(QObject):
             self.load_quote(symbol)
             if symbol not in self.events:
                 self.load_events(symbol)
+            if self.needs_instrument(symbol):
+                self.load_instrument(symbol)
 
     def load_quote(self, symbol):
         def done(quote):
             if symbol in self.symbols:
-                self.quotes[symbol] = quote
+                self.store_quote(symbol, quote)
                 self.status.emit("Aktualisiert " + dt.datetime.now().strftime("%H:%M:%S"))
                 self.changed.emit()
-        self.run(lambda: sd.fetch_quote(symbol), done,
-                 lambda exc: self.status.emit(f"{symbol}: Kurs nicht abrufbar"))
+
+        def failed(exc):
+            # Der letzte Kurs bleibt sichtbar, gilt aber ab jetzt als veraltet.
+            if symbol in self.symbols:
+                self.quote_errors[symbol] = str(exc) or "Abruf fehlgeschlagen"
+            self.status.emit(f"{symbol}: Kurs nicht abrufbar")
+            self.changed.emit()
+        self.run(lambda: sd.fetch_quote(symbol), done, failed)
+
+    def store_quote(self, symbol, quote):
+        now = dt.datetime.now().replace(microsecond=0)  # so genau wie in der Datenbank
+        self.quotes[symbol] = quote
+        self.quote_times[symbol] = now
+        self.quote_errors.pop(symbol, None)
+        self.store.save_snapshot(symbol, quote, now)
+
+    def freshness(self, symbol, now=None):
+        """Wie aktuell der Kurs ist: {stale, fetched_at, source, error}, oder None ohne Kurs."""
+        quote = self.quotes.get(symbol)
+        if not quote:
+            return None
+        fetched_at = self.quote_times.get(symbol)
+        error = self.quote_errors.get(symbol)
+        too_old = fetched_at is not None and ((now or dt.datetime.now()) - fetched_at).total_seconds() > STALE_SECONDS
+        return {"stale": bool(error) or too_old, "fetched_at": fetched_at,
+                "source": quote.get("source", ""), "error": error}
+
+    def stale_symbols(self, now=None):
+        return [s for s in self.symbols if (f := self.freshness(s, now)) and f["stale"]]
+
+    def needs_instrument(self, symbol, now=None):
+        if symbol in self.instrument_tried:
+            return False
+        info = self.instruments.get(symbol)
+        return info is None or (now or dt.datetime.now()) - info["fetched_at"] > INSTRUMENT_MAX_AGE
+
+    def load_instrument(self, symbol):
+        self.instrument_tried.add(symbol)
+
+        def done(info):
+            if symbol in self.symbols:
+                now = dt.datetime.now().replace(microsecond=0)
+                self.store.save_instrument(symbol, info, now)
+                self.instruments[symbol] = {**info, "fetched_at": now}
+                self.changed.emit()
+        self.run(lambda: sd.fetch_instrument(symbol), done)
 
     def load_events(self, symbol):
         def done(events):
@@ -368,11 +448,12 @@ class Controller(QObject):
                 return
             self.store.add_symbol(symbol)
             self.symbols = self.store.symbols()
-            self.quotes[symbol] = quote
+            self.store_quote(symbol, quote)
             self.reload_ledger()
             self.changed.emit()
             self.ledger_changed.emit()
             self.load_events(symbol)
+            self.load_instrument(symbol)
             found = symbol if symbol == text.upper() else f"{text.upper()} als {symbol}"
             self.status.emit(f"{found} gefunden")
 
@@ -387,7 +468,7 @@ class Controller(QObject):
         """Nimmt die Aktie aus der Watchlist. Ihre Transaktionen bleiben gespeichert."""
         self.store.remove_symbol(symbol)
         self.symbols = self.store.symbols()
-        for cache in (self.quotes, self.events):
+        for cache in (self.quotes, self.events, self.quote_times, self.quote_errors, self.instruments):
             cache.pop(symbol, None)
         self._ledger_changed()
 
@@ -616,7 +697,7 @@ COLUMNS = (
     ("symbol", "Symbol", 70, Qt.AlignLeft),
     ("price", "Kurs", 62, Qt.AlignRight),
     ("day", "Tag", 74, Qt.AlignRight),
-    ("shares", "Stk", 44, Qt.AlignRight),
+    ("value", "Position", 76, Qt.AlignRight),
     ("pl", "G/V %", 74, Qt.AlignRight),
     ("amount", "G/V", 80, Qt.AlignRight),
     ("event", "Termin", None, Qt.AlignLeft),
@@ -649,26 +730,34 @@ class StockCard(QFrame):
             self.labels[key] = label
             row.addWidget(label, 0 if width else 1)
         self.price, self.day = self.labels["price"], self.labels["day"]
-        self.shares, self.pl = self.labels["shares"], self.labels["pl"]
+        self.value, self.pl = self.labels["value"], self.labels["pl"]
         self.amount, self.event = self.labels["amount"], self.labels["event"]
         self.labels["symbol"].setText(symbol)
         self.labels["symbol"].setStyleSheet("font-weight: 700;")
         self.price.setStyleSheet("font-weight: 700;")
         self.event.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
 
-    def set_data(self, quote, position, events):
+    def set_data(self, quote, position, events, freshness=None):
+        stale = bool(freshness and freshness["stale"])
         if events:
             self.event.setText(sd.format_event(events[0], short=True))
             self.values["event"] = events[0][0]
         else:
             self.event.setText("kein Termin" if events is not None else "…")
             self.values["event"] = None
-        for key in ("price", "day", "shares", "pl", "amount"):
+        for key in ("price", "day", "value", "pl", "amount"):
             self.labels[key].setText("")
             self.values[key] = None
+        self.price.setToolTip("")
+        self.day.setToolTip("")
+        self.value.setToolTip("")
         if not quote:
             return
         self.price.setText(f"{quote['price']:.2f}")
+        # Ein veralteter Kurs ist gelb und kursiv; der Tooltip nennt Stand und Quelle.
+        self.price.setStyleSheet("font-weight: 700;" + (f" color: {AMBER}; font-style: italic;" if stale else ""))
+        self.price.setToolTip(freshness_text(freshness))
+        self.day.setToolTip(freshness_text(freshness))
         self.values["price"] = quote["price"]
         change = quote["change_pct"]
         self.day.setText(f"{arrow(change)} {change:+.2f} %")
@@ -677,12 +766,14 @@ class StockCard(QFrame):
         if position:
             pl = sd.pl_percent(position, quote["price"])
             amount = sd.pl_amount(position, quote["price"])
-            self.shares.setText(f"{position['shares']:g}")
+            value = quote["price"] * position["shares"]
+            self.value.setText(f"{value:,.2f}")
+            self.value.setToolTip(f"{position['shares']:g} Stück")
             self.pl.setText(f"{pl:+.2f} %")
             self.pl.setStyleSheet(f"color: {sign_color(pl)}; font-weight: 600;")
             self.amount.setText(f"{amount:+.2f}")
             self.amount.setStyleSheet(f"color: {sign_color(amount)};")
-            self.values.update(shares=position["shares"], pl=pl, amount=amount)
+            self.values.update(value=value, pl=pl, amount=amount)
 
     def flash(self, color):
         flash(self, color)
@@ -747,14 +838,24 @@ class MainWindow(QWidget):
 
         self.status = QLabel("")
         self.status.setStyleSheet(f"color: {MUTED}; font-size: 10px;")
-        body.addWidget(self.status)
+        self.stale_note = QLabel()
+        self.stale_note.setStyleSheet(f"color: {AMBER}; font-size: 10px; font-weight: 600;")
+        self.stale_note.hide()
+        footer = QHBoxLayout()
+        footer.addWidget(self.status, 1)
+        footer.addWidget(self.stale_note)
+        body.addLayout(footer)
 
         screen = QApplication.primaryScreen().availableGeometry()
-        self.setFixedSize(600, min(640, screen.height() - 20))
+        self.setFixedHeight(min(640, screen.height() - 20))
 
         ctl.changed.connect(self.sync)
         ctl.status.connect(self.status.setText)
         ctl.trade_recorded.connect(self.flash_card)
+        # Ein Kurs veraltet auch, ohne dass neue Daten kommen; deshalb prüft ein Timer das Alter regelmäßig.
+        self.fresh_timer = QTimer(self)
+        self.fresh_timer.timeout.connect(self.refresh_cards)
+        self.fresh_timer.start(15_000)
         self.sync()
 
     def show_docked(self):
@@ -815,12 +916,39 @@ class MainWindow(QWidget):
                 card.menu_requested.connect(self.show_menu)
                 self.cards[symbol] = card
                 self.list.insertWidget(self.list.count() - 1, card)
-        for symbol, card in self.cards.items():
-            card.set_data(self.ctl.quotes.get(symbol), self.ctl.positions.get(symbol),
-                          self.ctl.events.get(symbol))
+        self.refresh_cards()
         self.empty.setVisible(not self.cards)
         self.header.setVisible(bool(self.cards))
         self.reorder()
+        self.fit_width()
+
+    def refresh_cards(self):
+        for symbol, card in self.cards.items():
+            card.set_data(self.ctl.quotes.get(symbol), self.ctl.positions.get(symbol),
+                          self.ctl.events.get(symbol), self.ctl.freshness(symbol))
+        stale = self.ctl.stale_symbols()
+        if stale:
+            self.stale_note.setText(f"⚠ {len(stale)} Kurs{'e' if len(stale) != 1 else ''} veraltet")
+            self.stale_note.setToolTip("\n".join(
+                f"{s}: " + freshness_text(self.ctl.freshness(s)).replace("\n", " · ") for s in stale))
+            self.stale_note.show()
+        else:
+            self.stale_note.hide()
+
+    def fit_width(self):
+        """Das Fenster ist genau so breit, wie die Spalten brauchen; der Termin-Text bestimmt die letzte Spalte."""
+        event = max([c.event.sizeHint().width() for c in self.cards.values()]
+                    + [self.heads["event"].sizeHint().width()])
+        for card in self.cards.values():
+            card.event.setMinimumWidth(event)
+        self.heads["event"].setMinimumWidth(event)
+        fixed = [width for _, _, width, _ in COLUMNS if width]
+        row = ROW_MARGINS[0] + ROW_MARGINS[2] + sum(fixed) + event + ROW_SPACING * len(fixed)
+        # + Scrollleiste samt Rand (12), Innenrand des Panels (32), Rahmen (2), Schattenrand des Fensters (28)
+        width = row + 12 + 32 + 2 + 28
+        if width != self.width():
+            self.setFixedWidth(width)
+            Dock.arrange()
 
     def sort_by(self, key):
         """Erster Klick sortiert aufsteigend, jeder weitere auf dieselbe Spalte kehrt die Richtung um."""
@@ -1001,6 +1129,83 @@ class TransactionsWindow(QWidget):
 
 # ---------- Detailfenster ----------
 
+class PriceChart(QWidget):
+    """Liniendiagramm eines Kursverlaufs mit Hover-Anzeige; points = [(datetime, Kurs)] oder None."""
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedHeight(130)
+        self.setMouseTracking(True)
+        self.points, self.note, self.hover = None, "Wird geladen …", None
+
+    def show_points(self, points, note=""):
+        self.points, self.note, self.hover = points, note, None
+        self.update()
+
+    def _plot_rect(self):
+        return self.rect().adjusted(4, 8, -4, -8)
+
+    def mouseMoveEvent(self, event):
+        if self.points:
+            rect = self._plot_rect()
+            share = (event.position().x() - rect.left()) / max(rect.width(), 1)
+            self.hover = min(max(round(share * (len(self.points) - 1)), 0), len(self.points) - 1)
+            self.update()
+
+    def leaveEvent(self, event):
+        self.hover = None
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        rect = self._plot_rect()
+        if not self.points:
+            painter.setPen(QColor(MUTED))
+            painter.drawText(self.rect(), Qt.AlignCenter, self.note)
+            return
+        prices = [p for _, p in self.points]
+        low, high = min(prices), max(prices)
+        span = (high - low) or 1.0
+        color = QColor(sign_color(prices[-1] - prices[0]))
+
+        def pos(i):
+            x = rect.left() + rect.width() * i / (len(prices) - 1)
+            return QPointF(x, rect.bottom() - rect.height() * (prices[i] - low) / span)
+
+        path = QPainterPath(pos(0))
+        for i in range(1, len(prices)):
+            path.lineTo(pos(i))
+        fill = QPainterPath(path)
+        fill.lineTo(rect.right(), rect.bottom())
+        fill.lineTo(rect.left(), rect.bottom())
+        fill.closeSubpath()
+        shade = QColor(color)
+        shade.setAlpha(40)
+        painter.fillPath(fill, shade)
+        painter.setPen(QPen(color, 1.8))
+        painter.drawPath(path)
+        painter.setPen(QColor(MUTED))
+        small = painter.font()
+        small.setPixelSize(10)
+        painter.setFont(small)
+        painter.drawText(rect.adjusted(2, 0, 0, 0), Qt.AlignTop | Qt.AlignLeft, f"{high:.2f}")
+        painter.drawText(rect.adjusted(2, 0, 0, 0), Qt.AlignBottom | Qt.AlignLeft, f"{low:.2f}")
+        if self.hover is not None:
+            stamp, price = self.points[self.hover]
+            point = pos(self.hover)
+            painter.setPen(QPen(QColor(MUTED), 1, Qt.DashLine))
+            painter.drawLine(QPointF(point.x(), rect.top()), QPointF(point.x(), rect.bottom()))
+            painter.setBrush(color)
+            painter.setPen(Qt.NoPen)
+            painter.drawEllipse(point, 3.5, 3.5)
+            painter.setPen(QColor("#ffffff"))
+            right = point.x() < rect.center().x()
+            painter.drawText(rect.adjusted(0, 0, -2, 0) if right else rect.adjusted(2, 0, 0, 0),
+                             Qt.AlignTop | (Qt.AlignRight if right else Qt.AlignLeft),
+                             f"{stamp:%d.%m.%Y} · {price:.2f}")
+
+
 class DetailWindow(QWidget):
     closed = Signal(str)
 
@@ -1011,6 +1216,17 @@ class DetailWindow(QWidget):
         self.alive = True
         body = make_panel(self, symbol, self.close)
 
+        names = QVBoxLayout()
+        names.setSpacing(2)
+        self.company = QLabel()
+        self.company.setStyleSheet("font-size: 14px; font-weight: 600;")
+        self.company_meta = QLabel()
+        self.company_meta.setWordWrap(True)
+        self.company_meta.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        names.addWidget(self.company)
+        names.addWidget(self.company_meta)
+        body.addLayout(names)
+
         top = QHBoxLayout()
         self.price = QLabel("…")
         self.price.setStyleSheet("font-size: 30px; font-weight: 700;")
@@ -1019,7 +1235,29 @@ class DetailWindow(QWidget):
         top.addSpacing(8)
         top.addWidget(self.day)
         top.addStretch()
-        body.addLayout(top)
+        self.price_note = QLabel()
+        price_box = QVBoxLayout()
+        price_box.setSpacing(2)
+        price_box.addLayout(top)
+        price_box.addWidget(self.price_note)
+        body.addLayout(price_box)
+
+        # Kursdiagramm mit Zeitraumwahl
+        self.chart = PriceChart()
+        body.addWidget(self.chart)
+        self.range_key = sd.DEFAULT_RANGE
+        self.history_token = 0
+        range_row = QHBoxLayout()
+        range_row.setSpacing(4)
+        self.range_buttons = {}
+        for key, title, _, _ in sd.HISTORY_RANGES:
+            button = QPushButton(title)
+            button.setCheckable(True)
+            button.setCursor(Qt.PointingHandCursor)
+            button.clicked.connect(lambda _checked=False, k=key: self.load_history(k))
+            range_row.addWidget(button)
+            self.range_buttons[key] = button
+        body.addLayout(range_row)
 
         # Position
         self.position_card = position_card = QFrame()
@@ -1081,8 +1319,31 @@ class DetailWindow(QWidget):
 
         ctl.changed.connect(self.refresh_view)
         ctl.trade_recorded.connect(self.on_trade)
+        self.fresh_timer = QTimer(self)
+        self.fresh_timer.timeout.connect(self.refresh_view)
+        self.fresh_timer.start(15_000)
         self.refresh_view()
         ctl.run(self.load, self.show_loaded)
+        self.load_history(self.range_key)
+
+    def load_history(self, key):
+        """Lädt den Kursverlauf für den Zeitraum; eine spätere Auswahl verwirft die Antwort einer früheren."""
+        self.range_key = key
+        self.history_token += 1
+        token = self.history_token
+        for k, button in self.range_buttons.items():
+            button.setChecked(k == key)
+        self.chart.show_points(None, "Wird geladen …")
+
+        def done(points):
+            if self.alive and token == self.history_token:
+                self.chart.show_points(points)
+
+        def fail(exc):
+            if self.alive and token == self.history_token:
+                self.chart.show_points(None, f"Kursverlauf nicht ladbar: {exc}")
+
+        self.ctl.run(lambda: sd.fetch_history(self.symbol, key), done, fail)
 
     def on_trade(self, symbol, kind):
         if symbol == self.symbol:
@@ -1091,6 +1352,22 @@ class DetailWindow(QWidget):
     def refresh_view(self):
         quote = self.ctl.quotes.get(self.symbol)
         position = self.ctl.positions.get(self.symbol)
+        freshness = self.ctl.freshness(self.symbol)
+        stale = bool(freshness and freshness["stale"])
+        self.price.setStyleSheet("font-size: 30px; font-weight: 700;" + (f" color: {AMBER};" if stale else ""))
+        self.price_note.setText(freshness_text(freshness).replace("\n", " · "))
+        self.price_note.setStyleSheet(f"color: {AMBER if stale else MUTED}; font-size: 11px;")
+        instrument = self.ctl.instruments.get(self.symbol)
+        self.company.setVisible(bool(instrument))
+        self.company_meta.setVisible(bool(instrument))
+        if instrument:
+            self.company.setText(instrument["name"])
+            isin = f"ISIN {instrument['isin']}" if instrument["isin"] else ""
+            self.company_meta.setText(" · ".join(part for part in (
+                instrument["exchange"], instrument["sector"], instrument["industry"], instrument["country"], isin)
+                if part))
+            self.company_meta.setToolTip(f"Stammdaten: {instrument['source']}, Stand "
+                                         f"{instrument['fetched_at']:%d.%m.%Y %H:%M}")
         if quote:
             cur = quote["currency"]
             self.price.setText(f"{quote['price']:.2f} {cur}")

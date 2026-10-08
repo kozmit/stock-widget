@@ -29,8 +29,30 @@ CREATE TABLE IF NOT EXISTS transactions (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS transactions_symbol ON transactions (symbol);
+CREATE TABLE IF NOT EXISTS price_snapshots (
+    symbol TEXT PRIMARY KEY,
+    price REAL NOT NULL,
+    change_pct REAL NOT NULL,
+    currency TEXT NOT NULL,
+    source TEXT NOT NULL,
+    fetched_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS instruments (
+    symbol TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    exchange TEXT NOT NULL DEFAULT '',
+    currency TEXT NOT NULL DEFAULT '',
+    sector TEXT NOT NULL DEFAULT '',
+    industry TEXT NOT NULL DEFAULT '',
+    country TEXT NOT NULL DEFAULT '',
+    isin TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL,
+    fetched_at TEXT NOT NULL
+);
 """
-SCHEMA_VERSION = "1"
+# 1: Watchlist und Transaktionen. 2: dazu letzter Kurs und Stammdaten je Aktie, jeweils mit Quelle und Zeitpunkt.
+SCHEMA_VERSION = "2"
+INSTRUMENT_FIELDS = ("name", "exchange", "currency", "sector", "industry", "country", "isin")
 DEFAULT_SYMBOLS = ["AAPL", "MSFT", "DELL"]
 
 
@@ -39,7 +61,8 @@ class Store:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         self.db = sqlite3.connect(path)
         self.db.executescript(SCHEMA)
-        self.db.execute("INSERT OR IGNORE INTO meta VALUES ('schema_version', ?)", (SCHEMA_VERSION,))
+        # Neue Tabellen legt SCHEMA an; bestehende Daten bleiben unverändert, nur die Versionsnummer zieht nach.
+        self.db.execute("INSERT OR REPLACE INTO meta VALUES ('schema_version', ?)", (SCHEMA_VERSION,))
         self.db.commit()
 
     def close(self):
@@ -88,6 +111,34 @@ class Store:
     def delete_transaction(self, transaction_id):
         self.db.execute("DELETE FROM transactions WHERE id = ?", (transaction_id,))
         self.db.commit()
+
+    # -- Letzter Kurs und Stammdaten (mit Quelle und Zeitpunkt des Abrufs) --
+    def save_snapshot(self, symbol, quote, fetched_at):
+        self.db.execute(
+            "INSERT OR REPLACE INTO price_snapshots VALUES (?, ?, ?, ?, ?, ?)",
+            (symbol, quote["price"], quote["change_pct"], quote["currency"], quote.get("source", ""),
+             fetched_at.isoformat(timespec="seconds")))
+        self.db.commit()
+
+    def snapshots(self):
+        rows = self.db.execute(
+            "SELECT symbol, price, change_pct, currency, source, fetched_at FROM price_snapshots")
+        return {r[0]: {"price": r[1], "change_pct": r[2], "currency": r[3], "source": r[4],
+                       "fetched_at": dt.datetime.fromisoformat(r[5])} for r in rows}
+
+    def save_instrument(self, symbol, info, fetched_at):
+        values = [info.get(field) or "" for field in INSTRUMENT_FIELDS]
+        self.db.execute(
+            "INSERT OR REPLACE INTO instruments VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (symbol, *values, info.get("source", ""), fetched_at.isoformat(timespec="seconds")))
+        self.db.commit()
+
+    def instruments(self):
+        rows = self.db.execute(
+            "SELECT symbol, name, exchange, currency, sector, industry, country, isin, source, fetched_at "
+            "FROM instruments")
+        return {r[0]: {**dict(zip(INSTRUMENT_FIELDS, r[1:8])), "source": r[8],
+                       "fetched_at": dt.datetime.fromisoformat(r[9])} for r in rows}
 
     # -- Übernahme der bisherigen Daten (watchlist.json) --
     def import_legacy(self, json_path, today=None):

@@ -11,6 +11,8 @@ DATA_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "Sto
 LEGACY_FILE = os.path.join(DATA_DIR, "watchlist.json")  # nur noch zur einmaligen Übernahme
 DB_FILE = os.path.join(DATA_DIR, "stock_widget.db")
 
+SOURCE = "Yahoo Finance"
+
 EVENT_LABELS = {
     "Earnings Date": "Quartalszahlen",
     "Ex-Dividend Date": "Ex-Dividende",
@@ -30,6 +32,52 @@ def fetch_quote(symbol):
         "price": float(price),
         "change_pct": (float(price) / float(prev) - 1) * 100,
         "currency": info["currency"] or "",
+        "source": SOURCE,
+    }
+
+
+# Zeiträume des Kursdiagramms: Schlüssel, Beschriftung, yfinance-Zeitraum und Kerzenlänge
+HISTORY_RANGES = (
+    ("1w", "1 W", "7d", "1h"),
+    ("1m", "1 M", "1mo", "1d"),
+    ("6m", "6 M", "6mo", "1d"),
+    ("1y", "1 J", "1y", "1d"),
+    ("5y", "5 J", "5y", "1wk"),
+)
+DEFAULT_RANGE = "6m"
+
+
+def fetch_history(symbol, range_key=DEFAULT_RANGE):
+    """Schlusskurse als Liste [(Zeitpunkt, Kurs)] für einen Zeitraum aus HISTORY_RANGES."""
+    _, _, period, interval = next(r for r in HISTORY_RANGES if r[0] == range_key)
+    frame = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=False)
+    closes = frame["Close"].dropna()
+    points = [(stamp.to_pydatetime(), float(value)) for stamp, value in closes.items()]
+    if len(points) < 2:
+        raise ValueError("keine Kursverlaufsdaten")
+    return points
+
+
+def fetch_instrument(symbol):
+    """Stammdaten einer Aktie. Die ISIN liefert Yahoo nur bei ETFs; sonst bleibt das Feld leer."""
+    ticker = yf.Ticker(symbol)
+    info = ticker.info or {}
+    name = info.get("longName") or info.get("shortName")
+    if not name:
+        raise ValueError("keine Stammdaten")
+    try:
+        isin = ticker.isin
+    except Exception:
+        isin = None
+    return {
+        "name": name,
+        "exchange": info.get("fullExchangeName") or info.get("exchange") or "",
+        "currency": info.get("currency") or "",
+        "sector": info.get("sector") or "",
+        "industry": info.get("industry") or "",
+        "country": info.get("country") or "",
+        "isin": isin if isin and isin != "-" else "",
+        "source": SOURCE,
     }
 
 

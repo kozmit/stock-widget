@@ -107,5 +107,79 @@ class StoreTests(unittest.TestCase):
             self.store.add_transaction("AAA", "buy", -1, 10, 0, dt.date(2026, 1, 1))
 
 
+class SnapshotAndInstrumentTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.path = os.path.join(self.dir.name, "test.db")
+        self.store = Store(self.path)
+        self.addCleanup(self.store.close)
+
+    QUOTE = {"price": 123.45, "change_pct": -1.5, "currency": "EUR", "source": "Yahoo Finance"}
+    INFO = {"name": "Siemens Energy AG", "exchange": "XETRA", "currency": "EUR", "sector": "Industrials",
+            "industry": "Machinery", "country": "Germany", "isin": "", "source": "Yahoo Finance"}
+
+    def test_snapshot_roundtrip_keeps_price_currency_source_and_time(self):
+        moment = dt.datetime(2026, 10, 8, 14, 3, 12)
+        self.store.save_snapshot("ENR.DE", self.QUOTE, moment)
+        self.assertEqual(self.store.snapshots()["ENR.DE"],
+                         {"price": 123.45, "change_pct": -1.5, "currency": "EUR",
+                          "source": "Yahoo Finance", "fetched_at": moment})
+
+    def test_new_snapshot_replaces_the_old_one(self):
+        self.store.save_snapshot("ENR.DE", self.QUOTE, dt.datetime(2026, 10, 8, 14, 0, 0))
+        self.store.save_snapshot("ENR.DE", {**self.QUOTE, "price": 130.0}, dt.datetime(2026, 10, 8, 14, 5, 0))
+        snapshots = self.store.snapshots()
+        self.assertEqual(len(snapshots), 1)
+        self.assertEqual(snapshots["ENR.DE"]["price"], 130.0)
+
+    def test_instrument_roundtrip(self):
+        moment = dt.datetime(2026, 10, 8, 14, 3, 12)
+        self.store.save_instrument("ENR.DE", self.INFO, moment)
+        self.assertEqual(self.store.instruments()["ENR.DE"], {**self.INFO, "fetched_at": moment})
+
+    def test_instrument_with_missing_fields_stores_empty_strings(self):
+        self.store.save_instrument("SPY", {"name": "ETF", "sector": None, "source": "Yahoo Finance"},
+                                   dt.datetime(2026, 1, 1))
+        stored = self.store.instruments()["SPY"]
+        self.assertEqual((stored["name"], stored["sector"], stored["country"], stored["isin"]), ("ETF", "", "", ""))
+
+    def test_data_survives_reopening_the_database(self):
+        self.store.save_snapshot("ENR.DE", self.QUOTE, dt.datetime(2026, 10, 8, 14, 3, 12))
+        self.store.close()
+        reopened = Store(self.path)
+        self.addCleanup(reopened.close)
+        self.assertIn("ENR.DE", reopened.snapshots())
+
+    def test_database_from_schema_version_1_is_upgraded_without_losing_data(self):
+        import sqlite3
+        old_path = os.path.join(self.dir.name, "old.db")
+        old = sqlite3.connect(old_path)
+        old.executescript("""
+            CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE watchlist (symbol TEXT PRIMARY KEY, sort INTEGER NOT NULL,
+                opening_realized REAL NOT NULL DEFAULT 0);
+            CREATE TABLE transactions (id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK (kind IN ('buy', 'sell')), shares REAL NOT NULL, price REAL NOT NULL,
+                fee REAL NOT NULL DEFAULT 0, executed_on TEXT NOT NULL, note TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL);
+            INSERT INTO meta VALUES ('schema_version', '1'), ('legacy_imported', '2026-10-08');
+            INSERT INTO watchlist VALUES ('GEV', 1, 5.0);
+            INSERT INTO transactions (symbol, kind, shares, price, fee, executed_on, note, created_at)
+                VALUES ('GEV', 'buy', 7.36, 547.62, 0, '2026-10-08', 'Startbestand', '2026-10-08T22:00:00');
+        """)
+        old.commit()
+        old.close()
+        upgraded = Store(old_path)
+        self.addCleanup(upgraded.close)
+        self.assertEqual(upgraded.meta("schema_version"), "2")
+        self.assertEqual(upgraded.symbols(), ["GEV"])
+        self.assertEqual(upgraded.opening_realized(), {"GEV": 5.0})
+        self.assertEqual(upgraded.transactions()[0].shares, 7.36)
+        self.assertEqual(upgraded.snapshots(), {})  # neue Tabellen sind da und leer
+        upgraded.save_snapshot("GEV", self.QUOTE, dt.datetime(2026, 10, 8, 23, 0, 0))
+        self.assertIn("GEV", upgraded.snapshots())
+
+
 if __name__ == "__main__":
     unittest.main()

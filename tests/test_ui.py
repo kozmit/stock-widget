@@ -344,12 +344,14 @@ class MainWindowTests(AppTestCase):
         self.ctl.changed.emit()
         self.assertEqual(self.main.cards["AAPL"].day.text(), "▼ -2.00 %")
 
-    def test_card_shows_position_and_profit_only_when_held(self):
+    def test_card_shows_position_value_and_profit_only_when_held(self):
         card = self.main.cards["AAPL"]
-        self.assertEqual((card.shares.text(), card.pl.text(), card.amount.text()), ("", "", ""))
+        self.assertEqual((card.value.text(), card.pl.text(), card.amount.text()), ("", "", ""))
         self.ctl.record_trade("AAPL", "buy", 10, 80, 0, TODAY)
-        self.assertEqual((card.shares.text(), card.pl.text(), card.amount.text()), ("10", "+25.00 %", "+200.00"))
-        self.assertEqual(self.main.cards["MSFT"].shares.text(), "")
+        self.assertEqual((card.value.text(), card.pl.text(), card.amount.text()),
+                         ("1,000.00", "+25.00 %", "+200.00"))
+        self.assertEqual(card.value.toolTip(), "10 Stück")
+        self.assertEqual(self.main.cards["MSFT"].value.text(), "")
 
     def test_card_shows_next_event(self):
         self.ctl.events["AAPL"] = [(TODAY + dt.timedelta(days=5), "Ex-Dividende")]
@@ -388,6 +390,18 @@ class MainWindowTests(AppTestCase):
         self.assertEqual(self.symbols_on_screen(), ["MSFT", "DELL", "AAPL"])
         self.assertTrue(self.main.heads["symbol"].text().endswith("▼"))
         self.assertEqual(self.main.heads["price"].text(), "Kurs")
+
+    def test_window_is_exactly_as_wide_as_the_columns_need(self):
+        self.main.show()
+        for card in self.main.cards.values():
+            self.assertLessEqual(card.minimumSizeHint().width(), self.main.area.viewport().width())
+        before = self.main.width()
+        self.ctl.events["AAPL"] = [(TODAY + dt.timedelta(days=5), "Ex-Dividende")]
+        self.ctl.changed.emit()
+        self.assertGreater(self.main.width(), before)
+        for card in self.main.cards.values():
+            self.assertLessEqual(card.minimumSizeHint().width(), self.main.area.viewport().width())
+            self.assertGreaterEqual(card.event.width(), card.event.sizeHint().width())
 
     def test_removed_symbol_loses_its_card_and_empty_hint_appears_at_the_end(self):
         for symbol in list(self.ctl.symbols):
@@ -448,6 +462,138 @@ class MainWindowTests(AppTestCase):
         self.main.toggle_pin()
         self.assertEqual(w.Dock.windows, order)
         self.assertFalse(any(win.windowFlags() & Qt.WindowStaysOnTopHint for win in order))
+
+
+class StaleDisplayTests(AppTestCase):
+    def setUp(self):
+        super().setUp()
+        now = dt.datetime.now()
+        self.ctl.quote_times = {s: now for s in self.ctl.symbols}
+        self.main = w.MainWindow(self.ctl)
+
+    def make_stale(self, symbol="AAPL", error="offline"):
+        self.ctl.quote_errors[symbol] = error
+        self.ctl.changed.emit()
+
+    def test_fresh_quote_is_not_marked_and_the_tooltip_names_time_and_source(self):
+        card = self.main.cards["AAPL"]
+        self.assertNotIn(w.AMBER, card.price.styleSheet())
+        self.assertIn("Stand", card.price.toolTip())
+        self.assertIn("Testquelle", card.price.toolTip())
+        self.assertNotIn("Veraltet", card.price.toolTip())
+        self.assertTrue(self.main.stale_note.isHidden())
+
+    def test_failed_refresh_marks_the_price_amber_and_italic_with_the_reason(self):
+        self.make_stale()
+        card = self.main.cards["AAPL"]
+        self.assertIn(w.AMBER, card.price.styleSheet())
+        self.assertIn("italic", card.price.styleSheet())
+        self.assertIn("Veraltet: letzter Abruf fehlgeschlagen (offline)", card.price.toolTip())
+        self.assertEqual(card.price.text(), "100.00")  # der letzte Kurs bleibt sichtbar
+        self.assertNotIn(w.AMBER, self.main.cards["MSFT"].price.styleSheet())
+
+    def test_footer_counts_stale_quotes_and_lists_them_in_the_tooltip(self):
+        self.make_stale("AAPL")
+        self.assertFalse(self.main.stale_note.isHidden())
+        self.assertEqual(self.main.stale_note.text(), "⚠ 1 Kurs veraltet")
+        self.make_stale("MSFT", "kein Netz")
+        self.assertEqual(self.main.stale_note.text(), "⚠ 2 Kurse veraltet")
+        self.assertIn("AAPL", self.main.stale_note.toolTip())
+        self.assertIn("MSFT", self.main.stale_note.toolTip())
+        self.assertIn("kein Netz", self.main.stale_note.toolTip())
+
+    def test_marker_disappears_after_a_successful_refresh(self):
+        self.make_stale()
+        self.ctl.quote_errors.clear()
+        self.ctl.changed.emit()
+        self.assertTrue(self.main.stale_note.isHidden())
+        self.assertNotIn(w.AMBER, self.main.cards["AAPL"].price.styleSheet())
+
+    def test_quote_turns_stale_with_age_even_without_new_events(self):
+        self.ctl.quote_times["AAPL"] = dt.datetime.now() - dt.timedelta(seconds=w.STALE_SECONDS + 30)
+        self.assertNotIn(w.AMBER, self.main.cards["AAPL"].price.styleSheet())  # noch nichts ausgelöst
+        self.main.fresh_timer.timeout.emit()
+        self.assertIn(w.AMBER, self.main.cards["AAPL"].price.styleSheet())
+        self.assertIn("länger nicht aktualisiert", self.main.cards["AAPL"].price.toolTip())
+        self.assertFalse(self.main.stale_note.isHidden())
+
+    def test_timer_runs_every_fifteen_seconds(self):
+        self.assertTrue(self.main.fresh_timer.isActive())
+        self.assertEqual(self.main.fresh_timer.interval(), 15_000)
+
+    def test_old_quote_from_an_earlier_day_shows_date_in_the_tooltip(self):
+        self.ctl.quote_times["AAPL"] = dt.datetime.now() - dt.timedelta(days=2)
+        self.ctl.changed.emit()
+        tip = self.main.cards["AAPL"].price.toolTip()
+        self.assertRegex(tip, r"Stand \d\d\.\d\d\. \d\d:\d\d")
+
+    def test_cards_without_a_quote_have_no_tooltip_or_marker(self):
+        self.ctl.quotes.pop("AAPL")
+        self.ctl.changed.emit()
+        self.assertEqual(self.main.cards["AAPL"].price.toolTip(), "")
+        self.assertEqual(self.main.cards["AAPL"].price.text(), "")
+
+    def test_detail_window_shows_age_source_and_stale_state(self):
+        self.main.open_detail("AAPL")
+        detail = self.main.details["AAPL"]
+        self.assertIn("Testquelle", detail.price_note.text())
+        self.assertNotIn(w.AMBER, detail.price.styleSheet())
+        self.make_stale()
+        self.assertIn(w.AMBER, detail.price.styleSheet())
+        self.assertIn(w.AMBER, detail.price_note.styleSheet())
+        self.assertIn("Veraltet", detail.price_note.text())
+
+    def test_detail_window_notices_aging_by_itself(self):
+        self.main.open_detail("AAPL")
+        detail = self.main.details["AAPL"]
+        self.ctl.quote_times["AAPL"] = dt.datetime.now() - dt.timedelta(seconds=w.STALE_SECONDS + 30)
+        detail.fresh_timer.timeout.emit()
+        self.assertIn(w.AMBER, detail.price.styleSheet())
+
+
+class MasterDataDisplayTests(AppTestCase):
+    INFO = {"name": "Apple Inc.", "exchange": "NASDAQ", "currency": "USD", "sector": "Technology",
+            "industry": "Consumer Electronics", "country": "United States", "isin": "",
+            "source": "Yahoo Finance", "fetched_at": dt.datetime(2026, 10, 8, 23, 50)}
+
+    def setUp(self):
+        super().setUp()
+        self.main = w.MainWindow(self.ctl)
+
+    def test_without_master_data_the_header_stays_empty(self):
+        self.main.open_detail("AAPL")
+        detail = self.main.details["AAPL"]
+        self.assertTrue(detail.company.isHidden())
+        self.assertTrue(detail.company_meta.isHidden())
+
+    def test_detail_shows_name_exchange_sector_industry_and_country(self):
+        self.ctl.instruments["AAPL"] = dict(self.INFO)
+        self.main.open_detail("AAPL")
+        detail = self.main.details["AAPL"]
+        self.assertFalse(detail.company.isHidden())
+        self.assertEqual(detail.company.text(), "Apple Inc.")
+        self.assertEqual(detail.company_meta.text(),
+                         "NASDAQ · Technology · Consumer Electronics · United States")
+
+    def test_isin_is_shown_only_when_known(self):
+        self.ctl.instruments["AAPL"] = {**self.INFO, "isin": "US0378331005"}
+        self.main.open_detail("AAPL")
+        self.assertTrue(self.main.details["AAPL"].company_meta.text().endswith("ISIN US0378331005"))
+
+    def test_tooltip_names_source_and_date_of_the_master_data(self):
+        self.ctl.instruments["AAPL"] = dict(self.INFO)
+        self.main.open_detail("AAPL")
+        tip = self.main.details["AAPL"].company_meta.toolTip()
+        self.assertIn("Yahoo Finance", tip)
+        self.assertIn("08.10.2026 23:50", tip)
+
+    def test_open_detail_window_updates_when_master_data_arrives(self):
+        self.main.open_detail("AAPL")
+        detail = self.main.details["AAPL"]
+        self.assertTrue(detail.company.isHidden())
+        self.ctl.load_instrument("AAPL")
+        self.assertTrue(wait_until(lambda: detail.company.text() == "AAPL Inc."))
+        self.assertFalse(detail.company.isHidden())
 
 
 class FlashTests(AppTestCase):
@@ -575,6 +721,35 @@ class WindowTests(AppTestCase):
             self.assertIn("in 7 Tagen", detail.event_when.text())
             self.assertTrue(wait_until(lambda: any(
                 "Schlagzeile" in t for t in texts(detail))))
+
+    def test_detail_chart_defaults_to_six_months_and_switches_range(self):
+        calls = []
+
+        def history(symbol, key="6m"):
+            calls.append(key)
+            return [(dt.datetime(2026, 1, 1) + dt.timedelta(days=i), 100.0 + i) for i in range(5)]
+
+        with mock.patch.object(sd, "fetch_history", history):
+            self.main.open_detail("AAPL")
+            detail = self.main.details["AAPL"]
+            self.assertTrue(wait_until(lambda: detail.chart.points is not None))
+            self.assertEqual(calls, ["6m"])
+            self.assertTrue(detail.range_buttons["6m"].isChecked())
+            detail.range_buttons["5y"].click()
+            self.assertTrue(wait_until(lambda: calls == ["6m", "5y"] and detail.chart.points is not None))
+            self.assertEqual([k for k, b in detail.range_buttons.items() if b.isChecked()], ["5y"])
+            self.assertEqual(list(detail.range_buttons), ["1w", "1m", "6m", "1y", "5y"])
+            detail.chart.grab()  # Zeichnen darf nicht scheitern
+
+    def test_detail_chart_reports_a_failed_load(self):
+        def broken(symbol, key="6m"):
+            raise ValueError("offline")
+
+        with mock.patch.object(sd, "fetch_history", broken):
+            self.main.open_detail("AAPL")
+            detail = self.main.details["AAPL"]
+            self.assertTrue(wait_until(lambda: "offline" in detail.chart.note))
+            self.assertIsNone(detail.chart.points)
 
     def test_detail_without_events_says_so(self):
         self.main.open_detail("AAPL")

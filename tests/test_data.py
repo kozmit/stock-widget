@@ -11,10 +11,18 @@ class FakeInfo(dict):
 
 
 class FakeTicker:
-    def __init__(self, symbol, info=None, calendar=None, news=None):
+    def __init__(self, symbol, info=None, calendar=None, news=None, details=None, isin="-"):
         self.fast_info = info if info is not None else FakeInfo(last_price=110.0, previous_close=100.0, currency="USD")
         self.calendar = calendar
         self.news = news or []
+        self.info = details if details is not None else {}
+        self._isin = isin
+
+    @property
+    def isin(self):
+        if isinstance(self._isin, Exception):
+            raise self._isin
+        return self._isin
 
 
 def patch_yf(**ticker_kwargs):
@@ -94,6 +102,11 @@ class QuoteTests(unittest.TestCase):
         self.assertAlmostEqual(quote["change_pct"], 10.0)
         self.assertEqual(quote["currency"], "USD")
 
+    def test_quote_names_its_source(self):
+        patcher, _ = patch_yf()
+        with patcher:
+            self.assertEqual(sd.fetch_quote("X")["source"], "Yahoo Finance")
+
     def test_missing_price_is_an_error_not_a_zero(self):
         patcher, _ = patch_yf(info=FakeInfo(last_price=None, previous_close=100.0, currency="USD"))
         with patcher, self.assertRaises(ValueError):
@@ -103,6 +116,48 @@ class QuoteTests(unittest.TestCase):
         patcher, _ = patch_yf(info=FakeInfo(last_price=10.0, previous_close=0, currency="USD"))
         with patcher, self.assertRaises(ValueError):
             sd.fetch_quote("X")
+
+
+class InstrumentTests(unittest.TestCase):
+    DETAILS = {"longName": "Siemens Energy AG", "shortName": "SIEMENS ENERGY", "fullExchangeName": "XETRA",
+               "exchange": "GER", "currency": "EUR", "sector": "Industrials",
+               "industry": "Specialty Industrial Machinery", "country": "Germany"}
+
+    def test_master_data_is_read_from_yahoo_info(self):
+        patcher, _ = patch_yf(details=self.DETAILS)
+        with patcher:
+            info = sd.fetch_instrument("ENR.DE")
+        self.assertEqual(info, {"name": "Siemens Energy AG", "exchange": "XETRA", "currency": "EUR",
+                                "sector": "Industrials", "industry": "Specialty Industrial Machinery",
+                                "country": "Germany", "isin": "", "source": "Yahoo Finance"})
+
+    def test_short_name_and_plain_exchange_are_fallbacks(self):
+        details = {"shortName": "ABB", "exchange": "EBS", "currency": "CHF"}
+        patcher, _ = patch_yf(details=details)
+        with patcher:
+            info = sd.fetch_instrument("ABBN.SW")
+        self.assertEqual((info["name"], info["exchange"], info["sector"], info["country"]), ("ABB", "EBS", "", ""))
+
+    def test_dash_isin_from_yahoo_means_unknown(self):
+        patcher, _ = patch_yf(details=self.DETAILS, isin="-")
+        with patcher:
+            self.assertEqual(sd.fetch_instrument("ENR.DE")["isin"], "")
+
+    def test_real_isin_is_kept(self):
+        patcher, _ = patch_yf(details=self.DETAILS, isin="US78462F1030")
+        with patcher:
+            self.assertEqual(sd.fetch_instrument("SPY")["isin"], "US78462F1030")
+
+    def test_failing_isin_lookup_does_not_break_master_data(self):
+        patcher, _ = patch_yf(details=self.DETAILS, isin=RuntimeError("offline"))
+        with patcher:
+            info = sd.fetch_instrument("ENR.DE")
+        self.assertEqual((info["name"], info["isin"]), ("Siemens Energy AG", ""))
+
+    def test_unknown_symbol_without_a_name_is_an_error(self):
+        patcher, _ = patch_yf(details={})
+        with patcher, self.assertRaisesRegex(ValueError, "Stammdaten"):
+            sd.fetch_instrument("NIX")
 
 
 class EventTests(unittest.TestCase):

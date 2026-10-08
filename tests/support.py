@@ -1,4 +1,5 @@
 """Gemeinsame Hilfen für die Tests: temporäre Datenbank, kein Netzwerk, Dialoge fernsteuern."""
+import datetime as dt
 import json
 import os
 import shutil
@@ -13,7 +14,7 @@ from PySide6.QtWidgets import QApplication
 import stock_data as sd
 import stock_widget as w
 
-QUOTE = {"price": 100.0, "change_pct": 1.5, "currency": "USD"}
+QUOTE = {"price": 100.0, "change_pct": 1.5, "currency": "USD", "source": "Testquelle"}
 
 
 def qapp():
@@ -30,6 +31,16 @@ def fake_quote(symbol):
     if symbol in UNKNOWN or " " in symbol or symbol.endswith(tuple(sd.SUFFIX_ALIASES)):
         raise ValueError("keine Kursdaten")
     return dict(QUOTE)
+
+
+def fake_instrument(symbol):
+    return {"name": f"{symbol} Inc.", "exchange": "NASDAQ", "currency": "USD", "sector": "Technology",
+            "industry": "Software", "country": "United States", "isin": "", "source": "Yahoo Finance"}
+
+
+def fake_history(symbol, range_key="6m"):
+    start = dt.datetime(2026, 1, 1)
+    return [(start + dt.timedelta(days=i), 100.0 + i) for i in range(10)]
 
 
 def wait_until(condition, timeout=3000):
@@ -84,7 +95,8 @@ class AppTestCase(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
         for name, fake in (("fetch_quote", fake_quote), ("fetch_events", lambda s: []),
-                           ("fetch_news", lambda s, count=15: []), ("search_symbols", lambda q, count=8: [])):
+                           ("fetch_news", lambda s, count=15: []), ("search_symbols", lambda q, count=8: []),
+                           ("fetch_instrument", fake_instrument), ("fetch_history", fake_history)):
             patcher = mock.patch.object(sd, name, fake)
             patcher.start()
             self.addCleanup(patcher.stop)

@@ -305,6 +305,167 @@ class AddSymbolLookupTests(AppTestCase):
         return " ".join(self._status)
 
 
+class FreshnessTests(AppTestCase):
+    def restart(self):
+        self.ctl.store.close()
+        self.ctl.shutdown()
+        self.ctl = w.Controller()
+
+    def load(self, symbol="AAPL"):
+        self.ctl.quote_times.pop(symbol, None)
+        self.ctl.load_quote(symbol)
+        self.assertTrue(wait_until(lambda: symbol in self.ctl.quote_times))
+
+    def test_loaded_quote_is_saved_with_source_and_time(self):
+        before = dt.datetime.now().replace(microsecond=0)
+        self.load()
+        saved = self.ctl.store.snapshots()["AAPL"]
+        self.assertEqual((saved["price"], saved["currency"], saved["source"]), (100.0, "USD", "Testquelle"))
+        self.assertGreaterEqual(saved["fetched_at"], before)
+
+    def test_freshly_loaded_quote_is_not_stale(self):
+        self.load()
+        fresh = self.ctl.freshness("AAPL")
+        self.assertFalse(fresh["stale"])
+        self.assertEqual((fresh["source"], fresh["error"]), ("Testquelle", None))
+        self.assertEqual(self.ctl.stale_symbols(), [])
+
+    def test_quote_becomes_stale_after_three_refresh_intervals(self):
+        self.load()
+        fetched = self.ctl.quote_times["AAPL"]
+        edge = dt.timedelta(seconds=w.STALE_SECONDS)
+        self.assertFalse(self.ctl.freshness("AAPL", fetched + edge)["stale"])
+        self.assertTrue(self.ctl.freshness("AAPL", fetched + edge + dt.timedelta(seconds=1))["stale"])
+        self.assertEqual(self.ctl.stale_symbols(fetched + edge + dt.timedelta(seconds=1)), ["AAPL"])
+
+    def test_no_quote_means_no_freshness(self):
+        self.ctl.quotes.pop("AAPL")
+        self.assertIsNone(self.ctl.freshness("AAPL"))
+        self.assertNotIn("AAPL", self.ctl.stale_symbols())
+
+    def test_failed_refresh_keeps_last_quote_but_marks_it_stale(self):
+        self.load()
+        with mock.patch.object(sd, "fetch_quote", side_effect=RuntimeError("offline")):
+            self.ctl.load_quote("AAPL")
+            self.assertTrue(wait_until(lambda: "AAPL" in self.ctl.quote_errors))
+        self.assertEqual(self.ctl.quotes["AAPL"]["price"], 100.0)
+        fresh = self.ctl.freshness("AAPL")
+        self.assertTrue(fresh["stale"])
+        self.assertIn("offline", fresh["error"])
+        self.assertEqual(self.ctl.stale_symbols(), ["AAPL"])
+
+    def test_failed_refresh_does_not_touch_the_saved_snapshot(self):
+        self.load()
+        saved = self.ctl.store.snapshots()["AAPL"]
+        with mock.patch.object(sd, "fetch_quote", side_effect=RuntimeError("offline")):
+            self.ctl.load_quote("AAPL")
+            wait_until(lambda: "AAPL" in self.ctl.quote_errors)
+        self.assertEqual(self.ctl.store.snapshots()["AAPL"], saved)
+
+    def test_failed_refresh_tells_the_ui_to_update(self):
+        changes = []
+        self.ctl.changed.connect(lambda: changes.append(1))
+        with mock.patch.object(sd, "fetch_quote", side_effect=RuntimeError("offline")):
+            self.ctl.load_quote("AAPL")
+            self.assertTrue(wait_until(lambda: changes))
+
+    def test_next_successful_refresh_clears_the_error(self):
+        with mock.patch.object(sd, "fetch_quote", side_effect=RuntimeError("offline")):
+            self.ctl.load_quote("AAPL")
+            wait_until(lambda: "AAPL" in self.ctl.quote_errors)
+        self.load()
+        self.assertNotIn("AAPL", self.ctl.quote_errors)
+        self.assertFalse(self.ctl.freshness("AAPL")["stale"])
+
+    def test_without_any_quote_a_failure_creates_no_fake_number(self):
+        self.ctl.quotes.pop("AAPL")
+        with mock.patch.object(sd, "fetch_quote", side_effect=RuntimeError("offline")):
+            self.ctl.load_quote("AAPL")
+            wait_until(lambda: "AAPL" in self.ctl.quote_errors)
+        self.assertNotIn("AAPL", self.ctl.quotes)
+
+    def test_last_saved_quotes_are_shown_after_a_restart_with_their_age(self):
+        self.load()
+        saved_at = self.ctl.quote_times["AAPL"]
+        self.restart()
+        self.assertEqual(self.ctl.quotes["AAPL"]["price"], 100.0)
+        self.assertEqual(self.ctl.quote_times["AAPL"], saved_at)
+        self.assertFalse(self.ctl.freshness("AAPL", saved_at)["stale"])
+        self.assertTrue(self.ctl.freshness("AAPL", saved_at + dt.timedelta(days=2))["stale"])
+
+    def test_quote_of_a_removed_symbol_is_not_restored(self):
+        self.load()
+        self.ctl.remove("AAPL")
+        self.assertNotIn("AAPL", self.ctl.quote_times)
+        self.restart()
+        self.assertNotIn("AAPL", self.ctl.quotes)
+
+    def test_new_symbol_gets_its_snapshot_right_away(self):
+        self.ctl.add_symbol("NVDA", self.fail)
+        self.assertTrue(wait_until(lambda: "NVDA" in self.ctl.symbols))
+        self.assertIn("NVDA", self.ctl.store.snapshots())
+        self.assertFalse(self.ctl.freshness("NVDA")["stale"])
+
+
+class InstrumentLoadingTests(AppTestCase):
+    def test_refresh_loads_and_saves_master_data_for_every_symbol(self):
+        self.ctl.refresh()
+        self.assertTrue(wait_until(lambda: len(self.ctl.instruments) == 3))
+        info = self.ctl.instruments["AAPL"]
+        self.assertEqual((info["name"], info["sector"], info["source"]), ("AAPL Inc.", "Technology", "Yahoo Finance"))
+        self.assertEqual(set(self.ctl.store.instruments()), {"AAPL", "MSFT", "DELL"})
+
+    def test_master_data_is_there_after_a_restart_without_new_download(self):
+        self.ctl.refresh()
+        wait_until(lambda: len(self.ctl.instruments) == 3)
+        self.ctl.store.close()
+        self.ctl.shutdown()
+        with mock.patch.object(sd, "fetch_instrument", side_effect=AssertionError("kein neuer Abruf nötig")):
+            self.ctl = w.Controller()
+            self.assertEqual(len(self.ctl.instruments), 3)
+            self.assertFalse(self.ctl.needs_instrument("AAPL"))
+
+    def test_failed_download_is_not_repeated_every_minute(self):
+        calls = []
+
+        def failing(symbol):
+            calls.append(symbol)
+            raise RuntimeError("offline")
+
+        with mock.patch.object(sd, "fetch_instrument", failing):
+            self.ctl.refresh()
+            wait_until(lambda: len(calls) == 3)
+            self.ctl.refresh()
+            wait_until(lambda: False, 300)
+        self.assertEqual(sorted(calls), ["AAPL", "DELL", "MSFT"])
+        self.assertEqual(self.ctl.instruments, {})
+
+    def test_old_master_data_is_reloaded_but_recent_data_is_not(self):
+        now = dt.datetime.now()
+        self.ctl.instruments["AAPL"] = {"name": "x", "fetched_at": now - dt.timedelta(days=8)}
+        self.ctl.instruments["MSFT"] = {"name": "x", "fetched_at": now - dt.timedelta(days=6)}
+        self.assertTrue(self.ctl.needs_instrument("AAPL"))
+        self.assertFalse(self.ctl.needs_instrument("MSFT"))
+        self.assertTrue(self.ctl.needs_instrument("DELL"))  # noch gar keine
+
+    def test_new_symbol_loads_its_master_data(self):
+        self.ctl.add_symbol("NVDA", self.fail)
+        self.assertTrue(wait_until(lambda: "NVDA" in self.ctl.instruments))
+        self.assertIn("NVDA", self.ctl.store.instruments())
+
+    def test_removed_symbol_drops_its_master_data_from_memory(self):
+        self.ctl.refresh()
+        wait_until(lambda: len(self.ctl.instruments) == 3)
+        self.ctl.remove("AAPL")
+        self.assertNotIn("AAPL", self.ctl.instruments)
+
+    def test_master_data_change_tells_the_ui_to_update(self):
+        changes = []
+        self.ctl.changed.connect(lambda: changes.append(1))
+        self.ctl.load_instrument("AAPL")
+        self.assertTrue(wait_until(lambda: changes))
+
+
 class SignalTests(AppTestCase):
     def collect(self, signal):
         seen = []
