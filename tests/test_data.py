@@ -11,12 +11,20 @@ class FakeInfo(dict):
 
 
 class FakeTicker:
-    def __init__(self, symbol, info=None, calendar=None, news=None, details=None, isin="-"):
+    created = []  # (Symbol, history-Aufrufe) der erzeugten Ticker, damit Tests die Abfragen prüfen können
+
+    def __init__(self, symbol, info=None, calendar=None, news=None, details=None, isin="-", frame=None):
+        self.symbol, self.frame, self.history_calls = symbol, frame, []
+        FakeTicker.created.append(self)
         self.fast_info = info if info is not None else FakeInfo(last_price=110.0, previous_close=100.0, currency="USD")
         self.calendar = calendar
         self.news = news or []
         self.info = details if details is not None else {}
         self._isin = isin
+
+    def history(self, **kwargs):
+        self.history_calls.append(kwargs)
+        return self.frame
 
     @property
     def isin(self):
@@ -91,6 +99,52 @@ class SymbolLookupTests(unittest.TestCase):
         self.assertEqual(found[0], {"symbol": "DRO.AX", "name": "DroneShield Limited",
                                     "exchange": "Australian", "type": "EQUITY"})
         self.assertEqual(found[1]["exchange"], "PNK")  # ohne Anzeigenamen der Börse
+
+
+class FxFetchTests(unittest.TestCase):
+    def setUp(self):
+        FakeTicker.created = []
+
+    def test_pair_name_is_foreign_currency_followed_by_base(self):
+        self.assertEqual(sd.fx_pair("USD", "EUR"), "USDEUR=X")
+
+    def test_current_rate(self):
+        patcher, _ = patch_yf(info=FakeInfo(last_price=0.8916))
+        with patcher:
+            self.assertAlmostEqual(sd.fetch_fx_rate("USD", "EUR"), 0.8916)
+        self.assertEqual(FakeTicker.created[0].symbol, "USDEUR=X")
+
+    def test_missing_or_nonpositive_rate_is_an_error(self):
+        for bad in (None, 0, -1.0):
+            patcher, _ = patch_yf(info=FakeInfo(last_price=bad))
+            with patcher, self.assertRaises(ValueError):
+                sd.fetch_fx_rate("USD", "EUR")
+
+    def test_history_becomes_a_day_to_rate_mapping(self):
+        import pandas
+        frame = pandas.DataFrame({"Close": [0.90, 0.91]}, index=pandas.to_datetime(["2026-01-05", "2026-01-06"]))
+        patcher, _ = patch_yf(frame=frame)
+        with patcher:
+            rates = sd.fetch_fx_history("USD", "EUR", dt.date(2026, 1, 1))
+        self.assertEqual(rates, {dt.date(2026, 1, 5): 0.90, dt.date(2026, 1, 6): 0.91})
+        ticker = FakeTicker.created[0]
+        self.assertEqual(ticker.symbol, "USDEUR=X")
+        self.assertEqual(ticker.history_calls, [{"start": "2026-01-01", "interval": "1d"}])
+
+    def test_history_skips_gaps_and_zero_closes(self):
+        import pandas
+        frame = pandas.DataFrame({"Close": [0.90, float("nan"), 0.0, 0.92]},
+                                 index=pandas.to_datetime(["2026-01-05", "2026-01-06", "2026-01-07", "2026-01-08"]))
+        patcher, _ = patch_yf(frame=frame)
+        with patcher:
+            rates = sd.fetch_fx_history("USD", "EUR", dt.date(2026, 1, 1))
+        self.assertEqual(rates, {dt.date(2026, 1, 5): 0.90, dt.date(2026, 1, 8): 0.92})
+
+    def test_empty_history_is_an_error(self):
+        import pandas
+        patcher, _ = patch_yf(frame=pandas.DataFrame({"Close": []}))
+        with patcher, self.assertRaises(ValueError):
+            sd.fetch_fx_history("USD", "EUR", dt.date(2026, 1, 1))
 
 
 class QuoteTests(unittest.TestCase):

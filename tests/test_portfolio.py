@@ -172,13 +172,51 @@ class SnapshotAndInstrumentTests(unittest.TestCase):
         old.close()
         upgraded = Store(old_path)
         self.addCleanup(upgraded.close)
-        self.assertEqual(upgraded.meta("schema_version"), "2")
+        self.assertEqual(upgraded.meta("schema_version"), "3")
         self.assertEqual(upgraded.symbols(), ["GEV"])
         self.assertEqual(upgraded.opening_realized(), {"GEV": 5.0})
         self.assertEqual(upgraded.transactions()[0].shares, 7.36)
         self.assertEqual(upgraded.snapshots(), {})  # neue Tabellen sind da und leer
         upgraded.save_snapshot("GEV", self.QUOTE, dt.datetime(2026, 10, 8, 23, 0, 0))
         self.assertIn("GEV", upgraded.snapshots())
+
+
+class FxStoreTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.path = os.path.join(self.dir.name, "test.db")
+        self.store = Store(self.path)
+        self.addCleanup(self.store.close)
+
+    def test_daily_rates_roundtrip_per_currency(self):
+        self.store.save_fx_rates("USD", {dt.date(2026, 1, 5): 0.9, dt.date(2026, 1, 6): 0.91}, "Yahoo Finance")
+        self.store.save_fx_rates("CHF", {dt.date(2026, 1, 5): 1.07}, "Yahoo Finance")
+        self.assertEqual(self.store.fx_rates(),
+                         {"USD": {dt.date(2026, 1, 5): 0.9, dt.date(2026, 1, 6): 0.91},
+                          "CHF": {dt.date(2026, 1, 5): 1.07}})
+
+    def test_saving_a_day_again_replaces_its_rate(self):
+        self.store.save_fx_rates("USD", {dt.date(2026, 1, 5): 0.9}, "Yahoo Finance")
+        self.store.save_fx_rates("USD", {dt.date(2026, 1, 5): 0.95, dt.date(2026, 1, 6): 0.96}, "Yahoo Finance")
+        self.assertEqual(self.store.fx_rates()["USD"], {dt.date(2026, 1, 5): 0.95, dt.date(2026, 1, 6): 0.96})
+
+    def test_latest_rate_keeps_source_and_time(self):
+        moment = dt.datetime(2026, 10, 9, 12, 30, 5)
+        self.store.save_fx_latest("USD", 0.8916, moment, "Yahoo Finance")
+        self.store.save_fx_latest("USD", 0.8920, moment + dt.timedelta(minutes=1), "Yahoo Finance")
+        self.assertEqual(self.store.fx_latest(),
+                         {"USD": {"rate": 0.8920, "source": "Yahoo Finance", "fetched_at": moment + dt.timedelta(minutes=1)}})
+
+    def test_rates_survive_reopening(self):
+        self.store.save_fx_rates("USD", {dt.date(2026, 1, 5): 0.9}, "Yahoo Finance")
+        self.store.close()
+        reopened = Store(self.path)
+        self.addCleanup(reopened.close)
+        self.assertEqual(reopened.fx_rates()["USD"][dt.date(2026, 1, 5)], 0.9)
+
+    def test_empty_database_has_no_rates(self):
+        self.assertEqual((self.store.fx_rates(), self.store.fx_latest()), ({}, {}))
 
 
 if __name__ == "__main__":

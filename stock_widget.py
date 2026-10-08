@@ -1606,12 +1606,17 @@ def money(value):
     return f"{value:,.2f} {SYMBOL_OF_BASE.get(BASE, BASE)}"
 
 
+def signed_number(value):
+    """Mit Vorzeichen und zwei Nachkommastellen; was auf 0,00 rundet, zeigt kein Minus ("-0.00")."""
+    return f"{0.0 if abs(value) < 0.005 else value:+,.2f}"
+
+
 def signed_money(value):
-    return f"{value:+,.2f} {SYMBOL_OF_BASE.get(BASE, BASE)}"
+    return f"{signed_number(value)} {SYMBOL_OF_BASE.get(BASE, BASE)}"
 
 
 def signed_percent(value):
-    return "–" if value is None else f"{value:+.2f} %"
+    return "–" if value is None else f"{0.0 if abs(value) < 0.005 else value:+.2f} %"
 
 
 def open_portfolio(ctl, open_symbol):
@@ -1731,7 +1736,7 @@ class HoldingRow(QFrame):
         labels["price"].setToolTip(f"in {holding.currency}")
         labels["value"].setText(f"{holding.value:,.2f}")
         color = sign_color(holding.unrealized)
-        labels["pl"].setText(f"{holding.unrealized:+,.2f}")
+        labels["pl"].setText(signed_number(holding.unrealized))
         labels["pl"].setStyleSheet(f"color: {color};")
         labels["pl"].setToolTip(f"Kurs {signed_money(holding.price_effect)} · Währung {signed_money(holding.fx_effect)}")
         labels["pl_pct"].setText(signed_percent(holding.pl_pct))

@@ -24,6 +24,7 @@ class MigrationTests(AppTestCase):
         self.assertAlmostEqual(self.ctl.realized["GEV"], 20.0)
 
     def test_new_controller_on_same_database_does_not_import_twice(self):
+        self.ctl.shutdown()
         self.ctl.store.close()
         again = w.Controller()
         self.addCleanup(again.store.close)
@@ -93,6 +94,7 @@ class TradeTests(AppTestCase):
 
     def test_state_survives_a_restart(self):
         self.ctl.record_trade("AAPL", "buy", 10, 100, 0, DAY1)
+        self.ctl.shutdown()
         self.ctl.store.close()
         again = w.Controller()
         self.addCleanup(lambda: again.pool.shutdown(wait=False))
@@ -307,8 +309,8 @@ class AddSymbolLookupTests(AppTestCase):
 
 class FreshnessTests(AppTestCase):
     def restart(self):
-        self.ctl.store.close()
         self.ctl.shutdown()
+        self.ctl.store.close()
         self.ctl = w.Controller()
 
     def load(self, symbol="AAPL"):
@@ -418,8 +420,8 @@ class InstrumentLoadingTests(AppTestCase):
     def test_master_data_is_there_after_a_restart_without_new_download(self):
         self.ctl.refresh()
         wait_until(lambda: len(self.ctl.instruments) == 3)
-        self.ctl.store.close()
         self.ctl.shutdown()
+        self.ctl.store.close()
         with mock.patch.object(sd, "fetch_instrument", side_effect=AssertionError("kein neuer Abruf nötig")):
             self.ctl = w.Controller()
             self.assertEqual(len(self.ctl.instruments), 3)
@@ -464,6 +466,169 @@ class InstrumentLoadingTests(AppTestCase):
         self.ctl.changed.connect(lambda: changes.append(1))
         self.ctl.load_instrument("AAPL")
         self.assertTrue(wait_until(lambda: changes))
+
+
+class FxLoadingTests(AppTestCase):
+    D1 = dt.date(2026, 1, 5)
+
+    def setUp(self):
+        super().setUp()
+        self.calls = {"rate": [], "history": []}
+
+        def rate(code, base):
+            self.calls["rate"].append((code, base))
+            return {"USD": 0.9, "CHF": 1.05}[code]
+
+        def history(code, base, start):
+            self.calls["history"].append((code, base, start))
+            return {start + dt.timedelta(days=i): {"USD": 0.9, "CHF": 1.05}[code]
+                    for i in range((dt.date.today() - start).days + 1)}
+
+        for name, fake in (("fetch_fx_rate", rate), ("fetch_fx_history", history)):
+            patcher = mock.patch.object(sd, name, fake)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_only_foreign_currencies_with_transactions_are_needed(self):
+        self.ctl.quotes["MSFT"]["currency"] = "EUR"
+        self.ctl.record_trade("AAPL", "buy", 1, 100, 0, self.D1)
+        self.ctl.record_trade("MSFT", "buy", 1, 100, 0, self.D1)
+        self.assertEqual(self.ctl.currencies_in_use(), {"USD": self.D1})  # EUR ist die Basis, DELL hat nichts
+
+    def test_earliest_transaction_day_counts_across_symbols(self):
+        self.ctl.record_trade("AAPL", "buy", 1, 100, 0, dt.date(2026, 3, 1))
+        self.ctl.record_trade("DELL", "buy", 1, 100, 0, dt.date(2026, 2, 1))
+        self.assertEqual(self.ctl.currencies_in_use(), {"USD": dt.date(2026, 2, 1)})
+
+    def test_pence_quotes_need_pounds(self):
+        self.ctl.quotes["AAPL"]["currency"] = "GBp"
+        self.ctl.record_trade("AAPL", "buy", 1, 100, 0, self.D1)
+        self.assertEqual(list(self.ctl.currencies_in_use()), ["GBP"])
+
+    def test_first_trade_loads_current_rate_and_history_and_saves_both(self):
+        self.ctl.record_trade("AAPL", "buy", 10, 80, 0, self.D1)
+        self.assertTrue(wait_until(lambda: self.ctl.fx.now("USD") == 0.9 and self.ctl.fx.coverage("USD")))
+        self.assertEqual(self.ctl.store.fx_latest()["USD"]["source"], "Yahoo Finance")
+        self.assertIn(self.D1, self.ctl.store.fx_rates()["USD"])
+
+    def test_history_starts_a_week_before_the_first_trade(self):
+        self.ctl.record_trade("AAPL", "buy", 10, 80, 0, self.D1)
+        self.assertTrue(wait_until(lambda: self.calls["history"]))
+        self.assertEqual(self.calls["history"][0], ("USD", "EUR", self.D1 - dt.timedelta(days=7)))
+
+    def test_no_rate_is_fetched_for_a_base_currency_portfolio(self):
+        self.ctl.quotes["AAPL"]["currency"] = "EUR"
+        self.ctl.record_trade("AAPL", "buy", 10, 80, 0, self.D1)
+        wait_until(lambda: False, 300)
+        self.assertEqual(self.calls, {"rate": [], "history": []})
+
+    def test_rates_are_there_after_a_restart_without_new_download(self):
+        self.ctl.record_trade("AAPL", "buy", 10, 80, 0, self.D1)
+        wait_until(lambda: self.ctl.fx.coverage("USD") and self.ctl.fx.now("USD"))
+        self.ctl.shutdown()
+        self.ctl.store.close()
+        with mock.patch.object(sd, "fetch_fx_rate", side_effect=RuntimeError("offline")), \
+                mock.patch.object(sd, "fetch_fx_history", side_effect=RuntimeError("offline")):
+            self.ctl = w.Controller()
+            self.assertEqual(self.ctl.fx.now("USD"), 0.9)
+            self.assertEqual(self.ctl.fx.on("USD", self.D1), 0.9)
+
+    def test_after_a_restart_only_new_days_are_loaded(self):
+        self.ctl.record_trade("AAPL", "buy", 10, 80, 0, self.D1)
+        wait_until(lambda: self.ctl.fx.coverage("USD") and self.ctl.fx.now("USD"))
+        self.ctl.shutdown()
+        self.ctl.store.close()
+        self.calls["history"].clear()
+        self.ctl = w.Controller()
+        self.ctl.quotes = {s: dict(QUOTE) for s in self.ctl.symbols}
+        self.ctl.refresh_fx()
+        self.assertTrue(wait_until(lambda: self.calls["history"]))
+        self.assertEqual(self.calls["history"][0][2], dt.date.today() - dt.timedelta(days=7))
+
+    def test_history_is_loaded_once_per_start_but_again_after_a_new_trade(self):
+        self.ctl.record_trade("AAPL", "buy", 10, 80, 0, self.D1)
+        wait_until(lambda: len(self.calls["history"]) == 1)
+        self.ctl.refresh_fx()
+        self.ctl.refresh_fx()
+        wait_until(lambda: False, 300)
+        self.assertEqual(len(self.calls["history"]), 1)
+        self.ctl.record_trade("AAPL", "buy", 1, 80, 0, dt.date(2025, 6, 1))  # älterer Kauf braucht mehr Historie
+        self.assertTrue(wait_until(lambda: len(self.calls["history"]) == 2))
+        self.assertEqual(self.calls["history"][1][2], dt.date(2025, 6, 1) - dt.timedelta(days=7))
+
+    def test_failed_rate_download_is_reported_and_leaves_the_rate_unknown(self):
+        seen = []
+        self.ctl.status.connect(seen.append)
+        with mock.patch.object(sd, "fetch_fx_rate", side_effect=RuntimeError("offline")), \
+                mock.patch.object(sd, "fetch_fx_history", side_effect=RuntimeError("offline")):
+            self.ctl.record_trade("AAPL", "buy", 10, 80, 0, self.D1)
+            self.assertTrue(wait_until(lambda: "Wechselkurs USD → EUR nicht abrufbar" in seen))
+        self.assertIsNone(self.ctl.fx.now("USD"))
+        summary = self.ctl.portfolio_summary()
+        self.assertEqual(summary.holdings, [])
+        self.assertIn("AAPL: kein Wechselkurs USD → EUR, nicht enthalten", summary.warnings)
+
+
+class PortfolioSummaryTests(AppTestCase):
+    D1 = dt.date(2026, 1, 5)
+
+    def setUp(self):
+        super().setUp()
+        self.ctl.fx.add_history("USD", {self.D1: 0.90})
+        self.ctl.fx.set_latest("USD", 0.90, dt.datetime.now(), "Test")
+
+    def test_summary_converts_with_the_stored_rates(self):
+        self.ctl.record_trade("AAPL", "buy", 10, 80, 0, self.D1)
+        summary = self.ctl.portfolio_summary()
+        self.assertAlmostEqual(summary.value, 900.0)     # 10 * 100 * 0,90
+        self.assertAlmostEqual(summary.invested, 720.0)  # 10 * 80 * 0,90
+        self.assertEqual(summary.warnings, [])
+
+    def test_summary_follows_the_watchlist_order_and_includes_carried_realized_profit(self):
+        self.ctl.store.close()
+        self.ctl.shutdown()
+        self.ctl = w.Controller()
+        self.ctl.quotes = {s: dict(QUOTE) for s in self.ctl.symbols}
+        self.ctl.fx.add_history("USD", {self.D1: 0.90})
+        self.ctl.fx.set_latest("USD", 0.90, dt.datetime.now(), "Test")
+        self.ctl.store.db.execute("UPDATE watchlist SET opening_realized = 10 WHERE symbol = 'DELL'")
+        self.ctl.store.db.commit()
+        self.ctl.reload_ledger()
+        self.ctl.record_trade("MSFT", "buy", 1, 100, 0, self.D1)
+        self.ctl.record_trade("AAPL", "buy", 1, 100, 0, self.D1)
+        summary = self.ctl.portfolio_summary()
+        self.assertEqual([h.symbol for h in summary.holdings], ["AAPL", "MSFT"])
+        self.assertAlmostEqual(summary.realized, 9.0)  # 10 USD * 0,90
+
+    def test_removed_stock_with_holdings_is_reported_not_silently_dropped(self):
+        self.ctl.record_trade("AAPL", "buy", 10, 80, 0, self.D1)
+        self.ctl.remove("AAPL")
+        summary = self.ctl.portfolio_summary()
+        self.assertEqual(summary.holdings, [])
+        self.assertIn("Entfernte Aktien mit Bestand sind nicht enthalten: AAPL", summary.warnings)
+
+    def test_removed_stock_that_was_fully_sold_is_not_reported(self):
+        self.ctl.record_trade("AAPL", "buy", 10, 80, 0, self.D1)
+        self.ctl.record_trade("AAPL", "sell", 10, 90, 0, dt.date(2026, 2, 1))
+        self.ctl.remove("AAPL")
+        self.assertEqual(self.ctl.removed_holdings, [])
+
+    def test_stale_quotes_are_mentioned(self):
+        self.ctl.record_trade("AAPL", "buy", 10, 80, 0, self.D1)
+        self.ctl.quote_errors["AAPL"] = "offline"
+        warnings = self.ctl.portfolio_summary().warnings
+        self.assertIn("1 Kurs veraltet: AAPL", warnings)
+
+    def test_two_stale_quotes_use_the_plural(self):
+        self.ctl.quote_errors.update({"AAPL": "offline", "MSFT": "offline"})
+        self.assertIn("2 Kurse veraltet: AAPL, MSFT", self.ctl.portfolio_summary().warnings)
+
+    def test_states_follow_the_ledger(self):
+        self.ctl.record_trade("AAPL", "buy", 10, 80, 0, self.D1)
+        self.assertEqual(self.ctl.states["AAPL"].shares, 10)
+        self.ctl.record_trade("AAPL", "sell", 10, 90, 0, dt.date(2026, 2, 1))
+        self.assertEqual(self.ctl.states["AAPL"].shares, 0)
+        self.assertEqual(len(self.ctl.states["AAPL"].sales), 1)
 
 
 class SignalTests(AppTestCase):

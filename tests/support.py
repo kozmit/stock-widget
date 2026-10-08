@@ -1,5 +1,6 @@
 """Gemeinsame Hilfen für die Tests: temporäre Datenbank, kein Netzwerk, Dialoge fernsteuern."""
 import datetime as dt
+import datetime as dt
 import json
 import os
 import shutil
@@ -41,6 +42,22 @@ def fake_instrument(symbol):
 def fake_history(symbol, range_key="6m"):
     start = dt.datetime(2026, 1, 1)
     return [(start + dt.timedelta(days=i), 100.0 + i) for i in range(10)]
+
+
+FX_RATES = {"USD": 0.9, "CHF": 1.05, "AUD": 0.6, "GBP": 1.2}  # Basiswährung je Einheit
+
+
+def fake_fx_rate(code, base):
+    if code not in FX_RATES:
+        raise ValueError(f"kein Wechselkurs {code}")
+    return FX_RATES[code]
+
+
+def fake_fx_history(code, base, start):
+    if code not in FX_RATES:
+        raise ValueError(f"keine Historie {code}")
+    days = (dt.date.today() - start).days
+    return {start + dt.timedelta(days=i): FX_RATES[code] for i in range(days + 1)}
 
 
 def wait_until(condition, timeout=3000):
@@ -96,7 +113,8 @@ class AppTestCase(unittest.TestCase):
             self.addCleanup(patcher.stop)
         for name, fake in (("fetch_quote", fake_quote), ("fetch_events", lambda s: []),
                            ("fetch_news", lambda s, count=15: []), ("search_symbols", lambda q, count=8: []),
-                           ("fetch_instrument", fake_instrument), ("fetch_history", fake_history)):
+                           ("fetch_instrument", fake_instrument), ("fetch_history", fake_history), ("fetch_fx_rate", fake_fx_rate),
+                           ("fetch_fx_history", fake_fx_history)):
             patcher = mock.patch.object(sd, name, fake)
             patcher.start()
             self.addCleanup(patcher.stop)

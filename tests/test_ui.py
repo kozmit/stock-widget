@@ -596,6 +596,204 @@ class MasterDataDisplayTests(AppTestCase):
         self.assertFalse(detail.company.isHidden())
 
 
+class NumberFormatTests(unittest.TestCase):
+    def test_signed_amounts_have_a_sign_and_thousands_separators(self):
+        self.assertEqual(w.signed_money(1234.5), "+1,234.50 €")
+        self.assertEqual(w.signed_money(-0.75), "-0.75 €")
+        self.assertEqual(w.money(1350), "1,350.00 €")
+
+    def test_tiny_negative_values_do_not_show_minus_zero(self):
+        self.assertEqual(w.signed_money(-0.001), "+0.00 €")
+        self.assertEqual(w.signed_number(-0.004), "+0.00")
+        self.assertEqual(w.signed_percent(-0.003), "+0.00 %")
+        self.assertEqual(w.signed_money(-0.005), "-0.01 €")  # ab einem halben Cent wird gerundet
+
+    def test_missing_percentage_is_a_dash(self):
+        self.assertEqual(w.signed_percent(None), "–")
+
+
+class PortfolioWindowTests(AppTestCase):
+    D1 = dt.date(2026, 1, 5)
+
+    def setUp(self):
+        super().setUp()
+        self.ctl.fx.add_history("USD", {self.D1: 0.90})
+        self.ctl.fx.set_latest("USD", 0.90, dt.datetime.now(), "Test")
+        self.ctl.instruments = {
+            "AAPL": {"name": "Apple Inc.", "sector": "Technology", "country": "United States", "currency": "USD"},
+            "MSFT": {"name": "Microsoft", "sector": "Technology", "country": "United States", "currency": "USD"},
+            "DELL": {"name": "Dell", "sector": "", "country": "", "currency": "USD"}}
+        self.ctl.record_trade("AAPL", "buy", 10, 80, 0, self.D1)    # Kosten 720 €, Wert 900 €
+        self.ctl.record_trade("MSFT", "buy", 5, 100, 0, self.D1)    # Kosten 450 €, Wert 450 €
+        self.main = w.MainWindow(self.ctl)
+        self.opened = []
+        w.open_portfolio(self.ctl, self.opened.append)
+        self.pw = w.PORTFOLIO_WINDOWS["window"]
+
+    def legend_labels(self):
+        rows = []
+        for index in range(self.pw.legend.count()):
+            widget = self.pw.legend.itemAt(index).widget()
+            if widget:
+                labels = widget.findChildren(QLabel) or ([widget] if isinstance(widget, QLabel) else [])
+                rows.append([label.text() for label in labels if label.text()])  # ohne den Farbpunkt
+        return rows
+
+    def test_total_value_and_invested_capital(self):
+        self.assertEqual(self.pw.total.text(), "1,350.00 €")
+        self.assertEqual(self.pw.total_sub.text(), "investiert 1,170.00 €")
+
+    def test_unrealized_tile_shows_amount_percentage_and_the_split(self):
+        self.assertEqual(self.pw.unrealized.value.text(), "+180.00 €")
+        self.assertIn("+15.38 %", self.pw.unrealized.sub.text())
+        self.assertIn("Kurs +180.00 €", self.pw.unrealized.sub.text())
+        self.assertIn("Währung +0.00 €", self.pw.unrealized.sub.text())
+
+    def test_gain_color_follows_the_sign(self):
+        self.assertIn(w.GREEN, self.pw.unrealized.value.styleSheet())
+        self.ctl.quotes["AAPL"]["price"] = 50.0
+        self.pw.refresh()
+        self.assertEqual(self.pw.unrealized.value.text(), "-270.00 €")  # 450 + 450 - 1170
+        self.assertIn(w.RED, self.pw.unrealized.value.styleSheet())
+
+    def test_currency_effect_appears_when_the_rate_moves(self):
+        self.ctl.fx.set_latest("USD", 0.80, dt.datetime.now(), "Test")
+        self.pw.refresh()
+        # Wert 1000 * 0,80 + 500 * 0,80 = 1200; Kosten 1170 -> +30; Kurs +180 (zum Kaufkurs 0,90 gerechnet), Währung -150
+        self.assertEqual(self.pw.unrealized.value.text(), "+30.00 €")
+        self.assertIn("Währung -150.00 €", self.pw.unrealized.sub.text())
+
+    def test_realized_tile_and_total_result_after_a_sale(self):
+        self.ctl.record_trade("AAPL", "sell", 2, 110, 0, dt.date(2026, 2, 1))  # 60 USD Gewinn = 54 €
+        self.pw.refresh()
+        self.assertEqual(self.pw.realized.value.text(), "+54.00 €")
+        self.assertIn("aus Verkäufen", self.pw.realized.sub.text())
+        # unrealisiert: 8 AAPL (Kosten 576, Wert 720) + MSFT (450/450) = +144; Summe +198
+        self.assertEqual(self.pw.unrealized.value.text(), "+144.00 €")
+        self.assertEqual(self.pw.result.value.text(), "+198.00 €")
+        self.assertIn("Rendite +", self.pw.result.sub.text())
+
+    def test_warnings_are_shown_and_hidden(self):
+        self.assertTrue(self.pw.notes.isHidden())
+        self.ctl.quote_errors["AAPL"] = "offline"
+        self.pw.refresh()
+        self.assertFalse(self.pw.notes.isHidden())
+        self.assertIn("1 Kurs veraltet: AAPL", self.pw.notes.text())
+        self.ctl.quote_errors.clear()
+        self.pw.refresh()
+        self.assertTrue(self.pw.notes.isHidden())
+
+    def test_missing_rate_is_named_in_the_notes(self):
+        self.ctl.quotes["DELL"]["currency"] = "CHF"
+        self.ctl.record_trade("DELL", "buy", 1, 100, 0, self.D1)
+        self.pw.refresh()
+        self.assertIn("DELL: kein Wechselkurs CHF → EUR", self.pw.notes.text())
+        self.assertNotIn("DELL", self.pw.rows)
+
+    def test_allocation_by_position_is_the_default_and_sorted(self):
+        labels = self.legend_labels()
+        self.assertEqual([l[0] for l in labels][:2], ["AAPL", "MSFT"])
+        self.assertEqual(labels[0][1], "66.7 %")
+        self.assertEqual(self.pw.dimension, "position")
+
+    def test_switching_the_allocation_to_sector_country_and_currency(self):
+        self.pw.segments["sector"].click()
+        self.assertEqual(self.legend_labels(), [["Technology", "100.0 %"]])
+        self.pw.segments["country"].click()
+        self.assertEqual(self.legend_labels(), [["United States", "100.0 %"]])
+        self.pw.segments["currency"].click()
+        self.assertEqual(self.legend_labels(), [["USD", "100.0 %"]])
+        self.assertTrue(self.pw.segments["currency"].isChecked())
+
+    def test_unknown_sector_is_named_unknown(self):
+        self.ctl.record_trade("DELL", "buy", 1, 100, 0, self.D1)
+        self.pw.segments["sector"].click()
+        self.pw.refresh()
+        self.assertIn(["Unbekannt", "6.2 %"], self.legend_labels())  # 90 von 1.440 €
+
+    def test_chosen_allocation_survives_a_refresh(self):
+        self.pw.segments["country"].click()
+        self.pw.refresh()
+        self.assertEqual(self.pw.dimension, "country")
+        self.assertTrue(self.pw.segments["country"].isChecked())
+
+    def test_donut_gets_one_slice_per_legend_entry_and_can_be_painted(self):
+        self.assertEqual(len(self.pw.donut.slices), 2)
+        self.assertFalse(self.pw.donut.grab().isNull())
+        self.pw.segments["sector"].click()
+        self.assertEqual(len(self.pw.donut.slices), 1)
+        self.assertFalse(self.pw.donut.grab().isNull())
+
+    def test_position_rows_are_sorted_by_value_with_profit_and_share(self):
+        self.assertEqual(list(self.pw.rows), ["AAPL", "MSFT"])
+        row = self.pw.rows["AAPL"].labels
+        self.assertEqual((row["shares"].text(), row["avg_cost"].text(), row["price"].text()), ("10", "80.00", "100.00"))
+        self.assertEqual((row["value"].text(), row["pl"].text(), row["pl_pct"].text(), row["share"].text()),
+                         ("900.00", "+180.00", "+25.00 %", "66.7 %"))
+        self.assertIn("Kurs", row["pl"].toolTip())
+        self.assertEqual(row["symbol"].toolTip(), "Apple Inc.")
+        self.assertEqual(row["price"].toolTip(), "in USD")
+
+    def test_rows_reorder_when_values_change(self):
+        self.ctl.quotes["MSFT"]["price"] = 500.0
+        self.pw.refresh()
+        order = [self.pw.holdings_layout.itemAt(i).widget().symbol for i in range(self.pw.holdings_layout.count())]
+        self.assertEqual(order, ["MSFT", "AAPL"])
+
+    def test_closed_position_leaves_the_table(self):
+        self.ctl.record_trade("MSFT", "sell", 5, 100, 0, dt.date(2026, 2, 1))
+        self.pw.refresh()
+        self.assertEqual(list(self.pw.rows), ["AAPL"])
+        self.assertEqual(self.pw.holdings_layout.count(), 1)
+
+    def test_empty_portfolio_shows_a_hint_and_zero_values(self):
+        for symbol in ("AAPL", "MSFT"):
+            self.ctl.record_trade(symbol, "sell", self.ctl.positions[symbol]["shares"], 100, 0, dt.date(2026, 2, 1))
+        self.pw.refresh()
+        self.assertFalse(self.pw.empty.isHidden())
+        self.assertEqual(self.pw.total.text(), "0.00 €")
+        self.assertEqual(self.legend_labels(), [["Keine Daten"]])
+        self.assertEqual(self.pw.donut.slices, [])
+        self.assertFalse(self.pw.donut.grab().isNull())
+
+    def test_clicking_a_row_opens_that_stock(self):
+        self.pw.rows["MSFT"].clicked.emit("MSFT")
+        self.assertEqual(self.opened, ["MSFT"])
+
+    def test_window_opens_once_docks_and_frees_its_slot_on_close(self):
+        w.open_portfolio(self.ctl, self.opened.append)
+        self.assertEqual(len(w.PORTFOLIO_WINDOWS), 1)
+        self.assertIn(self.pw, w.Dock.windows)
+        self.pw.close()
+        self.assertNotIn("window", w.PORTFOLIO_WINDOWS)
+        self.assertNotIn(self.pw, w.Dock.windows)
+
+    def test_many_changes_in_a_row_cause_one_refresh(self):
+        refreshes = []
+        self.pw.update_timer.timeout.disconnect()
+        self.pw.update_timer.timeout.connect(lambda: refreshes.append(1))
+        for _ in range(8):
+            self.ctl.changed.emit()
+        self.assertTrue(wait_until(lambda: refreshes))
+        wait_until(lambda: False, 400)
+        self.assertEqual(len(refreshes), 1)
+
+    def test_window_follows_live_changes(self):
+        self.ctl.quotes["AAPL"]["price"] = 200.0
+        self.ctl.changed.emit()
+        self.assertTrue(wait_until(lambda: self.pw.total.text() == "2,250.00 €"))  # 2000 * 0,9 + 450
+
+    def test_main_window_button_opens_the_portfolio(self):
+        self.pw.close()
+        self.main.portfolio_button.click()
+        self.assertIn("window", w.PORTFOLIO_WINDOWS)
+
+    def test_table_fits_the_window_width(self):
+        self.pw.show()
+        row = self.pw.rows["AAPL"]
+        self.assertLessEqual(row.minimumSizeHint().width(), self.pw.width() - 74)
+
+
 class FlashTests(AppTestCase):
     def setUp(self):
         super().setUp()
