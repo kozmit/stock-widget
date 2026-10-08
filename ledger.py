@@ -4,11 +4,15 @@ Der Bestand wird nie gespeichert, sondern immer aus Käufen und Verkäufen berec
 Verkäufe verbrauchen die ältesten Stücke zuerst (FIFO, wie es das deutsche Steuerrecht für
 Wertpapiere im selben Depot verlangt). Kaufgebühren erhöhen die Anschaffungskosten,
 Verkaufsgebühren mindern den Erlös.
+
+Für Auswertungen in einer anderen Währung bleibt sichtbar, aus welchen Käufen der Bestand
+besteht (Lot) und welche Käufe ein Verkauf verbraucht hat (Piece), jeweils mit Kaufdatum.
 """
 import datetime as dt
 from dataclasses import dataclass
 
 EPS = 1e-9
+OPENING_NOTE = "Startbestand"  # Käufe mit dieser Notiz sind übernommene Bestände ohne bekanntes Kaufdatum
 
 
 @dataclass(frozen=True)
@@ -24,6 +28,24 @@ class Transaction:
 
 
 @dataclass(frozen=True)
+class Lot:
+    """Ein noch gehaltener Teil eines Kaufs."""
+    day: dt.date
+    shares: float
+    unit_cost: float   # Kaufkurs je Stück inklusive anteiliger Kaufgebühr
+    opening: bool = False
+
+
+@dataclass(frozen=True)
+class Piece:
+    """Der Teil eines Kaufs, den ein Verkauf verbraucht hat."""
+    day: dt.date
+    shares: float
+    cost: float        # Anschaffungskosten dieser Stücke inklusive Kaufgebühr
+    opening: bool = False
+
+
+@dataclass(frozen=True)
 class Sale:
     """Ein einzelner Verkauf mit den nach FIFO zugeordneten Anschaffungskosten."""
     transaction_id: int
@@ -31,6 +53,7 @@ class Sale:
     shares: float
     proceeds: float    # Erlös abzüglich Verkaufsgebühr
     cost: float        # Anschaffungskosten der verkauften Stücke inklusive Kaufgebühren
+    pieces: tuple = () # die verbrauchten Käufe, älteste zuerst
 
     @property
     def gain(self):
@@ -43,6 +66,7 @@ class PositionState:
     cost_total: float  # Anschaffungskosten der noch gehaltenen Stücke
     realized: float    # Summe der Gewinne und Verluste aller Verkäufe
     sales: tuple = ()
+    lots: tuple = ()   # die noch gehaltenen Käufe, älteste zuerst
 
     @property
     def avg_cost(self):
@@ -63,31 +87,34 @@ def validate(tx):
 def replay(transactions):
     """Rechnet alle Transaktionen einer Aktie durch. Wirft ValueError, wenn der Verlauf ungültig ist
     (zum Beispiel ein Verkauf von mehr Stücken, als zu dem Zeitpunkt vorhanden waren)."""
-    lots = []          # [Stück, Stückkosten], älteste zuerst
+    lots = []          # [Stück, Stückkosten, Kaufdatum, Startbestand], älteste zuerst
     realized = 0.0
     sales = []
     # Am selben Tag zählen Käufe vor Verkäufen.
     for tx in sorted(transactions, key=lambda t: (t.day, t.kind != "buy", t.id)):
         validate(tx)
         if tx.kind == "buy":
-            lots.append([tx.shares, (tx.shares * tx.price + tx.fee) / tx.shares])
+            lots.append([tx.shares, (tx.shares * tx.price + tx.fee) / tx.shares, tx.day,
+                         tx.note.startswith(OPENING_NOTE)])
             continue
         held = sum(lot[0] for lot in lots)
         if tx.shares > held + EPS:
             raise ValueError(f"Am {tx.day:%d.%m.%Y} sind nur {held:g} Stück vorhanden, "
                              f"verkauft werden {tx.shares:g}")
-        remaining, cost = tx.shares, 0.0
+        remaining, cost, pieces = tx.shares, 0.0, []
         while remaining > EPS:
             take = min(lots[0][0], remaining)
             cost += take * lots[0][1]
+            pieces.append(Piece(lots[0][2], take, take * lots[0][1], lots[0][3]))
             lots[0][0] -= take
             remaining -= take
             if lots[0][0] <= EPS:
                 lots.pop(0)
         proceeds = tx.shares * tx.price - tx.fee
-        sales.append(Sale(tx.id, tx.day, tx.shares, proceeds, cost))
+        sales.append(Sale(tx.id, tx.day, tx.shares, proceeds, cost, tuple(pieces)))
         realized += proceeds - cost
+    kept = tuple(Lot(lot[2], lot[0], lot[1], lot[3]) for lot in lots)
     shares = sum(lot[0] for lot in lots)
     if shares <= EPS:
         return PositionState(0.0, 0.0, realized, tuple(sales))
-    return PositionState(shares, sum(lot[0] * lot[1] for lot in lots), realized, tuple(sales))
+    return PositionState(shares, sum(lot[0] * lot[1] for lot in lots), realized, tuple(sales), kept)

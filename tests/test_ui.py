@@ -739,6 +739,8 @@ class WindowTests(AppTestCase):
             self.assertTrue(wait_until(lambda: calls == ["6m", "5y"] and detail.chart.points is not None))
             self.assertEqual([k for k, b in detail.range_buttons.items() if b.isChecked()], ["5y"])
             self.assertEqual(list(detail.range_buttons), ["1w", "1m", "6m", "1y", "5y"])
+            self.assertEqual(detail.range_change.text(), "+4.00 %")
+            detail.chart.hover = 2
             detail.chart.grab()  # Zeichnen darf nicht scheitern
 
     def test_detail_chart_reports_a_failed_load(self):

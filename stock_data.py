@@ -58,6 +58,27 @@ def fetch_history(symbol, range_key=DEFAULT_RANGE):
     return points
 
 
+def fx_pair(currency, base):
+    return f"{currency}{base}=X"
+
+
+def fetch_fx_rate(currency, base):
+    """Aktueller Kurs: so viele Einheiten base kostet eine Einheit currency."""
+    rate = yf.Ticker(fx_pair(currency, base)).fast_info["last_price"]
+    if not rate or rate <= 0:
+        raise ValueError(f"kein Wechselkurs {currency} → {base}")
+    return float(rate)
+
+
+def fetch_fx_history(currency, base, start):
+    """Tageskurse ab start als {Datum: Kurs}."""
+    history = yf.Ticker(fx_pair(currency, base)).history(start=start.isoformat(), interval="1d")
+    rates = {stamp.date(): float(close) for stamp, close in history["Close"].items() if close and close > 0}
+    if not rates:
+        raise ValueError(f"keine Wechselkurs-Historie {currency} → {base}")
+    return rates
+
+
 def fetch_instrument(symbol):
     """Stammdaten einer Aktie. Die ISIN liefert Yahoo nur bei ETFs; sonst bleibt das Feld leer."""
     ticker = yf.Ticker(symbol)

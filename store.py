@@ -49,9 +49,23 @@ CREATE TABLE IF NOT EXISTS instruments (
     source TEXT NOT NULL,
     fetched_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS fx_rates (
+    currency TEXT NOT NULL,
+    day TEXT NOT NULL,
+    rate REAL NOT NULL,
+    source TEXT NOT NULL,
+    PRIMARY KEY (currency, day)
+);
+CREATE TABLE IF NOT EXISTS fx_latest (
+    currency TEXT PRIMARY KEY,
+    rate REAL NOT NULL,
+    source TEXT NOT NULL,
+    fetched_at TEXT NOT NULL
+);
 """
 # 1: Watchlist und Transaktionen. 2: dazu letzter Kurs und Stammdaten je Aktie, jeweils mit Quelle und Zeitpunkt.
-SCHEMA_VERSION = "2"
+# 3: dazu Wechselkurse in die Basiswährung (Tageskurse und letzter Kurs).
+SCHEMA_VERSION = "3"
 INSTRUMENT_FIELDS = ("name", "exchange", "currency", "sector", "industry", "country", "isin")
 DEFAULT_SYMBOLS = ["AAPL", "MSFT", "DELL"]
 
@@ -139,6 +153,28 @@ class Store:
             "FROM instruments")
         return {r[0]: {**dict(zip(INSTRUMENT_FIELDS, r[1:8])), "source": r[8],
                        "fetched_at": dt.datetime.fromisoformat(r[9])} for r in rows}
+
+    # -- Wechselkurse (Basiswährung je Einheit Fremdwährung) --
+    def save_fx_rates(self, currency, rates, source):
+        self.db.executemany(
+            "INSERT OR REPLACE INTO fx_rates VALUES (?, ?, ?, ?)",
+            [(currency, day.isoformat(), rate, source) for day, rate in rates.items()])
+        self.db.commit()
+
+    def fx_rates(self):
+        history = {}
+        for currency, day, rate in self.db.execute("SELECT currency, day, rate FROM fx_rates"):
+            history.setdefault(currency, {})[dt.date.fromisoformat(day)] = rate
+        return history
+
+    def save_fx_latest(self, currency, rate, fetched_at, source):
+        self.db.execute("INSERT OR REPLACE INTO fx_latest VALUES (?, ?, ?, ?)",
+                        (currency, rate, source, fetched_at.isoformat(timespec="seconds")))
+        self.db.commit()
+
+    def fx_latest(self):
+        rows = self.db.execute("SELECT currency, rate, source, fetched_at FROM fx_latest")
+        return {r[0]: {"rate": r[1], "source": r[2], "fetched_at": dt.datetime.fromisoformat(r[3])} for r in rows}
 
     # -- Übernahme der bisherigen Daten (watchlist.json) --
     def import_legacy(self, json_path, today=None):
