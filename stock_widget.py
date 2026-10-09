@@ -27,6 +27,7 @@ import consensus as cons
 import events as evt
 import fundamentals as fund
 import keywords as kw
+import newsfeed
 import sources
 import stock_data as sd
 import fx as fx_module
@@ -37,6 +38,7 @@ from store import Store
 REFRESH_SECONDS = 60
 STALE_SECONDS = 3 * REFRESH_SECONDS          # so lange gilt ein Kurs ohne neuen Abruf als aktuell
 INSTRUMENT_MAX_AGE = dt.timedelta(days=7)    # danach werden die Stammdaten neu geladen
+NEWS_MAX_AGE = dt.timedelta(minutes=10)      # so lange gelten geladene News für den Feed als frisch
 NEWS_FETCH_COUNT = 40                        # so viele News werden geholt; der Filter lässt davon nur einen Teil übrig
 NOT_LOADED = object()                        # Marke: die News einer Aktie sind noch nicht angekommen
 
@@ -662,6 +664,7 @@ class Controller(QObject):
     base_changed = Signal(str)  # die Basiswährung wurde umgestellt (EUR oder USD)
     calendar_changed = Signal()  # Termine wurden angelegt, geändert, gelöscht oder von Yahoo aktualisiert
     fundamentals_changed = Signal(str)  # Kennzahlen einer Aktie wurden geladen (oder der Abruf schlug fehl)
+    news_changed = Signal(str)  # die News einer Aktie wurden geladen (oder der Abruf schlug fehl)
     terms_changed = Signal(str)  # die Suchbegriffe einer Aktie (News-Filter) wurden gesammelt
     trade_recorded = Signal(str, str)  # Symbol, "buy" oder "sell"
     status = Signal(str)
@@ -684,6 +687,7 @@ class Controller(QObject):
         self.instrument_tried = set()  # Stammdaten werden je Start höchstens einmal je Aktie versucht
         self.fundamentals = self.store.fundamentals()  # Kennzahlen je Aktie: {"data", "source", "fetched_at"}
         self.fundamentals_errors, self.fundamentals_loading = {}, set()
+        self.news_cache, self.news_loading = {}, set()  # News je Aktie: {"news", "error", "fetched_at"}
         self.terms = self.store.search_terms()  # Suchbegriffe je Aktie: {"terms", "source", "fetched_at"}
         self.terms_loading = set()
         self.load_persisted()
@@ -1025,6 +1029,50 @@ class Controller(QObject):
                 self.changed.emit()
         self.run(lambda: sd.fetch_instrument(symbol), done)
 
+    def store_news(self, symbol, news, error=None, now=None):
+        """Merkt sich die News einer Aktie (auch die, die das Detailfenster selbst geladen hat). Schlug der Abruf
+        fehl, bleiben frühere News stehen und der Fehler wird mitgemerkt."""
+        old = self.news_cache.get(symbol)
+        keep = news if news is not None else (old or {}).get("news")
+        self.news_cache[symbol] = {"news": keep, "error": None if news is not None else str(error),
+                                   "fetched_at": now or dt.datetime.now()}
+        self.news_changed.emit(symbol)
+
+    def load_news(self, symbol, force=False, now=None):
+        """Lädt die News einer Aktie für den Feed, wenn sie fehlen oder älter als NEWS_MAX_AGE sind."""
+        entry = self.news_cache.get(symbol)
+        current = now or dt.datetime.now()
+        fresh = entry is not None and entry["error"] is None and current - entry["fetched_at"] < NEWS_MAX_AGE
+        if symbol in self.news_loading or (fresh and not force):
+            return False
+        self.news_loading.add(symbol)
+
+        def done(news):
+            self.news_loading.discard(symbol)
+            if symbol in self.symbols:
+                self.store_news(symbol, news)
+
+        def failed(exc):
+            self.news_loading.discard(symbol)
+            if symbol in self.symbols:
+                self.store_news(symbol, None, exc)
+        self.run(lambda: sd.fetch_news(symbol), done, failed)
+        return True
+
+    def feed_symbols(self, positions_only=True):
+        """Die Aktien, deren News der Feed zeigt: nur die mit Position oder die ganze Watchlist."""
+        return [s for s in self.symbols if not positions_only or s in self.positions]
+
+    def build_feed(self, positions_only=True, hours=newsfeed.DEFAULT_HOURS, limit=newsfeed.DEFAULT_LIMIT,
+                   show_minor=False, now=None):
+        """Der gemeinsame News-Feed aus den geladenen News (siehe newsfeed.build)."""
+        scope = self.feed_symbols(positions_only)
+        news = {s: self.news_cache[s]["news"] for s in scope if (self.news_cache.get(s) or {}).get("news") is not None}
+        items = newsfeed.merge(news, self.news_terms)
+        today = dt.date.today()
+        newsfeed.attach_events(items, {s: [m.event for m in self.calendar_events(s, today)] for s in scope}, today)
+        return newsfeed.build(items, now, hours, limit, show_minor)
+
     def load_fundamentals(self, symbol, force=False):
         """Lädt die Kennzahlen, wenn sie fehlen oder älter als fundamentals.MAX_AGE sind (oder mit force).
         Schlägt der Abruf fehl, bleiben die gespeicherten Kennzahlen mit ihrem alten Stand stehen."""
@@ -1194,7 +1242,7 @@ class Controller(QObject):
         self.store.remove_symbol(symbol)
         self.symbols = self.store.symbols()
         for cache in (self.quotes, self.events, self.quote_times, self.quote_errors, self.instruments,
-                      self.fundamentals, self.fundamentals_errors, self.terms):
+                      self.fundamentals, self.fundamentals_errors, self.terms, self.news_cache):
             cache.pop(symbol, None)
         self.terms_loading.discard(symbol)
         for key in (f"detail:{symbol}", f"tx:{symbol}"):
@@ -1705,6 +1753,12 @@ class MainWindow(QWidget):
         self.calendar_button.setCursor(Qt.PointingHandCursor)
         self.calendar_button.clicked.connect(lambda: open_calendar(self.ctl, open_symbol=self.open_detail))
 
+        self.news_button = QPushButton("≡")
+        self.news_button.setObjectName("icon")
+        self.news_button.setToolTip("News-Feed")
+        self.news_button.setCursor(Qt.PointingHandCursor)
+        self.news_button.clicked.connect(lambda: open_news(self.ctl, open_symbol=self.open_detail))
+
         self.watchlist_button = QPushButton("☆")
         self.watchlist_button.setObjectName("icon")
         self.watchlist_button.setToolTip("Watchlist öffnen oder schließen")
@@ -1716,7 +1770,8 @@ class MainWindow(QWidget):
                               pin=(ctl, "watchlist"))
         else:
             body = make_panel(self, "Positionen", self.hide_docked,
-                              extras=[self.calendar_button, self.portfolio_button, self.watchlist_button, self.pin])
+                              extras=[self.news_button, self.calendar_button, self.portfolio_button, self.watchlist_button,
+                                    self.pin])
 
         self.header = QWidget()
         header = QHBoxLayout(self.header)
@@ -2835,6 +2890,8 @@ class DetailWindow(QWidget):
             self.ctl.changed.emit()
         self.refresh_events()
         self.fetched_news, self.news_error = news, error
+        if news is not None:
+            self.ctl.store_news(self.symbol, news)  # der Feed muss sie nicht noch einmal laden
         self.render_news()
 
     def render_news(self):
@@ -2898,6 +2955,214 @@ class NewsCard(QFrame):
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton and self.rect().contains(event.position().toPoint()):
             QDesktopServices.openUrl(QUrl(self.link))
+
+
+# ---------- News-Feed ----------
+
+NEWS_WINDOWS = {}
+FEED_HOURS = ((24, "24 Std."), (48, "48 Std."), (168, "7 Tage"))
+FEED_STEP = 30
+TAG_COLORS = {3: AMBER, 2: ACCENT}
+
+
+def open_news(ctl, open_symbol=None):
+    existing = NEWS_WINDOWS.get("window")
+    if existing:
+        existing.raise_()
+        existing.activateWindow()
+        return
+    window = NewsFeedWindow(ctl, open_symbol)
+    window.closed.connect(lambda: NEWS_WINDOWS.pop("window", None))
+    NEWS_WINDOWS["window"] = window
+    Dock.add(window)
+    window.show()
+
+
+class FeedRow(QFrame):
+    """Eine Meldung im Feed: Titel, Kürzel, Quelle, Zeit, Einstufung und ein Hinweis auf einen bekannten Termin."""
+
+    def __init__(self, item):
+        super().__init__()
+        self.item, self.link = item, item.link
+        self.setObjectName("card")
+        self.setCursor(Qt.PointingHandCursor)
+        column = QVBoxLayout(self)
+        column.setContentsMargins(14, 10, 14, 10)
+        column.setSpacing(3)
+        top = QHBoxLayout()
+        top.setSpacing(8)
+        self.headline = QLabel(item.title)
+        self.headline.setWordWrap(True)
+        self.headline.setStyleSheet("font-weight: 600;")
+        top.addWidget(self.headline, 1)
+        self.badge = QLabel(item.tag or newsfeed.importance_label(item))
+        if item.importance in TAG_COLORS and self.badge.text():
+            style_pill(self.badge, TAG_COLORS[item.importance], strong=item.importance == 3)
+            top.addWidget(self.badge, 0, Qt.AlignTop)
+        else:
+            self.badge.hide()
+        column.addLayout(top)
+        when = item.published.astimezone().strftime("%d.%m. %H:%M") if item.published else ""
+        self.meta = QLabel(" · ".join(part for part in (", ".join(item.symbols), item.source, when) if part))
+        self.meta.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        column.addWidget(self.meta)
+        self.event_note = QLabel(item.event_note)
+        self.event_note.setWordWrap(True)
+        self.event_note.setStyleSheet(f"color: {AMBER}; font-size: 11px;")
+        self.event_note.setVisible(bool(item.event_note))
+        column.addWidget(self.event_note)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self.rect().contains(event.position().toPoint()):
+            QDesktopServices.openUrl(QUrl(self.link))
+
+
+class NewsFeedWindow(QWidget):
+    """Ein kurzer News-Feed über mehrere Aktien: standardmäßig nur Positionen, die letzten 48 Stunden, Wichtiges
+    zuerst, Dubletten zusammengeführt und Kursgerede ausgeblendet."""
+    closed = Signal()
+
+    def __init__(self, ctl, open_symbol=None):
+        super().__init__()
+        self.setAttribute(Qt.WA_DeleteOnClose)
+        self.ctl = ctl
+        self.positions_only, self.hours, self.show_minor, self.limit = True, newsfeed.DEFAULT_HOURS, False, FEED_STEP
+        body = make_panel(self, "News", self.close, pin=(ctl, "news"))
+        controls = QHBoxLayout()
+        controls.setSpacing(4)
+        self.only_positions = self._toggle("Nur Positionen", True, self.toggle_positions)
+        controls.addWidget(self.only_positions)
+        self.group = QButtonGroup(self)
+        self.hour_buttons = {}
+        for hours, title in FEED_HOURS:
+            button = QPushButton(title)
+            button.setObjectName("segment")
+            button.setCheckable(True)
+            button.setChecked(hours == self.hours)
+            button.clicked.connect(lambda _checked=False, h=hours: self.set_hours(h))
+            self.group.addButton(button)
+            self.hour_buttons[hours] = button
+            controls.addWidget(button)
+        controls.addStretch()
+        self.reload_button = QPushButton("↻")
+        self.reload_button.setObjectName("icon")
+        self.reload_button.setToolTip("News neu laden")
+        self.reload_button.clicked.connect(lambda: self.load(force=True))
+        controls.addWidget(self.reload_button)
+        body.addLayout(controls)
+        options = QHBoxLayout()
+        self.minor_button = self._toggle("Auch Unwichtiges", False, self.toggle_minor)
+        self.minor_button.setToolTip("Kursgerede und Ratgeber-Listen („Warum die Aktie heute steigt“) sind ausgeblendet")
+        options.addWidget(self.minor_button)
+        options.addStretch()
+        body.addLayout(options)
+        self.status = QLabel()
+        self.status.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        body.addWidget(self.status)
+        area, self.rows = scroll_area()
+        self.rows.addStretch()
+        body.addWidget(area, 1)
+        self.footer = QLabel()
+        self.footer.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        self.footer.setWordWrap(True)
+        body.addWidget(self.footer)
+        self.more_button = QPushButton("Mehr anzeigen")
+        self.more_button.clicked.connect(self.show_more)
+        body.addWidget(self.more_button)
+        screen = QApplication.primaryScreen().availableGeometry()
+        self.setFixedSize(500, min(780, screen.height() - 20))
+        self.update_timer = QTimer(self)
+        self.update_timer.setSingleShot(True)
+        self.update_timer.setInterval(200)
+        self.update_timer.timeout.connect(self.refresh)
+        ctl.news_changed.connect(self.update_timer.start)
+        ctl.terms_changed.connect(self.update_timer.start)
+        ctl.calendar_changed.connect(self.update_timer.start)
+        self.load()
+        self.refresh()
+
+    def _toggle(self, title, checked, slot):
+        button = QPushButton(title)
+        button.setObjectName("segment")
+        button.setCheckable(True)
+        button.setChecked(checked)
+        button.clicked.connect(slot)
+        return button
+
+    # ----- Bedienung -----
+
+    def load(self, force=False):
+        """Lädt die News der Aktien im gewählten Umfang, die fehlen oder veraltet sind."""
+        for symbol in self.ctl.feed_symbols(self.positions_only):
+            self.ctl.load_news(symbol, force=force)
+        self.refresh()
+
+    def toggle_positions(self):
+        self.positions_only = self.only_positions.isChecked()
+        self.limit = FEED_STEP
+        self.load()
+
+    def set_hours(self, hours):
+        self.hours, self.limit = hours, FEED_STEP
+        self.refresh()
+
+    def toggle_minor(self):
+        self.show_minor, self.limit = self.minor_button.isChecked(), FEED_STEP
+        self.refresh()
+
+    def show_more(self):
+        self.limit += FEED_STEP
+        self.refresh()
+
+    # ----- Anzeige -----
+
+    def refresh(self):
+        scope = self.ctl.feed_symbols(self.positions_only)
+        feed = self.ctl.build_feed(self.positions_only, self.hours, self.limit, self.show_minor)
+        while self.rows.count() > 1:
+            widget = self.rows.takeAt(0).widget()
+            if widget:
+                widget.hide()
+                widget.setParent(None)
+                widget.deleteLater()
+        for item in feed.items:
+            self.rows.insertWidget(self.rows.count() - 1, FeedRow(item))
+        loaded = sum(1 for s in scope if (self.ctl.news_cache.get(s) or {}).get("news") is not None)
+        failed = [s for s in scope if (self.ctl.news_cache.get(s) or {}).get("error")]
+        loading = [s for s in scope if s in self.ctl.news_loading]
+        if not scope:
+            self.status.setText("Keine Aktien im Umfang. Mit „Nur Positionen“ aus siehst du die ganze Watchlist.")
+        elif loading:
+            self.status.setText(f"Lade News … {loaded} von {len(scope)} Aktien")
+        else:
+            text = f"News von {loaded} von {len(scope)} Aktien"
+            if failed:
+                text += f" · nicht ladbar: {', '.join(failed)}"
+            self.status.setText(text)
+        if not feed.items:
+            note = QLabel("Keine passenden News." if not loading else "Wird geladen …")
+            note.setAlignment(Qt.AlignCenter)
+            note.setStyleSheet(f"color: {MUTED};")
+            self.rows.insertWidget(0, note)
+        parts = []
+        if feed.minor_hidden:
+            parts.append(f"{feed.minor_hidden} Kursgerede ausgeblendet")
+        if feed.old_hidden:
+            parts.append(f"{feed.old_hidden} älter als {dict(FEED_HOURS)[self.hours]}")
+        self.footer.setText(" · ".join(parts))
+        self.footer.setVisible(bool(parts))
+        self.more_button.setText(f"Mehr anzeigen ({feed.more} weitere)")
+        self.more_button.setVisible(feed.more > 0)
+
+    def closeEvent(self, event):
+        Dock.remove(self)
+        for signal in (self.ctl.news_changed, self.ctl.terms_changed, self.ctl.calendar_changed):
+            try:
+                signal.disconnect(self.update_timer.start)
+            except (RuntimeError, TypeError):
+                pass
+        self.closed.emit()
+        super().closeEvent(event)
 
 
 # ---------- Termine ----------
@@ -3797,6 +4062,8 @@ def restore_pinned(ctl, main):
             open_portfolio(ctl, above=main)
         elif kind == "watchlist":
             main.open_watchlist()
+        elif kind == "news":
+            open_news(ctl, open_symbol=main.open_detail)
         elif kind == "calendar" and (not symbol or symbol in ctl.symbols):
             open_calendar(ctl, symbol or None, open_symbol=main.open_detail)
         elif symbol in ctl.symbols and kind == "detail":
@@ -3886,6 +4153,7 @@ def main():
     tray_menu.addAction("Alle Fenster schließen", lambda: close_widget(window))
     tray_menu.addAction("Portfolio", lambda: open_portfolio(ctl, above=window))
     tray_menu.addAction("Termine", lambda: open_calendar(ctl, open_symbol=window.open_detail))
+    tray_menu.addAction("News", lambda: open_news(ctl, open_symbol=window.open_detail))
     tray = QSystemTrayIcon(icon, app)
     notify = lambda title, text: tray.showMessage(title, text, QSystemTrayIcon.Information, 8000)
     tray_menu.addSeparator()
