@@ -37,6 +37,7 @@ class SyncBatch:
     trades: tuple
     cursor: str = ""        # Merkzettel für den nächsten Abruf, zum Beispiel der letzte Zeitstempel
     notes: tuple = ()       # Hinweise der Anbindung (zum Beispiel übersprungene Einträge), erscheinen im Abgleichstand
+    cash: tuple = None      # (Betrag, Währung) des verfügbaren Guthabens beim Anbieter, None = unbekannt
 
 
 class TransactionSource:

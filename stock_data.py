@@ -22,7 +22,10 @@ EVENT_LABELS = {
     "Ex-Dividend Date": "Ex-Dividende",
     "Dividend Date": "Dividendenzahlung",
 }
-EVENT_SHORT = {"Quartalszahlen": "Zahlen", "Ex-Dividende": "Ex-Div.", "Dividendenzahlung": "Dividende"}
+EVENT_SHORT = {"Quartalszahlen": "Zahlen", "Ex-Dividende": "Ex-Div.", "Dividendenzahlung": "Dividende",
+               # Arten eigener Termine (events.KINDS), kurz genug für die Spalte „Termin“
+               "Unternehmensprognose": "Prognose", "Produktstart": "Release", "Genehmigung oder Entscheidung": "Entscheid",
+               "Übernahme oder Fusion": "Übernahme", "Branchenveranstaltung": "Event", "Sonstiges": "Termin"}
 
 
 # ---------- Kurse, Termine, News ----------
@@ -48,7 +51,10 @@ def previous_close(info):
         regular = info["regular_market_previous_close"]
     except KeyError:
         regular = None
-    return regular if regular not in (None, 0) else info["previous_close"]
+    # Bei manchen Werten (zum Beispiel ETFs in London und Frankfurt) liefert Yahoo hier NaN
+    if regular is None or regular == 0 or regular != regular:
+        return info["previous_close"]
+    return regular
 
 
 def _epoch(value):
@@ -75,7 +81,7 @@ def fetch_quote(symbol):
     ticker = yf.Ticker(symbol)
     info = ticker.fast_info
     price, prev = info["last_price"], previous_close(info)
-    if price is None or prev in (None, 0):
+    if price is None or price != price or prev is None or prev == 0 or prev != prev:  # None, 0 oder NaN
         raise ValueError("keine Kursdaten")
     if session_not_started(ticker):
         prev = price
@@ -163,6 +169,18 @@ def fetch_instrument(symbol):
     }
 
 
+def fetch_targets(symbol):
+    """Kursziele der Analysten laut Yahoo: {mean, high, low, count, currency}. None, wenn es keine gibt
+    (Rohstoffe, ETFs und kleine Werte haben oft keine). Die Währung ist die der Kursziele."""
+    info = yf.Ticker(symbol).info or {}
+    mean = info.get("targetMeanPrice")
+    if not mean:
+        return None
+    return {"mean": float(mean), "high": info.get("targetHighPrice"), "low": info.get("targetLowPrice"),
+            "count": info.get("numberOfAnalystOpinions"),
+            "currency": info.get("financialCurrency") or info.get("currency") or ""}
+
+
 def _to_date(value):
     if isinstance(value, dt.datetime):
         return value.date()
@@ -197,7 +215,7 @@ def format_event(event, short=False):
     day, label = event
     days = days_until(day)
     if short:
-        return f"{EVENT_SHORT[label]} {day.strftime('%d.%m.')} · {days} T"
+        return f"{EVENT_SHORT.get(label, label)} {day.strftime('%d.%m.')} · {days} T"
     when = "heute" if days == 0 else f"in {days} T"
     return f"{label} {day.strftime('%d.%m.%Y')} ({when})"
 
@@ -264,7 +282,10 @@ def fetch_news(symbol, count=15):
 # ---------- Kennzahlen und Eingaben ----------
 
 def pl_percent(position, price):
-    """Gewinn/Verlust in % der gehaltenen Stücke; position["cost"] ist der durchschnittliche Einstandskurs."""
+    """Gewinn/Verlust in % der gehaltenen Stücke; position["cost"] ist der durchschnittliche Einstandskurs.
+    Ohne Einstand (zugeteilte Aktie) ist der ganze Wert Gewinn: 100 %."""
+    if not position["cost"]:
+        return 100.0
     return (price / position["cost"] - 1) * 100
 
 

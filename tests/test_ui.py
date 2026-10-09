@@ -13,6 +13,7 @@ from PySide6.QtGui import QEnterEvent, QKeyEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QLabel, QPushButton, QWidget
 
+import events as evt
 import glossary
 import history
 import stock_data as sd
@@ -25,6 +26,18 @@ NUM = sd.parse_number
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+def hold_all(ctl):
+    """Gibt jeder Aktie eine kleine Position (Einstand = Kurs 100), damit ihre Zeilen in der Box Positionen stehen."""
+    for symbol in list(ctl.symbols):
+        ctl.record_trade(symbol, "buy", 1, 100, 0, TODAY)
+
+
+def drop_position(ctl, symbol):
+    """Löscht alle Transaktionen einer Aktie: sie hat danach keine Position mehr."""
+    ctl.store.delete_transactions([tx.id for tx in ctl.transactions.get(symbol, [])])
+    ctl._ledger_changed()
+
+
 def texts(widget):
     return [label.text() for label in widget.findChildren(QLabel)]
 
@@ -34,6 +47,7 @@ def reset_windows():
         window.close()
     w.Dock.windows.clear()
     w.TX_WINDOWS.clear()
+    w.CALENDAR_WINDOWS.clear()
     w.PIN["on"] = True
 
 
@@ -328,6 +342,7 @@ class TradeDialogTests(AppTestCase):
 class MainWindowTests(AppTestCase):
     def setUp(self):
         super().setUp()
+        hold_all(self.ctl)
         self.main = w.MainWindow(self.ctl)
 
     def test_one_card_per_symbol_in_watchlist_order(self):
@@ -363,19 +378,33 @@ class MainWindowTests(AppTestCase):
         self.main.heads["day"].click()
         self.assertEqual(self.symbols_on_screen(), ["MSFT", "DELL", "AAPL"])
 
+    def test_chosen_sort_is_saved_per_box_and_restored(self):
+        self.main.heads["day"].click()
+        self.main.heads["day"].click()  # absteigend
+        self.assertEqual(self.ctl.saved_sort("positions"), ("day", True))
+        self.assertEqual(self.ctl.saved_sort("watchlist"), (None, False))  # die andere Box bleibt unberührt
+        again = w.MainWindow(self.ctl)
+        self.assertEqual((again.sort_key, again.sort_desc), ("day", True))
+        self.assertIn("▼", again.heads["day"].text())
+
+    def test_invalid_saved_sort_falls_back_to_the_default_order(self):
+        self.ctl.store.set_meta("sort:positions", '{"key": "gibt-es-nicht", "desc": true}')
+        self.assertEqual(self.ctl.saved_sort("positions"), (None, False))
+        self.ctl.store.set_meta("sort:positions", "kein json")
+        self.assertEqual(self.ctl.saved_sort("positions"), (None, False))
+
     def test_negative_change_uses_down_arrow(self):
         self.ctl.quotes["AAPL"]["change_pct"] = -2.0
         self.ctl.changed.emit()
         self.assertEqual(self.main.cards["AAPL"].day.text(), "▼ -2.00 %")
 
-    def test_card_shows_position_value_and_profit_only_when_held(self):
+    def test_card_shows_position_value_and_profit(self):
         card = self.main.cards["AAPL"]
-        self.assertEqual((card.value.text(), card.pl.text(), card.amount.text()), ("", "", ""))
-        self.ctl.record_trade("AAPL", "buy", 10, 80, 0, TODAY)
+        self.ctl.record_trade("AAPL", "buy", 9, 80, 0, TODAY)  # 10 Stück, Einstand 820, Wert 1000
         self.assertEqual((card.value.text(), card.pl.text(), card.amount.text()),
-                         ("1,000.00", "+25.00 %", "+200.00"))
+                         ("1,000.00", "+21.95 %", "+180.00"))
         self.assertEqual(card.value.toolTip(), "10 Stück")
-        self.assertEqual(self.main.cards["MSFT"].value.text(), "")
+        self.assertEqual(self.main.cards["MSFT"].value.text(), "100.00")
 
     def test_card_shows_next_event(self):
         self.ctl.events["AAPL"] = [(TODAY + dt.timedelta(days=5), "Ex-Dividende")]
@@ -401,11 +430,12 @@ class MainWindowTests(AppTestCase):
         self.assertEqual(self.symbols_on_screen(), ["AAPL", "DELL", "MSFT"])
 
     def test_empty_cells_sort_last_in_both_directions(self):
-        self.ctl.record_trade("DELL", "buy", 10, 80, 0, TODAY)
-        self.main.heads["pl"].click()
-        self.assertEqual(self.symbols_on_screen()[0], "DELL")
-        self.main.heads["pl"].click()
-        self.assertEqual(self.symbols_on_screen()[0], "DELL")
+        self.ctl.quotes.pop("MSFT")  # ohne Kurs bleibt die Zelle leer
+        self.ctl.changed.emit()
+        self.main.heads["price"].click()
+        self.assertEqual(self.symbols_on_screen()[-1], "MSFT")
+        self.main.heads["price"].click()
+        self.assertEqual(self.symbols_on_screen()[-1], "MSFT")
 
     def test_sort_survives_refresh_and_marks_the_active_header(self):
         self.main.heads["symbol"].click()
@@ -434,6 +464,7 @@ class MainWindowTests(AppTestCase):
         self.assertFalse(self.main.empty.isHidden())
 
     def test_menu_without_position_offers_start_and_buy_but_no_sell(self):
+        drop_position(self.ctl, "AAPL")
         menu = self.main.build_menu("AAPL")  # Referenz halten, sonst räumt Qt das Menü sofort ab
         entries = [a.text() for a in menu.actions() if a.text()]
         self.assertEqual(entries, ["Details", "Startbestand festlegen …", "Aufstocken …",
@@ -493,6 +524,7 @@ class StaleDisplayTests(AppTestCase):
         super().setUp()
         now = dt.datetime.now()
         self.ctl.quote_times = {s: now for s in self.ctl.symbols}
+        hold_all(self.ctl)
         self.main = w.MainWindow(self.ctl)
 
     def make_stale(self, symbol="AAPL", error="offline"):
@@ -664,37 +696,32 @@ class PortfolioWindowTests(AppTestCase):
 
     def test_total_value_and_invested_capital(self):
         self.assertEqual(self.pw.total.text(), "1,350.00 €")
-        self.assertEqual(plain(self.pw.total_sub), "investiert 1,170.00 €")
+        self.assertEqual(self.pw.invested.value.text(), "1,170.00 €")
 
-    def test_unrealized_tile_shows_amount_percentage_and_the_split(self):
-        self.assertEqual(self.pw.unrealized.value.text(), "+180.00 €")
-        self.assertIn("+15.38 %", plain(self.pw.unrealized.sub))
-        self.assertIn("Kurs +180.00 €", plain(self.pw.unrealized.sub))
-        self.assertIn("Währung +0.00 €", plain(self.pw.unrealized.sub))
+    def test_tiles_have_no_small_print(self):
+        for tile in (self.pw.total_tile, self.pw.invested, self.pw.cash, self.pw.result):
+            self.assertEqual(tile.sub.text(), "")
+            self.assertTrue(tile.sub.isHidden())
 
     def test_gain_color_follows_the_sign(self):
-        self.assertIn(w.GREEN, self.pw.unrealized.value.styleSheet())
+        self.assertEqual(self.pw.result.value.text(), "+180.00 €")
+        self.assertIn(w.GREEN, self.pw.result.value.styleSheet())
         self.ctl.quotes["AAPL"]["price"] = 50.0
         self.pw.refresh()
-        self.assertEqual(self.pw.unrealized.value.text(), "-270.00 €")  # 450 + 450 - 1170
-        self.assertIn(w.RED, self.pw.unrealized.value.styleSheet())
+        self.assertEqual(self.pw.result.value.text(), "-270.00 €")  # 450 + 450 - 1170
+        self.assertIn(w.RED, self.pw.result.value.styleSheet())
 
     def test_currency_effect_appears_when_the_rate_moves(self):
         self.ctl.fx.set_latest("USD", 0.80, dt.datetime.now(), "Test")
         self.pw.refresh()
-        # Wert 1000 * 0,80 + 500 * 0,80 = 1200; Kosten 1170 -> +30; Kurs +180 (zum Kaufkurs 0,90 gerechnet), Währung -150
-        self.assertEqual(self.pw.unrealized.value.text(), "+30.00 €")
-        self.assertIn("Währung -150.00 €", plain(self.pw.unrealized.sub))
+        # Wert 1000 * 0,80 + 500 * 0,80 = 1200; Kosten 1170 -> +30
+        self.assertEqual(self.pw.result.value.text(), "+30.00 €")
 
-    def test_realized_tile_and_total_result_after_a_sale(self):
+    def test_total_result_after_a_sale_includes_the_realized_part(self):
         self.ctl.record_trade("AAPL", "sell", 2, 110, 0, dt.date(2026, 2, 1))  # 60 USD Gewinn = 54 €
         self.pw.refresh()
-        self.assertEqual(self.pw.realized.value.text(), "+54.00 €")
-        self.assertIn("aus Verkäufen", plain(self.pw.realized.sub))
-        # unrealisiert: 8 AAPL (Kosten 576, Wert 720) + MSFT (450/450) = +144; Summe +198
-        self.assertEqual(self.pw.unrealized.value.text(), "+144.00 €")
+        # unrealisiert: 8 AAPL (Kosten 576, Wert 720) + MSFT (450/450) = +144; plus realisiert 54 = +198
         self.assertEqual(self.pw.result.value.text(), "+198.00 €")
-        self.assertIn("Rendite +", plain(self.pw.result.sub))
 
     def test_warnings_are_shown_and_hidden(self):
         self.assertTrue(self.pw.notes.isHidden())
@@ -745,6 +772,31 @@ class PortfolioWindowTests(AppTestCase):
         self.pw.segments["sector"].click()
         self.assertEqual(len(self.pw.donut.slices), 1)
         self.assertFalse(self.pw.donut.grab().isNull())
+
+    def test_the_switch_changes_the_whole_portfolio_to_dollar_and_back(self):
+        import fx
+        self.addCleanup(fx.set_base, "EUR")
+        self.ctl.fx.add_history("EUR", {self.D1: 1.25})
+        self.ctl.fx.set_latest("EUR", 1.25, dt.datetime.now(), "Test")
+        self.assertTrue(self.pw.base_buttons["EUR"].isChecked())
+        with mock.patch.object(self.ctl, "refresh_fx"):   # kein Netzwerk
+            self.pw.base_buttons["USD"].click()
+        self.ctl.fx.add_history("EUR", {self.D1: 1.25})
+        self.assertEqual(fx.BASE, "USD")
+        self.assertTrue(self.pw.base_buttons["USD"].isChecked())
+        self.assertIn("USD", self.pw.total_caption.text())
+        self.assertTrue(self.pw.total.text().endswith("$"))
+        with mock.patch.object(self.ctl, "refresh_fx"):
+            self.pw.base_buttons["EUR"].click()
+        self.assertTrue(self.pw.total.text().endswith("€"))
+
+    def test_available_cash_is_part_of_the_total_value_and_shown_with_the_positions(self):
+        self.assertEqual(self.pw.cash.value.text(), "0.00 €")
+        self.ctl.cash["etoro"] = (1000.0, "USD", dt.datetime.now())  # USD zum Kurs 0,90 = 900 €
+        self.pw.refresh()
+        self.assertEqual(self.pw.total.text(), "2,250.00 €")            # 1.350 Positionen + 900 Guthaben
+        self.assertEqual(self.pw.cash.value.text(), "900.00 €")
+        self.assertEqual(self.pw.result.value.text(), "+180.00 €")      # das Ergebnis bleibt unberührt
 
     def test_portfolio_has_no_positions_section_those_are_in_the_watchlist(self):
         texts_in_window = " ".join(label.text() for label in self.pw.findChildren(QLabel))
@@ -811,12 +863,14 @@ class PortfolioWindowTests(AppTestCase):
         self.ctl.changed.emit()  # der Termin-Text macht die Watchlist breiter
         self.assertEqual(pw.width(), self.main.width())
 
-    def test_summary_tiles_and_total_share_one_row_to_use_the_width(self):
+    def test_summary_tiles_share_one_row_and_stay_inside_the_box(self):
         self.pw.show()
         QApplication.processEvents()
-        tops = {self.pw.total.parentWidget().geometry().y(), self.pw.unrealized.geometry().y(),
-                self.pw.realized.geometry().y(), self.pw.result.geometry().y()}
-        self.assertEqual(len(tops), 1)
+        tiles = (self.pw.total_tile, self.pw.invested, self.pw.cash, self.pw.result)
+        self.assertEqual(len({tile.geometry().y() for tile in tiles}), 1)
+        area = self.pw.area.viewport().width()
+        for tile in tiles:
+            self.assertLessEqual(tile.geometry().right(), area)
 
     def test_allocation_names_up_to_sixteen_entries_before_grouping_the_rest(self):
         asked = []
@@ -1660,6 +1714,8 @@ class TermWiringTests(AppTestCase):
 
     def test_each_event_kind_has_its_own_explanation(self):
         for kind, key in w.EVENT_TERMS.items():
+            self.ctl.store.db.execute("DELETE FROM events")  # Termine bleiben gespeichert: jede Runde beginnt leer
+            self.ctl.reload_calendar()
             events = [(TODAY + dt.timedelta(days=3), kind)]
             with mock.patch.object(sd, "fetch_events", lambda s, events=events: events):
                 self.main.open_detail("MSFT")
@@ -1674,12 +1730,8 @@ class TermWiringTests(AppTestCase):
         self.ctl.record_trade("AAPL", "buy", 10, 80, 0, TODAY)
         w.open_portfolio(self.ctl)
         window = w.PORTFOLIO_WINDOWS["window"]
-        self.assertTrue({"gesamtwert", "unrealisiert", "realisiert", "gesamtergebnis", "verlauf", "aufteilung"}
+        self.assertTrue({"gesamtwert", "investiert", "guthaben", "gesamtergebnis", "verlauf", "aufteilung"}
                         <= set(self.anchors(window)))
-        self.assertEqual(self.links(window.total_sub), ["investiert"])
-        self.assertEqual(self.links(window.unrealized.sub), ["kursgewinn", "waehrungseffekt"])
-        self.assertEqual(self.links(window.realized.sub), ["kursgewinn", "waehrungseffekt"])
-        self.assertEqual(self.links(window.result.sub), ["gesamtrendite"])
 
     def test_transactions_window_explains_opening_balance_and_realized_profit(self):
         self.ctl.start_position("AAPL", 3, 0)
@@ -1696,12 +1748,624 @@ class TermWiringTests(AppTestCase):
             self.assertEqual(self.main.heads[key].toolTip(), "")
 
 
+def day(n):
+    return TODAY + dt.timedelta(days=n)
+
+
+def pick(combo, value):
+    combo.setCurrentIndex(combo.findData(value))
+
+
+class StatusBadgeTests(unittest.TestCase):
+    def setUp(self):
+        qapp()
+
+    def test_each_status_has_its_german_label_and_its_own_explanation(self):
+        for status, label in (("confirmed", "bestätigt"), ("expected", "erwartet"), ("speculative", "spekulativ"),
+                              ("occurred", "eingetreten")):
+            badge = w.style_status_badge(QLabel(), status)
+            self.assertEqual(badge.text(), label)
+            self.assertEqual(badge._term_anchor.key, w.STATUS_TERMS[status])
+
+    def test_colors_differ_so_speculation_never_looks_confirmed(self):
+        sheets = {s: w.style_status_badge(QLabel(), s).styleSheet() for s in evt.STATUSES}
+        self.assertIn(w.GREEN, sheets["confirmed"])
+        self.assertIn(w.AMBER, sheets["expected"])
+        self.assertIn("#a78bfa", sheets["speculative"])
+        self.assertEqual(len(set(sheets.values())), 4)
+
+    def test_only_speculative_badges_have_a_dashed_border(self):
+        self.assertIn("dashed", w.style_status_badge(QLabel(), "speculative").styleSheet())
+        for status in ("confirmed", "expected", "occurred"):
+            self.assertNotIn("dashed", w.style_status_badge(QLabel(), status).styleSheet())
+
+    def test_restyling_a_badge_replaces_the_old_look(self):
+        badge = w.style_status_badge(QLabel(), "speculative")
+        w.style_status_badge(badge, "confirmed")
+        self.assertEqual((badge.text(), "dashed" in badge.styleSheet()), ("bestätigt", False))
+
+
+class EventNoteTests(unittest.TestCase):
+    def merged(self, *events, today=None):
+        return evt.merge_duplicates(list(events), today or TODAY)[0]
+
+    def event(self, **kw):
+        base = dict(id=1, symbol="AAPL", kind="product", title="X", day=day(5), end=day(5), precision="day",
+                    status="expected", source="manual", relevance=2)
+        base.update(kw)
+        return evt.Event(**base)
+
+    def test_source_is_always_named(self):
+        self.assertEqual(w.event_note(self.merged(self.event()), TODAY), "Quelle: Manuell")
+
+    def test_relevance_is_named_only_when_it_is_not_normal(self):
+        self.assertIn("Relevanz hoch", w.event_note(self.merged(self.event(relevance=3)), TODAY))
+        self.assertIn("Relevanz niedrig", w.event_note(self.merged(self.event(relevance=1)), TODAY))
+        self.assertNotIn("Relevanz", w.event_note(self.merged(self.event()), TODAY))
+
+    def test_a_missed_speculative_date_is_called_overdue(self):
+        item = self.merged(self.event(status="speculative", day=day(-9), end=day(-9)))
+        self.assertIn("Datum verstrichen", w.event_note(item, TODAY))
+
+    def test_a_missed_expected_date_is_not_called_overdue(self):
+        item = self.merged(self.event(status="expected", day=day(-9), end=day(-9)))
+        self.assertNotIn("verstrichen", w.event_note(item, TODAY))
+
+    def test_other_sources_with_other_dates_are_shown_and_notes_are_kept(self):
+        a = self.event(id=1, kind="earnings", source="manual", status="confirmed", day=day(5), end=day(5), note="IR-Seite")
+        b = self.event(id=2, kind="earnings", source="Yahoo Finance", day=day(7), end=day(7))
+        note = w.event_note(self.merged(a, b), TODAY)
+        self.assertIn("Quelle: Manuell, Yahoo Finance", note)
+        self.assertIn(f"Yahoo Finance nennt {day(7):%d.%m.%Y}", note)
+        self.assertTrue(note.endswith("IR-Seite"))
+
+
+class ChoiceFieldTests(unittest.TestCase):
+    def setUp(self):
+        qapp()
+        reset_windows()
+        self.addCleanup(reset_windows)
+
+    def test_choice_field_is_a_combo_with_the_current_value_selected(self):
+        dialog = w.FieldDialog("T", "i", [("Art", w.Choice([("Eins", 1), ("Zwei", 2)], 2))], field_width=190)
+        combo = dialog.entries[0]
+        self.assertIsInstance(combo, w.QComboBox)
+        self.assertEqual((combo.count(), combo.currentData(), combo.currentText(), combo.width()), (2, 2, "Zwei", 190))
+
+    def test_unknown_current_value_falls_back_to_the_first_option(self):
+        dialog = w.FieldDialog("T", "i", [("Art", w.Choice([("Eins", 1), ("Zwei", 2)], 9))])
+        self.assertEqual(dialog.entries[0].currentData(), 1)
+
+    def test_apply_receives_the_data_of_choices_next_to_parsed_text(self):
+        received = []
+        dialog = w.FieldDialog("T", "i", [("Name", "x", str), ("Art", w.Choice([("A", "a"), ("Ohne", None)], None))],
+                               received.extend)
+        driver = DialogDriver(lambda d: (d.entries[0].setText("neu"), pick(d.entries[1], "a"), d.submit()))
+        self.assertTrue(dialog.run())
+        driver.check()
+        self.assertEqual(received, ["neu", "a"])
+
+    def test_a_choice_with_none_as_value_gives_none(self):
+        received = []
+        dialog = w.FieldDialog("T", "i", [("Art", w.Choice([("Automatisch", None), ("Hoch", 3)], None))], received.extend)
+        driver = DialogDriver(lambda d: d.submit())
+        dialog.run()
+        driver.check()
+        self.assertEqual(received, [None])
+
+    def test_a_choice_first_does_not_break_the_focus_handling(self):
+        dialog = w.FieldDialog("T", "i", [("Art", w.Choice([("A", 1)], 1)), ("Text", "x", str)])
+        driver = DialogDriver(lambda d: self.assertIsNotNone(QApplication.focusWidget()))
+        dialog.run()
+        driver.check()
+
+    def test_existing_numeric_dialogs_still_work(self):
+        received = []
+        dialog = w.FieldDialog("T", "i", [("Zahl", "2,5")], received.extend)
+        driver = DialogDriver(lambda d: d.submit())
+        self.assertTrue(dialog.run())
+        driver.check()
+        self.assertEqual(received, [2.5])
+
+
+class EventDialogTests(AppTestCase):
+    def fill(self, **values):
+        """Setzt Felder nach Namen (Titel, Datum, Art, Status, Relevanz, Notiz, Aktie) und bestätigt."""
+        def callback(dialog):
+            names = [label.text() for label in dialog.findChildren(QLabel)]
+            fields = {name: dialog.entries[i] for i, name in enumerate(
+                [n for n in names if n in ("Aktie", "Titel", "Datum", "Art", "Status", "Relevanz", "Notiz")])}
+            for name, value in values.items():
+                if isinstance(fields[name], w.QComboBox):
+                    pick(fields[name], value)
+                else:
+                    fields[name].setText(value)
+            dialog.submit()
+        return callback
+
+    def run_dialog(self, callback, **kwargs):
+        driver = DialogDriver(callback)
+        accepted = w.event_dialog(self.ctl, **kwargs)
+        driver.check()
+        return accepted
+
+    def test_adding_for_a_stock_saves_a_manual_event_with_all_fields(self):
+        self.assertTrue(self.run_dialog(self.fill(Titel="Vision Pro 3", Datum="Mai 2027", Art="product", Status="speculative",
+                                           Notiz="laut Gerücht"), symbol="AAPL"))
+        [item] = self.ctl.calendar_events("AAPL")
+        event = item.event
+        self.assertEqual((event.title, event.precision, event.kind, event.status), ("Vision Pro 3", "month", "product", "speculative"))
+        self.assertEqual((event.note, event.source, item.status), ("laut Gerücht", "manual", "speculative"))
+
+    def test_without_a_stock_the_dialog_asks_for_it(self):
+        seen = []
+
+        def callback(dialog):
+            seen.append([dialog.entries[0].itemData(i) for i in range(dialog.entries[0].count())])
+            self.fill(Aktie="MSFT", Titel="Messe", Datum="08.12.2026", Art="conference")(dialog)
+
+        self.assertTrue(self.run_dialog(callback))
+        self.assertEqual(seen[0], list(self.ctl.symbols))
+        self.assertEqual(self.ctl.calendar_events("MSFT")[0].event.title, "Messe")
+        self.assertEqual(self.ctl.calendar_events("AAPL"), [])
+
+    def test_the_stock_is_not_asked_for_when_it_is_given(self):
+        def callback(dialog):
+            self.assertNotIn("Aktie", [label.text() for label in dialog.findChildren(QLabel)])
+            dialog.reject()
+        self.assertFalse(self.run_dialog(callback, symbol="AAPL"))
+
+    def test_relevance_defaults_to_the_one_that_fits_the_kind(self):
+        self.run_dialog(self.fill(Titel="Zahlen", Datum="01.12.2026", Art="earnings"), symbol="AAPL")
+        self.assertEqual(self.ctl.calendar_events("AAPL")[0].event.relevance, 3)
+
+    def test_relevance_can_be_set_by_hand(self):
+        self.run_dialog(self.fill(Titel="Zahlen", Datum="01.12.2026", Art="earnings", Relevanz=1), symbol="AAPL")
+        self.assertEqual(self.ctl.calendar_events("AAPL")[0].event.relevance, 1)
+
+    def test_an_invalid_date_is_reported_inside_the_dialog_and_nothing_is_saved(self):
+        def callback(dialog):
+            dialog.entries[1].setText("bald")
+            dialog.submit()
+            self.assertIs(QApplication.activeModalWidget(), dialog)
+            self.assertIn("Datum", dialog.error.text())
+
+        self.assertFalse(self.run_dialog(callback, symbol="AAPL"))
+        self.assertEqual(self.ctl.store.events(), [])
+
+    def test_the_title_may_stay_empty_and_falls_back_to_the_kind(self):
+        self.run_dialog(self.fill(Datum="2027", Art="regulatory"), symbol="AAPL")
+        self.assertEqual(self.ctl.calendar_events("AAPL")[0].event.title, "Genehmigung oder Entscheidung")
+
+    def test_editing_shows_the_current_values_and_saves_the_changes(self):
+        event_id = self.ctl.add_event("AAPL", "product", "Alt", "Mai 2027", "speculative", 3, "n")
+        event = self.ctl.store.events()[0]
+        seen = []
+
+        def callback(dialog):
+            seen.append([e.text() if isinstance(e, w.QLineEdit) else e.currentData() for e in dialog.entries])
+            self.fill(Titel="Neu", Datum="15.05.2027", Status="confirmed")(dialog)
+
+        self.assertTrue(self.run_dialog(callback, event=event))
+        self.assertEqual(seen[0], ["Alt", "Mai 2027", "product", "speculative", 3, "n"])
+        [item] = self.ctl.calendar_events("AAPL")
+        self.assertEqual((item.event.id, item.event.title, item.status, item.event.precision), (event_id, "Neu", "confirmed", "day"))
+
+    def test_cancelling_changes_nothing(self):
+        self.ctl.add_event("AAPL", "product", "Alt", "Mai 2027", "speculative")
+        self.assertFalse(self.run_dialog(lambda d: (d.entries[0].setText("Neu"), d.reject()), event=self.ctl.store.events()[0]))
+        self.assertEqual(self.ctl.store.events()[0].title, "Alt")
+
+    def test_deleting_asks_first_and_names_the_event(self):
+        self.ctl.add_event("AAPL", "product", "Weg damit", "Mai 2027", "speculative")
+        event = self.ctl.store.events()[0]
+        seen = []
+        driver = DialogDriver(lambda d: (seen.extend(texts(d)), d.reject()))
+        self.assertFalse(w.delete_event_dialog(self.ctl, event))
+        driver.check()
+        self.assertTrue(any("Weg damit" in t and "Mai 2027" in t for t in seen))
+        self.assertEqual(len(self.ctl.store.events()), 1)
+
+    def test_confirming_the_deletion_removes_it(self):
+        self.ctl.add_event("AAPL", "product", "Weg damit", "Mai 2027", "speculative")
+        driver = DialogDriver(lambda d: d.submit())
+        self.assertTrue(w.delete_event_dialog(self.ctl, self.ctl.store.events()[0]))
+        driver.check()
+        self.assertEqual(self.ctl.store.events(), [])
+
+
+class CalendarWindowTests(AppTestCase):
+    def setUp(self):
+        super().setUp()
+        self.ctl.record_yahoo_events("AAPL", [(day(3), "Quartalszahlen"), (day(25), "Ex-Dividende")])
+        self.ctl.record_yahoo_events("MSFT", [(day(5), "Quartalszahlen")])
+        self.ctl.add_event("DELL", "product", "GTA VI", day(10).strftime("%d.%m.%Y"), "speculative")
+        self.ctl.add_event("DELL", "product", "Demo", TODAY.strftime("%m/%Y"), "expected")
+        self.ctl.add_event("DELL", "product", "Weit weg", day(60).strftime("%d.%m.%Y"), "expected")
+        self.ctl.record_trade("AAPL", "buy", 1, 100, 0, day(-30))
+        self.opened = []
+        self.main = w.MainWindow(self.ctl)
+
+    def open(self, symbol=None):
+        w.open_calendar(self.ctl, symbol, self.opened.append)
+        return w.CALENDAR_WINDOWS[symbol or ""]
+
+    def rows(self, window):
+        """Die Termine des gewählten Tages (ohne die Liste der Termine ohne genauen Tag)."""
+        return [row for row in window.findChildren(w.EventRow) if row.item.event.precision == "day"]
+
+    def titles(self, window):
+        return [row.title.text() for row in self.rows(window)]
+
+    def chips(self, window, when):
+        window.select(when)
+        return [chip.full_text for chip in window.cells[when].chips]
+
+    def labels(self, window):
+        return [label.text() for label in window.findChildren(QLabel)]
+
+    def test_it_opens_on_the_current_month_with_today_selected(self):
+        window = self.open()
+        self.assertEqual(window.month, TODAY.replace(day=1))
+        self.assertEqual(window.selected, TODAY)
+        self.assertEqual(window.month_label.text(), f"{w.MONTHS[TODAY.month - 1]} {TODAY.year}")
+
+    def test_the_grid_has_full_weeks_starting_on_monday(self):
+        window = self.open()
+        days = window.month_days()
+        self.assertEqual(days[0].weekday(), 0)
+        self.assertEqual(days[-1].weekday(), 6)
+        self.assertEqual(len(days) % 7, 0)
+        self.assertEqual(len(window.cells), len(days))
+        self.assertEqual([l for l in self.labels(window) if l in w.WEEKDAYS], list(w.WEEKDAYS))
+
+    def test_every_month_is_shown_completely(self):
+        window = self.open()
+        for step in range(-14, 15):
+            window.month = TODAY.replace(day=1)
+            window.shift_month(step)
+            days = window.month_days()
+            self.assertIn(window.month, days)
+            last = (window.month.replace(day=28) + dt.timedelta(days=4)).replace(day=1) - dt.timedelta(days=1)
+            self.assertIn(last, days)
+            self.assertLess(days.index(window.month), 7)
+
+    def test_events_are_entered_in_the_cell_of_their_day(self):
+        window = self.open()
+        self.assertEqual(self.chips(window, day(3)), ["AAPL · Quartalszahlen"])
+        self.assertEqual(self.chips(window, day(5)), ["MSFT · Quartalszahlen"])
+        self.assertEqual(self.chips(window, day(10)), ["DELL · GTA VI"])
+        self.assertEqual(self.chips(window, day(4)), [])
+
+    def test_a_chip_shows_the_status_and_a_speculative_one_is_dashed(self):
+        window = self.open()
+        window.select(day(10))
+        chip = window.cells[day(10)].chips[0]
+        self.assertIn("dashed", chip.styleSheet())
+        self.assertIn("spekulativ", chip.toolTip())
+        window.select(day(3))
+        self.assertNotIn("dashed", window.cells[day(3)].chips[0].styleSheet())
+        self.assertIn("erwartet", window.cells[day(3)].chips[0].toolTip())
+
+    def test_many_events_on_one_day_show_three_chips_and_a_counter(self):
+        for number in range(5):
+            self.ctl.add_event("DELL", "product", f"Termin {number}", day(12).strftime("%d.%m.%Y"), "expected")
+        window = self.open()
+        window.select(day(12))
+        cell = window.cells[day(12)]
+        self.assertEqual(len(cell.chips), w.CHIPS_PER_DAY)
+        self.assertEqual(cell.more.text(), "+ 2 weitere")
+        self.assertEqual(len(self.rows(window)), 5)  # unten stehen alle
+
+    def test_the_month_buttons_move_forward_and_back_and_today_returns(self):
+        window = self.open()
+        window.next_button.click()
+        self.assertEqual((window.month.month - TODAY.month) % 12, 1)
+        window.prev_button.click()
+        window.prev_button.click()
+        self.assertEqual((TODAY.month - window.month.month) % 12, 1)
+        window.today_button.click()
+        self.assertEqual((window.month, window.selected), (TODAY.replace(day=1), TODAY))
+
+    def test_a_later_month_shows_its_events(self):
+        self.ctl.add_event("DELL", "product", "Weit weg", day(60).strftime("%d.%m.%Y"), "expected")
+        window = self.open()
+        self.assertEqual(self.chips(window, day(60)), ["DELL · Weit weg"])
+        self.assertEqual(window.month, day(60).replace(day=1))
+
+    def test_the_past_is_in_the_calendar_too(self):
+        self.ctl.add_event("DELL", "product", "Gestern", day(-1).strftime("%d.%m.%Y"), "confirmed")
+        self.ctl.add_event("DELL", "product", "Nie passiert", day(-10).strftime("%d.%m.%Y"), "speculative")
+        window = self.open()
+        window.select(day(-1))
+        self.assertEqual(self.titles(window), ["DELL · Gestern"])
+        self.assertEqual(self.rows(window)[0].badge.text(), "eingetreten")
+        window.select(day(-10))
+        row = self.rows(window)[0]
+        self.assertEqual(row.badge.text(), "spekulativ")
+        self.assertIn("Datum verstrichen", row.meta.text())
+
+    def test_the_selected_day_is_listed_below_with_header_status_and_source(self):
+        window = self.open()
+        window.select(day(3))
+        header = f"{w.WEEKDAYS[day(3).weekday()]} {day(3):%d.%m.%Y} · IN 3 TAGEN".upper()
+        self.assertIn(header, self.labels(window))
+        row = self.rows(window)[0]
+        self.assertEqual(row.badge.text(), "erwartet")
+        self.assertIn("Quelle: Yahoo Finance", row.meta.text())
+        window.select(day(10))
+        self.assertIn("Quelle: Manuell", self.rows(window)[0].meta.text())
+
+    def test_clicking_a_cell_selects_its_day(self):
+        window = self.open()
+        window.select(day(3))
+        window.cells[day(5)].clicked.emit(day(5))
+        self.assertEqual(window.selected, day(5))
+        self.assertEqual(self.titles(window), ["MSFT · Quartalszahlen"])
+
+    def test_a_day_without_events_says_so(self):
+        window = self.open()
+        window.select(day(4))
+        self.assertEqual(self.rows(window), [])
+        self.assertTrue(any("Keine Termine an diesem Tag" in t for t in texts(window)))
+
+    def test_a_speculative_event_is_never_shown_as_confirmed(self):
+        window = self.open()
+        window.select(day(10))
+        row = self.rows(window)[0]
+        self.assertNotEqual(row.badge.text(), "bestätigt")
+        self.assertIn("dashed", row.badge.styleSheet())
+
+    def test_events_without_an_exact_day_are_listed_below_for_their_month(self):
+        window = self.open()
+        header = "OHNE GENAUEN TAG IN DIESEM MONAT"
+        self.assertIn(header, self.labels(window))
+        self.assertIn("DELL · Demo", [row.title.text() for row in window.findChildren(w.EventRow)])
+        window.shift_month(2)
+        self.assertNotIn(header, self.labels(window))
+
+    def test_only_positions_hides_the_others(self):
+        window = self.open()
+        window.select(day(3))
+        window.only_positions.click()
+        self.assertEqual(self.chips(window, day(3)), ["AAPL · Quartalszahlen"])
+        self.assertEqual(self.chips(window, day(5)), [])
+        window.only_positions.click()
+        self.assertEqual(self.chips(window, day(5)), ["MSFT · Quartalszahlen"])
+
+    def test_a_stock_window_shows_only_that_stock_without_symbol_prefix(self):
+        window = self.open("DELL")
+        self.assertTrue(window.only_positions.isHidden())
+        self.assertEqual(self.chips(window, day(10)), ["GTA VI"])
+        self.assertEqual(self.chips(window, day(3)), [])
+        self.assertTrue(all(" · " not in t for t in self.titles(window)))
+
+    def test_an_empty_calendar_still_shows_the_grid(self):
+        for event in list(self.ctl.store.events()):
+            self.ctl.store.delete_event(event.id)
+        self.ctl.reload_calendar()
+        window = self.open()
+        self.assertEqual(self.rows(window), [])
+        self.assertTrue(window.cells)
+        self.assertTrue(any("Keine Termine an diesem Tag" in t for t in texts(window)))
+
+    def test_new_events_appear_without_reopening(self):
+        window = self.open()
+        window.select(day(4))
+        self.ctl.add_event("MSFT", "product", "Neu", day(4).strftime("%d.%m.%Y"), "confirmed")
+        self.assertTrue(wait_until(lambda: self.titles(window) == ["MSFT · Neu"]))
+        self.assertTrue(wait_until(lambda: [c.full_text for c in window.cells[day(4)].chips] == ["MSFT · Neu"]))
+
+    def test_clicking_a_row_opens_that_stock_in_the_overall_window_only(self):
+        window = self.open()
+        window.select(day(5))
+        self.rows(window)[0].clicked.emit("MSFT")
+        self.assertEqual(self.opened, ["MSFT"])
+        other = self.open("DELL")
+        other.select(day(10))
+        self.assertFalse(self.rows(other)[0].show_symbol)
+
+    def test_only_manual_events_can_be_changed_or_deleted(self):
+        window = self.open()
+        tips = lambda row: [b.toolTip() for b in row.findChildren(QPushButton)]
+        window.select(day(10))
+        manual = self.rows(window)[0]
+        self.assertIn("Termin löschen", tips(manual))
+        self.assertIn("Termin ändern", tips(manual))
+        window.select(day(3))
+        other = self.rows(window)[0]
+        self.assertNotIn("Termin löschen", tips(other))
+        self.assertNotIn("Termin ändern", tips(other))
+
+    def test_the_delete_button_of_a_row_asks_and_removes_the_event(self):
+        window = self.open()
+        window.select(day(10))
+        delete = next(b for b in self.rows(window)[0].findChildren(QPushButton) if b.toolTip() == "Termin löschen")
+        driver = DialogDriver(lambda d: d.submit())
+        delete.click()
+        driver.check()
+        self.assertTrue(wait_until(lambda: self.titles(window) == [] and window.cells[day(10)].chips == []))
+
+    def test_the_edit_button_opens_the_prefilled_dialog(self):
+        window = self.open()
+        window.select(day(10))
+        edit = next(b for b in self.rows(window)[0].findChildren(QPushButton) if b.toolTip() == "Termin ändern")
+        seen = []
+        driver = DialogDriver(lambda d: (seen.append(d.entries[0].text()), d.reject()))
+        edit.click()
+        driver.check()
+        self.assertEqual(seen, ["GTA VI"])
+
+    def test_the_add_button_opens_the_dialog_for_the_stock_or_with_a_stock_choice(self):
+        seen = []
+        driver = DialogDriver(lambda d: (seen.append(isinstance(d.entries[0], w.QComboBox)), d.reject()))
+        self.open().add_button.click()
+        driver.check()
+        driver = DialogDriver(lambda d: (seen.append(isinstance(d.entries[0], w.QComboBox)), d.reject()))
+        self.open("DELL").add_button.click()
+        driver.check()
+        self.assertEqual(seen, [True, False])
+
+    def test_the_window_is_wide(self):
+        screen = QApplication.primaryScreen().availableGeometry()
+        self.assertEqual(self.open().width(), min(1020, screen.width() - 20))
+
+    def test_the_legend_explains_the_four_statuses(self):
+        keys = [glossary.key_of_link(url) for url in __import__("re").findall(r'href="([^"]+)"', self.open().legend.text())]
+        self.assertEqual(keys, list(w.STATUS_TERMS.values()))
+
+    def test_a_window_opens_once_per_stock_docks_and_frees_its_slot(self):
+        window = self.open()
+        w.open_calendar(self.ctl)
+        self.assertEqual(len(w.CALENDAR_WINDOWS), 1)
+        self.assertIn(window, w.Dock.windows)
+        window.close()
+        self.assertNotIn("", w.CALENDAR_WINDOWS)
+        self.assertNotIn(window, w.Dock.windows)
+
+    def test_closing_the_window_disconnects_it(self):
+        window = self.open()
+        window.close()
+        self.ctl.calendar_changed.emit()  # darf nichts mehr aufrufen
+        self.assertNotIn("", w.CALENDAR_WINDOWS)
+
+    def test_the_window_can_be_pinned_and_pinned_windows_come_back(self):
+        window = self.open()
+        window.pin_button.click()
+        self.assertTrue(self.ctl.is_pinned("calendar"))
+        window.close()
+        w.restore_pinned(self.ctl, self.main)
+        self.assertIn("", w.CALENDAR_WINDOWS)
+
+    def test_a_pinned_stock_calendar_comes_back_and_an_unknown_one_does_not(self):
+        self.ctl.set_pinned("calendar:DELL", True)
+        self.ctl.set_pinned("calendar:GIBTESNICHT", True)
+        w.restore_pinned(self.ctl, self.main)
+        self.assertEqual(sorted(w.CALENDAR_WINDOWS), ["DELL"])
+
+    def test_the_button_of_the_positions_box_opens_the_calendar(self):
+        self.main.calendar_button.click()
+        self.assertIn("", w.CALENDAR_WINDOWS)
+        self.assertEqual(self.main.calendar_button.toolTip(), "Termine der nächsten Tage")
+
+
+class DetailEventsTests(AppTestCase):
+    def setUp(self):
+        super().setUp()
+        self.main = w.MainWindow(self.ctl)
+
+    def detail(self):
+        self.main.open_detail("AAPL")
+        detail = self.main.details["AAPL"]
+        wait_until(lambda: detail.event_title.text() != "Wird geladen …")
+        return detail
+
+    def test_the_next_event_shows_title_date_status_and_source(self):
+        self.ctl.record_yahoo_events("AAPL", [(day(7), "Quartalszahlen")])
+        detail = self.detail()
+        self.assertEqual(detail.event_title.text(), "Quartalszahlen")
+        self.assertIn("in 7 Tagen", detail.event_when.text())
+        self.assertEqual(detail.event_status.text(), "erwartet")
+        self.assertFalse(detail.event_status.isHidden())
+        self.assertIn("Quelle: Yahoo Finance", detail.event_note.text())
+
+    def test_a_speculative_manual_event_is_marked_as_such(self):
+        self.ctl.add_event("AAPL", "product", "GTA VI", day(30).strftime("%d.%m.%Y"), "speculative")
+        detail = self.detail()
+        self.assertEqual((detail.event_title.text(), detail.event_status.text()), ("GTA VI", "spekulativ"))
+        self.assertIn("dashed", detail.event_status.styleSheet())
+        self.assertIn("Quelle: Manuell", detail.event_note.text())
+
+    def test_following_events_are_listed_each_with_its_own_status(self):
+        self.ctl.add_event("AAPL", "product", "A", day(10).strftime("%d.%m.%Y"), "confirmed")
+        self.ctl.add_event("AAPL", "product", "B", day(20).strftime("%d.%m.%Y"), "speculative")
+        self.ctl.add_event("AAPL", "product", "C", day(30).strftime("%d.%m.%Y"), "expected")
+        detail = self.detail()
+        rows = detail.findChildren(w.EventRow)
+        self.assertEqual([(r.title.text(), r.badge.text()) for r in rows], [("B", "spekulativ"), ("C", "erwartet")])
+
+    def test_at_most_four_following_events_then_a_count(self):
+        for i in range(8):
+            self.ctl.add_event("AAPL", "product", f"E{i}", day(10 + i).strftime("%d.%m.%Y"), "expected")
+        detail = self.detail()
+        self.assertEqual(len(detail.findChildren(w.EventRow)), 4)
+        self.assertIn("… und 3 weitere", texts(detail))
+
+    def test_two_sources_for_the_same_event_become_one_entry_naming_both(self):
+        self.ctl.record_yahoo_events("AAPL", [(day(10), "Quartalszahlen")])
+        self.ctl.add_event("AAPL", "earnings", "Zahlen laut IR", day(12).strftime("%d.%m.%Y"), "confirmed")
+        detail = self.detail()
+        self.assertEqual((detail.event_title.text(), detail.event_status.text()), ("Zahlen laut IR", "bestätigt"))
+        self.assertIn("Quelle: Yahoo Finance, Manuell", detail.event_note.text())
+        self.assertIn(f"Yahoo Finance nennt {day(10):%d.%m.%Y}", detail.event_note.text())
+        self.assertEqual(detail.findChildren(w.EventRow), [])
+
+    def test_events_that_have_passed_or_are_overdue_are_not_upcoming(self):
+        self.ctl.add_event("AAPL", "product", "Vorbei", day(-3).strftime("%d.%m.%Y"), "confirmed")
+        self.ctl.add_event("AAPL", "product", "Verpasst", day(-20).strftime("%d.%m.%Y"), "speculative")
+        self.assertEqual(self.detail().event_title.text(), "Kein bevorstehender Termin")
+
+    def test_without_any_event_it_says_so_and_hides_status_and_source(self):
+        detail = self.detail()
+        self.assertEqual(detail.event_title.text(), "Kein bevorstehender Termin")
+        self.assertTrue(detail.event_status.isHidden())
+        self.assertTrue(detail.event_note.isHidden())
+
+    def test_a_failed_download_without_stored_events_says_not_loadable(self):
+        with mock.patch.object(sd, "fetch_events", side_effect=RuntimeError("offline")):
+            self.main.open_detail("AAPL")
+            detail = self.main.details["AAPL"]
+            self.assertTrue(wait_until(lambda: detail.event_title.text() == "Termine nicht ladbar"))
+
+    def test_a_failed_download_still_shows_what_is_stored(self):
+        self.ctl.record_yahoo_events("AAPL", [(day(7), "Quartalszahlen")])
+        with mock.patch.object(sd, "fetch_events", side_effect=RuntimeError("offline")):
+            self.main.open_detail("AAPL")
+            detail = self.main.details["AAPL"]
+            wait_until(lambda: False, 400)
+        self.assertEqual(detail.event_title.text(), "Quartalszahlen")
+
+    def test_the_card_follows_new_events_live(self):
+        detail = self.detail()
+        self.ctl.add_event("AAPL", "merger", "Übernahmeangebot", day(4).strftime("%d.%m.%Y"), "speculative")
+        self.assertEqual(detail.event_title.text(), "Übernahmeangebot")
+
+    def test_the_title_is_explained_by_the_kind_of_event(self):
+        self.ctl.add_event("AAPL", "ex_dividend", "Dividende", day(4).strftime("%d.%m.%Y"), "expected")
+        self.assertEqual(self.detail().event_title._term_anchor.key, "ex_dividende")
+        self.ctl.add_event("AAPL", "product", "X", day(2).strftime("%d.%m.%Y"), "expected")
+        self.assertEqual(self.main.details["AAPL"].event_title._term_anchor.key, "termin")
+
+    def test_the_buttons_add_an_event_or_open_the_stock_calendar(self):
+        detail = self.detail()
+        seen = []
+        driver = DialogDriver(lambda d: (seen.append(isinstance(d.entries[0], w.QComboBox)), d.reject()))
+        detail.add_event_button.click()
+        driver.check()
+        self.assertEqual(seen, [False])  # die Aktie steht schon fest
+        detail.all_events_button.click()
+        self.assertIn("AAPL", w.CALENDAR_WINDOWS)
+
+    def test_closing_the_detail_window_disconnects_the_card(self):
+        detail = self.detail()
+        detail.close()
+        self.ctl.add_event("AAPL", "product", "X", day(2).strftime("%d.%m.%Y"), "expected")  # darf nicht scheitern
+        self.assertNotIn("AAPL", self.main.details)
+
+    def test_the_cards_column_shows_a_manual_event_of_a_loaded_stock(self):
+        self.ctl.record_trade("AAPL", "buy", 1, 100, 0, day(-5))  # nur Aktien mit Position stehen in dieser Box
+        self.ctl.events["AAPL"] = []
+        self.ctl.add_event("AAPL", "product", "Release", day(6).strftime("%d.%m.%Y"), "confirmed")
+        self.assertTrue(self.main.cards["AAPL"].event.text().startswith("Release"))
+
+
 class FlashTests(AppTestCase):
     def setUp(self):
         super().setUp()
         patcher = mock.patch.object(w, "FLASH_MS", 150)
         patcher.start()
         self.addCleanup(patcher.stop)
+        hold_all(self.ctl)
         self.main = w.MainWindow(self.ctl)
 
     @staticmethod
@@ -1725,6 +2389,7 @@ class FlashTests(AppTestCase):
         self.assertGreater(r, g)
 
     def test_start_position_flashes_green(self):
+        drop_position(self.ctl, "AAPL")
         self.ctl.start_position("AAPL", 10, 0)
         r, g, b = self.color_of(self.main.cards["AAPL"])
         self.assertGreater(g, r)
@@ -1850,6 +2515,7 @@ class WindowTests(AppTestCase):
             self.assertIsNone(detail.chart.points)
 
     def test_market_lamp_shows_open_extended_closed_and_hides_without_state(self):
+        hold_all(self.ctl)
         card = self.main.cards["AAPL"]
         for state, tip in (("open", "Börse geöffnet"), ("extended", "Vor- oder Nachbörse"),
                            ("closed", "Börse geschlossen")):
@@ -1862,12 +2528,14 @@ class WindowTests(AppTestCase):
         self.assertEqual(card.lamp.toolTip(), "")
 
     def test_market_lamp_is_off_for_a_stale_quote(self):
+        hold_all(self.ctl)
         self.ctl.quotes["AAPL"]["market_state"] = "open"
         self.ctl.quote_times["AAPL"] = dt.datetime.now() - dt.timedelta(days=3)
         self.ctl.changed.emit()
         self.assertIsNone(self.main.cards["AAPL"].market_state)
 
     def test_clicking_a_selected_row_deselects_it_and_closes_its_detail_window(self):
+        hold_all(self.ctl)
         card = self.main.cards["AAPL"]
         card.clicked.emit("AAPL")
         detail = self.main.details["AAPL"]
@@ -1881,6 +2549,7 @@ class WindowTests(AppTestCase):
         self.assertIn("AAPL", self.main.details)
 
     def test_card_is_highlighted_while_its_detail_window_is_open(self):
+        hold_all(self.ctl)
         card, other = self.main.cards["AAPL"], self.main.cards["MSFT"]
         self.assertFalse(card.property("open"))
         self.main.open_detail("AAPL")
@@ -1906,6 +2575,38 @@ class WindowTests(AppTestCase):
             for widget in (detail.chart, detail.position_card, detail.price):
                 self.assertTrue(inside.isAncestorOf(widget))
             self.assertTrue(any(inside.isAncestorOf(card) for card in detail.findChildren(w.NewsCard)))
+
+    def test_detail_shows_mean_target_range_and_analyst_count(self):
+        targets = {"mean": 110.0, "high": 140.0, "low": 80.0, "count": 12, "currency": "USD"}
+        with mock.patch.object(sd, "fetch_targets", lambda s: targets):
+            self.main.open_detail("AAPL")
+            detail = self.main.details["AAPL"]
+            self.assertTrue(wait_until(lambda: detail.target_mean.text() == "Ø 110.00 USD"))
+        self.assertEqual(detail.target_upside.text(), "+10.0 % zum aktuellen Kurs")  # Kurs im Test: 100
+        self.assertEqual(detail.target_range.text(), "Höchstes 140.00 · Niedrigstes 80.00 · 12 Analysten")
+
+    def test_detail_without_targets_says_so(self):
+        self.main.open_detail("AAPL")
+        detail = self.main.details["AAPL"]
+        self.assertTrue(wait_until(lambda: detail.target_mean.text() == "Keine Kursziele vorhanden"))
+
+    def test_detail_with_failed_target_lookup_shows_the_reason(self):
+        def broken(symbol):
+            raise RuntimeError("offline")
+        with mock.patch.object(sd, "fetch_targets", broken):
+            self.main.open_detail("AAPL")
+            detail = self.main.details["AAPL"]
+            self.assertTrue(wait_until(lambda: detail.target_mean.text() == "Nicht ladbar"))
+        self.assertIn("offline", detail.target_range.text())
+
+    def test_target_in_another_currency_shows_no_upside(self):
+        targets = {"mean": 110.0, "high": None, "low": None, "count": 1, "currency": "EUR"}
+        with mock.patch.object(sd, "fetch_targets", lambda s: targets):
+            self.main.open_detail("AAPL")
+            detail = self.main.details["AAPL"]
+            self.assertTrue(wait_until(lambda: detail.target_mean.text() == "Ø 110.00 EUR"))
+        self.assertEqual(detail.target_upside.text(), "")
+        self.assertEqual(detail.target_range.text(), "1 Analyst")
 
     def test_detail_without_events_says_so(self):
         self.main.open_detail("AAPL")
@@ -2015,10 +2716,88 @@ class ChoiceDialogTests(unittest.TestCase):
         driver.check()
 
 
-class AddSymbolUiTests(AppTestCase):
+class PositionsAndWatchlistTests(AppTestCase):
     def setUp(self):
         super().setUp()
         self.main = w.MainWindow(self.ctl)
+        self.main.open_watchlist()
+        self.watchlist = self.main.watchlist
+
+    def test_boxes_are_titled_positions_and_watchlist(self):
+        self.assertIn("Positionen", texts(self.main))
+        self.assertIn("Watchlist", texts(self.watchlist))
+
+    def test_stocks_without_a_position_are_on_the_watchlist_only(self):
+        self.assertEqual(list(self.main.cards), [])
+        self.assertEqual(list(self.watchlist.cards), ["AAPL", "MSFT", "DELL"])
+
+    def test_a_purchase_moves_the_stock_to_positions_and_a_full_sale_moves_it_back(self):
+        self.ctl.record_trade("AAPL", "buy", 10, 80, 0, TODAY)
+        self.assertEqual(list(self.main.cards), ["AAPL"])
+        self.assertEqual(list(self.watchlist.cards), ["MSFT", "DELL"])
+        self.ctl.record_trade("AAPL", "sell", 10, 90, 0, TODAY)
+        self.assertEqual(list(self.main.cards), [])
+        self.assertEqual(sorted(self.watchlist.cards), ["AAPL", "DELL", "MSFT"])
+
+    def test_watchlist_has_no_position_columns_and_is_narrower(self):
+        self.ctl.record_trade("MSFT", "buy", 1, 100, 0, TODAY)  # sonst zeigt Positionen keine Kopfzeile
+        self.main.show()
+        self.watchlist.show()
+        for key in ("value", "pl", "amount"):
+            self.assertFalse(self.watchlist.heads[key].isVisibleTo(self.watchlist))
+            self.assertTrue(self.main.heads[key].isVisibleTo(self.main))
+            self.assertFalse(self.watchlist.cards["AAPL"].labels[key].isVisibleTo(self.watchlist))
+        self.assertLess(self.watchlist.width(), self.main.width())
+        for card in self.watchlist.cards.values():
+            self.assertLessEqual(card.minimumSizeHint().width(), self.watchlist.area.viewport().width())
+
+    def test_empty_hints_show_in_the_box_without_stocks(self):
+        self.assertFalse(self.main.empty.isHidden())
+        self.assertTrue(self.watchlist.empty.isHidden())
+
+    def test_watchlist_button_opens_and_closes_the_watchlist(self):
+        self.main.show_docked()
+        self.watchlist.hide_docked()
+        self.main.watchlist_button.click()
+        self.assertTrue(self.watchlist.isVisible())
+        self.assertIn(self.watchlist, w.Dock.windows)
+        self.main.watchlist_button.click()
+        self.assertFalse(self.watchlist.isVisible())
+        self.assertNotIn(self.watchlist, w.Dock.windows)
+
+    def test_watchlist_is_created_once(self):
+        self.main.open_watchlist()
+        self.assertIs(self.main.watchlist, self.watchlist)
+
+    def test_plus_belongs_to_the_watchlist_and_the_pin_can_be_set_there(self):
+        self.assertIsNotNone(getattr(self.watchlist, "pin_button", None))
+        self.watchlist.pin_button.click()
+        self.assertTrue(self.ctl.is_pinned("watchlist"))
+        self.assertIsNone(getattr(self.main, "pin_button", None))
+
+    def test_pinned_watchlist_opens_with_the_widget(self):
+        self.ctl.set_pinned("watchlist", True)
+        self.watchlist.hide_docked()
+        w.restore_pinned(self.ctl, self.main)
+        self.assertTrue(self.watchlist.isVisible())
+
+    def test_an_open_detail_highlights_the_row_in_whichever_box_holds_it(self):
+        self.main.show_docked()
+        self.watchlist.open_detail("AAPL")
+        self.assertIn("AAPL", self.main.details)
+        self.ctl.record_trade("AAPL", "buy", 10, 80, 0, TODAY)
+        self.assertIs(self.main.details, self.watchlist.details)
+        self.assertTrue(self.main.cards["AAPL"].property("open"))
+
+    def test_closing_the_watchlist_window_takes_it_out_of_the_dock(self):
+        self.watchlist.close()
+        self.assertNotIn(self.watchlist, w.Dock.windows)
+
+
+class AddSymbolUiTests(AppTestCase):
+    def setUp(self):
+        super().setUp()
+        self.main = w.MainWindow(self.ctl, watchlist_of=w.MainWindow(self.ctl))  # neue Aktien kommen auf die Watchlist
 
     def add(self, text):
         self.main.add_symbol(text)

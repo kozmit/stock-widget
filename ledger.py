@@ -85,7 +85,9 @@ def validate(tx):
         raise ValueError("Art muss Kauf oder Verkauf sein")
     if tx.shares <= 0:
         raise ValueError("Die Stückzahl muss größer als 0 sein")
-    if tx.price <= 0:
+    # Eine geschenkte Aktie (Abspaltung, Zuteilung) kostet nichts: nur importierte Käufe dürfen den Kurs 0 haben
+    free = tx.kind == "buy" and tx.price == 0 and tx.source not in ("manual", "opening")
+    if tx.price < 0 or (tx.price == 0 and not free):
         raise ValueError("Der Kurs muss größer als 0 sein")
     if tx.fee < 0:
         raise ValueError("Die Gebühr darf nicht negativ sein")

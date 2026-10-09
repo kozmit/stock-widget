@@ -48,9 +48,9 @@ GLOSSARY = _terms(
          interpretation="Eine Position entsteht durch Käufe und wird durch Verkäufe kleiner. Der Bestand wird immer "
                         "aus den eingetragenen Käufen und Verkäufen berechnet."),
     Term("positionswert", "Position (Wert)", "Der aktuelle Wert der gehaltenen Stücke einer Aktie.",
-         formula="Stückzahl × aktueller Kurs", unit="Währung der Aktie (nicht in Euro umgerechnet)",
+         formula="Stückzahl × aktueller Kurs", unit="Währung der Aktie (nicht umgerechnet)",
          interpretation="Der Mauszeiger auf dem Wert zeigt die Stückzahl. In der Portfolio-Übersicht stehen die "
-                        "Werte dagegen in Euro."),
+                        "Werte dagegen in der Basiswährung."),
     Term("startbestand", "Startbestand",
          "Ein übernommener Bestand ohne bekanntes Kaufdatum, zum Beispiel aus dem alten Widget oder über „Startbestand "
          "festlegen“. Der Einstandskurs wird aus Stückzahl und deinem damaligen Gewinn oder Verlust berechnet.",
@@ -85,16 +85,16 @@ GLOSSARY = _terms(
          interpretation="+25 % heißt: Die Stücke sind 25 % mehr wert als beim Kauf."),
     Term("unrealisiert", "Unrealisierter Gewinn/Verlust",
          "Gewinn oder Verlust der Stücke, die du noch hältst. Er ist nur auf dem Papier, solange du nicht verkaufst.",
-         formula="Wert − Investiert", unit="Euro",
+         formula="Wert − Investiert", unit="Basiswährung (Euro oder Dollar)",
          interpretation="Er ändert sich mit Kurs und Wechselkurs. Steuerlich zählt er erst beim Verkauf."),
     Term("realisiert", "Realisierter Gewinn/Verlust",
          "Gewinn oder Verlust aus Stücken, die du bereits verkauft hast. Er steht endgültig fest.",
-         formula="Erlös (nach Gebühr) − Anschaffungskosten der verkauften Stücke (FIFO)", unit="Euro",
-         interpretation="Erlös und Anschaffungskosten werden je zum Wechselkurs des Verkaufs- und des Kauftags in Euro "
+         formula="Erlös (nach Gebühr) − Anschaffungskosten der verkauften Stücke (FIFO)", unit="Basiswährung (Euro oder Dollar)",
+         interpretation="Erlös und Anschaffungskosten werden je zum Wechselkurs des Verkaufs- und des Kauftags in die Basiswährung "
                         "umgerechnet. Ein späterer Verkauf ändert frühere Verkäufe nicht."),
     Term("gesamtergebnis", "Gesamtergebnis", "Alles, was du mit dem Portfolio bisher verdient oder verloren hast: das "
                                              "Ergebnis der gehaltenen Stücke plus das der verkauften.",
-         formula="unrealisiert + realisiert", unit="Euro"),
+         formula="unrealisiert + realisiert", unit="Basiswährung (Euro oder Dollar)"),
     Term("gesamtrendite", "Gesamtrendite",
          "Das Gesamtergebnis im Verhältnis zum gesamten Kapital, das du je eingesetzt hast (gehaltene und bereits "
          "verkaufte Stücke).",
@@ -103,30 +103,39 @@ GLOSSARY = _terms(
          interpretation="Das ist keine zeitgewichtete Rendite: Sie sagt nichts darüber, wie lange das Kapital "
                         "gebunden war, und zählt Ein- und Auszahlungen nicht nach dem Zeitpunkt.",
          example="Ergebnis +168 €, eingesetzt 1.150 € → +14,6 %."),
-    Term("investiert", "Investiert", "Die Anschaffungskosten der Stücke, die du noch hältst, in Euro, einschließlich "
+    Term("investiert", "Investiert", "Die Anschaffungskosten der Stücke, die du noch hältst, in der Basiswährung, einschließlich "
                                      "der Gebühren.",
-         formula="Summe aus Stück × Einstand × Wechselkurs am Kauftag", unit="Euro",
+         formula="Summe aus Stück × Einstand × Wechselkurs am Kauftag", unit="Basiswährung (Euro oder Dollar)",
          interpretation="Der Wechselkurs des Kauftags bleibt fest. Verkaufte Stücke zählen hier nicht mehr mit."),
-    Term("gesamtwert", "Gesamtwert", "Der heutige Wert aller gehaltenen Stücke, in Euro (der Basiswährung).",
-         formula="Summe aus Stückzahl × Kurs × aktueller Wechselkurs", unit="Euro",
-         interpretation="Aktien ohne Kurs oder ohne Wechselkurs fehlen im Wert; der gelbe Hinweis nennt sie."),
-    Term("basiswaehrung", "Basiswährung", "Die Währung, in der das ganze Portfolio gerechnet wird: Euro. Aktien in "
-                                          "anderen Währungen werden mit dem Wechselkurs umgerechnet.",
-         unit="EUR"),
+    Term("gesamtwert", "Gesamtwert", "Der heutige Wert aller gehaltenen Stücke plus das verfügbare Guthaben bei "
+                                     "eToro, in der Basiswährung (Euro oder Dollar).",
+         formula="Summe aus Stückzahl × Kurs × aktueller Wechselkurs, plus Guthaben × aktueller Wechselkurs",
+         unit="Basiswährung (Euro oder Dollar)",
+         interpretation="Aktien ohne Kurs oder ohne Wechselkurs fehlen im Wert; der gelbe Hinweis nennt sie. Ohne "
+                        "bekanntes Guthaben (kein eToro-Abgleich) zählen nur die Stücke."),
+    Term("guthaben", "Verfügbares Guthaben", "Das Geld auf deinem eToro-Konto, das nicht in Positionen steckt "
+                                             "(bei eToro „Credit“, in US-Dollar).",
+         unit="Basiswährung, umgerechnet vom Dollar",
+         interpretation="Der Stand stammt vom letzten eToro-Abgleich. Er gehört zum Gesamtwert, nicht zu Investiert "
+                        "und nicht zum Ergebnis."),
+    Term("basiswaehrung", "Basiswährung", "Die Währung, in der das ganze Portfolio gerechnet wird: Euro oder Dollar, oben im "
+                                          "Portfolio-Fenster umschaltbar. Aktien in anderen Währungen werden mit dem "
+                                          "Wechselkurs umgerechnet.",
+         unit="EUR oder USD"),
     Term("kursgewinn", "Kursgewinn", "Der Teil des Ergebnisses, der aus der Kursentwicklung der Aktie selbst kommt, "
                                     "ohne die Veränderung des Wechselkurses.",
-         formula="(Wert − Kosten in Aktienwährung) × Wechselkurs am Kauftag", unit="Euro"),
+         formula="(Wert − Kosten in Aktienwährung) × Wechselkurs am Kauftag", unit="Basiswährung (Euro oder Dollar)"),
     Term("waehrungseffekt", "Währungseffekt",
          "Der Teil des Ergebnisses, der nur daher kommt, dass sich der Wechselkurs seit dem Kauf verändert hat.",
-         formula="Wert in Aktienwährung × (Wechselkurs heute − Wechselkurs am Kauftag)", unit="Euro",
+         formula="Wert in Aktienwährung × (Wechselkurs heute − Wechselkurs am Kauftag)", unit="Basiswährung (Euro oder Dollar)",
          interpretation="Wird der Euro stärker, sinkt der Euro-Wert von Aktien in Dollar, Franken oder Australischen "
                         "Dollar, auch wenn ihr Kurs gleich bleibt. Kursgewinn und Währungseffekt ergeben zusammen das "
-                        "Ergebnis in Euro."),
+                        "Ergebnis in der Basiswährung."),
     Term("kurs_waehrung", "Kursgewinn und Währungseffekt",
-         "Das Ergebnis in Euro besteht aus zwei Teilen: dem Kursgewinn der Aktie und dem Effekt der Wechselkursänderung.",
+         "Das Ergebnis besteht aus zwei Teilen: dem Kursgewinn der Aktie und dem Effekt der Wechselkursänderung.",
          formula="Ergebnis = Kursgewinn + Währungseffekt",
          interpretation="Kurs: Gewinn in der Aktienwährung, zum Wechselkurs des Kaufs umgerechnet. Währung: Wert × "
-                        "Änderung des Wechselkurses seit dem Kauf. Aktien in Euro haben keinen Währungseffekt."),
+                        "Änderung des Wechselkurses seit dem Kauf. Aktien in der Basiswährung haben keinen Währungseffekt."),
     Term("anteil", "Anteil", "Wie viel Prozent des Gesamtwerts diese Position ausmacht.",
          formula="Wert der Position ÷ Gesamtwert × 100", unit="Prozent",
          interpretation="Ein hoher Anteil heißt: Das Portfolio hängt stark an dieser Aktie."),
@@ -146,6 +155,38 @@ GLOSSARY = _terms(
          interpretation="Der letzte bekannte Kurs bleibt sichtbar, aber gelb und kursiv. Werte, die auf ihm beruhen, "
                         "sind dann nicht aktuell."),
     # ---- Termine ----
+    Term("termine", "Termine (Kalender)",
+         "Alle bekannten Termine zu deinen Aktien: Quartalszahlen und Dividenden von Yahoo Finance und eigene Einträge wie "
+         "Produktstarts oder Genehmigungen. Jeder Termin zeigt, wie verlässlich er ist.",
+         interpretation="Der Status ist wichtiger als das Datum: Nur bestätigte Termine sind offiziell. Daten von Yahoo "
+                        "gelten als erwartet, weil Yahoo nicht sagt, ob das Unternehmen sie bestätigt hat."),
+    Term("termin_status", "Status eines Termins",
+         "Sagt, wie verlässlich das Datum eines Termins ist: bestätigt, erwartet, spekulativ oder eingetreten.",
+         interpretation="Ein spekulativer Termin wird nie wie ein bestätigter dargestellt. Nach Ablauf des Datums gilt ein "
+                        "bestätigter oder erwarteter Termin als eingetreten; ein spekulativer bleibt spekulativ und "
+                        "wird als „Datum verstrichen“ gekennzeichnet."),
+    Term("status_bestaetigt", "Status: bestätigt",
+         "Der Termin wurde vom Unternehmen oder von der zuständigen Stelle offiziell genannt.",
+         interpretation="Die verlässlichste Stufe. Auch ein bestätigter Termin kann sich noch verschieben."),
+    Term("status_erwartet", "Status: erwartet",
+         "Der Termin ist eine Schätzung oder stammt von einem Datenanbieter wie Yahoo Finance, ohne dass das Unternehmen "
+         "ihn bestätigt hat.",
+         interpretation="Gut zum Planen, aber das Datum kann sich noch ändern, vor allem bei Quartalszahlen."),
+    Term("status_spekulativ", "Status: spekulativ",
+         "Der Termin beruht auf Gerüchten, Vermutungen oder Aussagen Dritter.",
+         interpretation="Plane nicht damit. Er kann sich stark verschieben oder ganz entfallen, zum Beispiel ein "
+                        "Erscheinungstermin, den nur ein Branchengerücht nennt."),
+    Term("status_eingetreten", "Status: eingetreten",
+         "Das Datum des Termins ist vorbei; das Widget geht davon aus, dass er stattgefunden hat.",
+         interpretation="Bei bestätigten und erwarteten Terminen setzt das Widget den Status selbst. Wurde ein Termin "
+                        "verschoben, legt Yahoo oder du den neuen an."),
+    Term("relevanz", "Relevanz eines Termins",
+         "Wie wichtig der Termin für die Aktie ist: hoch, normal oder niedrig.",
+         interpretation="Quartalszahlen sind meist hoch, Dividendenzahlungen niedrig. Am selben Tag stehen wichtigere "
+                        "Termine oben."),
+    Term("ungenau", "Termin ohne genauen Tag",
+         "Manche Termine sind nur als Monat oder Jahr bekannt, zum Beispiel ein Erscheinungstermin „Mai 2027“.",
+         interpretation="Sie stehen im Kalender in einem eigenen Abschnitt, damit kein Datum vorgetäuscht wird."),
     Term("termin", "Nächster Termin", "Das nächste wichtige Datum zu dieser Aktie: Quartalszahlen, Ex-Dividende oder "
                                       "Dividendenzahlung.",
          interpretation="Rund um Quartalszahlen bewegen sich Kurse oft stärker."),

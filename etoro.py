@@ -23,6 +23,7 @@ import uuid
 from sources import ExternalTrade, SyncBatch, TransactionSource
 
 BASE_URL = "https://public-api.etoro.com/api/v1"
+USER_AGENT = "StockWidget/1.0"
 PAGE_SIZE = 100
 MAX_PAGES = 200
 MAX_RETRIES = 3
@@ -85,7 +86,8 @@ class EtoroClient:
         url = BASE_URL + path + ("?" + urllib.parse.urlencode(params) if params else "")
         for attempt in range(MAX_RETRIES + 1):
             headers = {"x-api-key": self.api_key, "x-user-key": self.user_key,
-                       "x-request-id": str(uuid.uuid4()), "Accept": "application/json"}
+                       "x-request-id": str(uuid.uuid4()), "Accept": "application/json",
+                       "User-Agent": USER_AGENT}  # ohne Kennung antwortet eToro mit 403
             status, response_headers, text = self.opener(url, headers)
             if status == 429 and attempt < MAX_RETRIES:
                 retry = {k.lower(): v for k, v in response_headers.items()}.get("retry-after", "")
@@ -103,9 +105,12 @@ class EtoroClient:
         except ValueError as exc:
             raise EtoroError("eToro hat keine lesbare Antwort geliefert") from exc
 
+    def portfolio(self):
+        """Das ganze Portfolio: offene Positionen und verfügbares Guthaben (credit, in USD)."""
+        return self.get("/trading/info/portfolio").get("clientPortfolio") or {}
+
     def portfolio_positions(self):
-        data = self.get("/trading/info/portfolio")
-        return list((data.get("clientPortfolio") or {}).get("positions") or [])
+        return list(self.portfolio().get("positions") or [])
 
     def history(self, min_date):
         """Alle abgeschlossenen Trades seit min_date, seitenweise."""
@@ -132,13 +137,49 @@ class EtoroClient:
         return result
 
 
+# eToro-Börsenendung -> Yahoo-Endung (leer: Endung entfällt). Nicht aufgeführte Endungen (.DE, .L, .PA ...) gelten gleich.
+SUFFIXES = {"US": "", "ZU": "SW", "FR": "PA", "NV": "AS"}
+
+
+COMMODITIES = {"GOLD": "GC=F"}  # bei eToro der Rohstoff Gold (nicht die Aktie Barrick)
+
+
+def yahoo_symbol(symbol):
+    """Übersetzt ein eToro-Kürzel (zum Beispiel ORA.US, ABBN.ZU, 01211.HK) in das Yahoo-Kürzel."""
+    base, dot, suffix = symbol.strip().upper().partition(".")
+    if not dot:
+        return COMMODITIES.get(base, base)
+    if suffix == "HK":
+        return f"{base.lstrip('0').zfill(4)}.HK"
+    suffix = SUFFIXES.get(suffix, suffix)
+    return f"{base}.{suffix}" if suffix else base
+
+
 def _day(text):
     return dt.date.fromisoformat(str(text)[:10])
 
 
+ACCOUNT_CURRENCY = "USD"  # eToro-Konten und das Guthaben (credit) laufen in US-Dollar
+
+
 def _is_plain_long(item):
-    """Nur ungehebelte Käufe sind echte Wertpapiere; alles andere ist ein CFD oder eine Leerposition."""
+    """Ungehebelte Käufe sind echte Wertpapiere."""
     return bool(item.get("isBuy")) and (item.get("leverage") or 1) == 1
+
+
+def leveraged_equivalent(units, open_rate, close_rate, leverage):
+    """Rechnet eine gehebelte Long-Position (CFD) in einen gleichwertigen Kauf und Verkauf um, damit das Hauptbuch
+    (nur Käufe und Verkäufe) Gewinn und eingesetztes Kapital richtig führt: Stückzahl durch den Hebel, Schlusskurs so,
+    dass der Gewinn derselbe bleibt. Beispiel Hebel 2, 144,3 Stück von 6,93 auf 4,65 (-329): 72,15 Stück von 6,93
+    auf 2,37 kosten 500 und bringen 171. Gibt (Stück, Eröffnungskurs, Schlusskurs) zurück."""
+    leverage = leverage or 1
+    if leverage == 1:
+        return units, open_rate, close_rate
+    return units / leverage, open_rate, open_rate + leverage * (close_rate - open_rate)
+
+
+def leverage_note(leverage):
+    return f"Hebel {leverage}: Stückzahl und Schlusskurs auf den eingesetzten Betrag umgerechnet" if (leverage or 1) != 1 else ""
 
 
 def build_trades(open_positions, closed_trades, instruments):
@@ -151,7 +192,7 @@ def build_trades(open_positions, closed_trades, instruments):
         if not info or not info["symbol"]:
             unnamed.add(item.get("instrumentID", item.get("instrumentId")))
             return None
-        return info["symbol"]
+        return yahoo_symbol(info["symbol"])
 
     for item in open_positions:
         if item.get("mirrorID"):       # Kopierte Positionen (Copy Trading) gehören nicht zu den eigenen Käufen
@@ -165,19 +206,23 @@ def build_trades(open_positions, closed_trades, instruments):
             trades.append(ExternalTrade(f"{item['positionID']}:open", symbol, "buy", float(item["units"]),
                                         float(item["openRate"]), _day(item["openDateTime"])))
     for item in closed_trades:
-        if not _is_plain_long(item) or not item.get("units") or not item.get("openRate") or not item.get("closeRate"):
+        # Geschlossene gehebelte Long-Positionen (CFD) zählen mit; Leerverkäufe kennt das Hauptbuch nicht
+        if not item.get("isBuy") or not item.get("units") or not item.get("openRate") or not item.get("closeRate"):
             skipped += 1
             continue
         symbol = symbol_of(item)
         if not symbol:
             continue
         key = item["positionId"]
-        trades.append(ExternalTrade(f"{key}:open", symbol, "buy", float(item["units"]), float(item["openRate"]),
-                                    _day(item["openTimestamp"])))
-        trades.append(ExternalTrade(f"{key}:close", symbol, "sell", float(item["units"]), float(item["closeRate"]),
-                                    _day(item["closeTimestamp"]), fee=max(float(item.get("fees") or 0), 0.0)))
+        leverage = item.get("leverage") or 1
+        shares, open_rate, close_rate = leveraged_equivalent(float(item["units"]), float(item["openRate"]),
+                                                              float(item["closeRate"]), leverage)
+        trades.append(ExternalTrade(f"{key}:open", symbol, "buy", shares, open_rate, _day(item["openTimestamp"]),
+                                    note=leverage_note(leverage)))
+        trades.append(ExternalTrade(f"{key}:close", symbol, "sell", shares, close_rate, _day(item["closeTimestamp"]),
+                                    fee=max(float(item.get("fees") or 0), 0.0), note=leverage_note(leverage)))
     if skipped:
-        notes.append(f"{skipped} Position(en) übersprungen (gehebelt, Leerverkauf, kopiert oder ohne Stückzahl)")
+        notes.append(f"{skipped} Position(en) übersprungen (offen gehebelt, Leerverkauf, kopiert oder ohne Stückzahl)")
     if unnamed:
         notes.append(f"{len(unnamed)} Instrument(e) ohne Kürzel bei eToro")
     return trades, notes
@@ -196,7 +241,9 @@ class EtoroSource(TransactionSource):
             start = max(dt.date.fromisoformat(cursor) - dt.timedelta(days=OVERLAP_DAYS), floor) if cursor else floor
         except ValueError:
             start = floor
-        positions = self.client.portfolio_positions()
+        portfolio = self.client.portfolio()
+        positions = list(portfolio.get("positions") or [])
+        credit = portfolio.get("credit")
         closed = self.client.history(start)
         ids = {p.get("instrumentID") for p in positions} | {t.get("instrumentId") for t in closed}
         instruments = self.client.instruments(i for i in ids if i is not None)
@@ -204,4 +251,5 @@ class EtoroSource(TransactionSource):
         if not cursor:
             notes.append(f"Handelsverlauf nur ab {floor:%d.%m.%Y} (Grenze der eToro-Schnittstelle); "
                          "ältere, schon geschlossene Positionen fehlen")
-        return SyncBatch(tuple(trades), today.isoformat(), tuple(notes))
+        cash = (float(credit), ACCOUNT_CURRENCY) if isinstance(credit, (int, float)) else None
+        return SyncBatch(tuple(trades), today.isoformat(), tuple(notes), cash)

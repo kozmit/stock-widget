@@ -3,6 +3,7 @@ import datetime as dt
 import json
 from unittest import mock
 
+import events as evt
 import stock_data as sd
 from sources import ExternalTrade, SyncBatch, TransactionSource
 from tests.support import AppTestCase, QUOTE, wait_until
@@ -638,12 +639,13 @@ class FakeSource(TransactionSource):
 
     def __init__(self, trades=(), cursor="c1", error=None):
         self.trades, self.next_cursor, self.error, self.cursors = list(trades), cursor, error, []
+        self.cash = None
 
     def fetch(self, cursor):
         self.cursors.append(cursor)
         if self.error:
             raise self.error
-        return SyncBatch(tuple(self.trades), self.next_cursor)
+        return SyncBatch(tuple(self.trades), self.next_cursor, cash=self.cash)
 
 
 def trade(id, kind="buy", shares=10, price=100.0, day=DAY1, symbol="AAPL", fee=0.0):
@@ -661,6 +663,11 @@ class EtoroConnectionTests(AppTestCase):
         self.ctl.disconnect_etoro()
         self.assertNotIn("etoro", self.ctl.sources)
         self.assertEqual(len(self.ctl.transactions["AAPL"]), 1)
+
+    def test_adopt_unknown_puts_new_stocks_on_the_watchlist(self):
+        plan = self.ctl.import_trades("etoro", [trade("1", symbol="NVDA")], adopt_unknown=True)
+        self.assertEqual(len(plan.new), 1)
+        self.assertIn("NVDA", self.ctl.symbols)
 
     def test_notes_of_the_source_appear_in_the_sync_state(self):
         self.ctl.import_trades("etoro", [trade("1")], notes=("2 Position(en) übersprungen",))
@@ -702,6 +709,60 @@ class ImportTests(AppTestCase):
         [tx] = self.ctl.transactions["AAPL"]
         self.assertEqual((tx.source, tx.external_id, tx.shares, tx.price, tx.fee), ("etoro", "1", 10, 100, 1.5))
         self.assertAlmostEqual(self.ctl.positions["AAPL"]["shares"], 10)
+
+    def test_available_cash_is_kept_with_its_time_and_survives_a_restart(self):
+        self.ctl.import_trades("etoro", [trade("1")], cash=(2568.15, "USD"))
+        amount, currency, at = self.ctl.cash["etoro"]
+        self.assertEqual((amount, currency), (2568.15, "USD"))
+        self.assertLess(abs((dt.datetime.now() - at).total_seconds()), 60)
+        self.ctl.store.close()
+        again = w.Controller()
+        self.addCleanup(again.shutdown)
+        self.assertEqual(again.cash["etoro"][:2], (2568.15, "USD"))
+
+    def test_the_base_currency_can_be_switched_and_is_remembered(self):
+        import fx
+        self.addCleanup(fx.set_base, "EUR")
+        self.assertEqual(fx.BASE, "EUR")
+        seen = []
+        self.ctl.base_changed.connect(seen.append)
+        self.ctl.set_base("USD")
+        self.assertEqual((fx.BASE, seen), ("USD", ["USD"]))
+        self.ctl.store.close()
+        again = w.Controller()
+        self.addCleanup(again.shutdown)
+        self.assertEqual(fx.BASE, "USD")
+        again.set_base("EUR")
+        self.assertEqual(fx.BASE, "EUR")
+
+    def test_switching_the_base_drops_the_exchange_rates_of_the_old_base(self):
+        import fx
+        self.addCleanup(fx.set_base, "EUR")
+        self.ctl.store.save_fx_rates("USD", {DAY1: 0.9}, "t")
+        self.ctl.store.save_fx_latest("USD", 0.9, dt.datetime.now(), "t")
+        self.ctl.fx.add_history("USD", {DAY1: 0.9})
+        self.ctl.set_base("USD")
+        self.assertEqual((self.ctl.store.fx_rates(), self.ctl.store.fx_latest(), self.ctl.fx.history), ({}, {}, {}))
+
+    def test_old_euro_rates_are_dropped_when_the_database_remembers_another_base(self):
+        import fx
+        self.addCleanup(fx.set_base, "EUR")
+        self.ctl.store.save_fx_rates("USD", {DAY1: 0.9}, "t")
+        self.ctl.store.set_meta("base_currency", "USD")  # beim nächsten Start gilt Dollar, die Kurse sind aber Euro-Kurse
+        self.ctl.store.close()
+        again = w.Controller()
+        self.addCleanup(again.shutdown)
+        self.assertEqual(again.store.fx_rates(), {})
+
+    def test_an_unknown_base_is_ignored(self):
+        import fx
+        self.ctl.set_base("GBP")
+        self.assertEqual(fx.BASE, "EUR")
+
+    def test_an_import_without_cash_keeps_the_last_known_cash(self):
+        self.ctl.import_trades("etoro", [trade("1")], cash=(100.0, "USD"))
+        self.ctl.import_trades("etoro", [trade("2", day=DAY2)], cash=None)
+        self.assertEqual(self.ctl.cash["etoro"][:2], (100.0, "USD"))
 
     def test_importing_the_same_trades_again_books_nothing_twice(self):
         self.ctl.import_trades("etoro", [trade("1"), trade("2", day=DAY2)])
@@ -914,6 +975,232 @@ class DailyClosesTests(AppTestCase):
 
     def test_performance_without_entries_is_empty(self):
         self.assertEqual(self.ctl.performance().points, [])
+
+
+TODAY = dt.date.today()
+
+
+def day(n):
+    return TODAY + dt.timedelta(days=n)
+
+
+class YahooEventsTests(AppTestCase):
+    def record(self, fetched, symbol="AAPL"):
+        return self.ctl.record_yahoo_events(symbol, fetched)
+
+    def merged(self, symbol="AAPL"):
+        return self.ctl.calendar_events(symbol)
+
+    def test_a_reported_date_becomes_an_expected_event_from_yahoo(self):
+        self.assertTrue(self.record([(day(10), "Quartalszahlen")]))
+        [item] = self.merged()
+        event = item.event
+        self.assertEqual((event.kind, event.title, event.day, event.status), ("earnings", "Quartalszahlen", day(10), "expected"))
+        self.assertEqual((event.source, event.relevance, event.precision), ("Yahoo Finance", 3, "day"))
+
+    def test_yahoo_never_claims_confirmation(self):
+        self.record([(day(3), "Quartalszahlen"), (day(5), "Ex-Dividende"), (day(9), "Dividendenzahlung")])
+        self.assertEqual({m.status for m in self.merged()}, {"expected"})
+
+    def test_each_kind_gets_its_own_relevance(self):
+        self.record([(day(3), "Quartalszahlen"), (day(5), "Ex-Dividende"), (day(9), "Dividendenzahlung")])
+        self.assertEqual({m.event.kind: m.event.relevance for m in self.merged()},
+                         {"earnings": 3, "ex_dividend": 2, "dividend": 1})
+
+    def test_two_dates_of_one_kind_are_a_range(self):
+        self.record([(day(10), "Quartalszahlen"), (day(14), "Quartalszahlen")])
+        [item] = self.merged()
+        self.assertEqual((item.event.day, item.event.end), (day(10), day(14)))
+
+    def test_reporting_the_same_again_changes_nothing_and_stays_silent(self):
+        self.record([(day(10), "Quartalszahlen")])
+        seen = []
+        self.ctl.calendar_changed.connect(lambda: seen.append(1))
+        self.assertFalse(self.record([(day(10), "Quartalszahlen")]))
+        self.assertEqual((seen, len(self.ctl.store.events())), ([], 1))
+
+    def test_a_postponed_date_replaces_the_old_one(self):
+        self.record([(day(10), "Quartalszahlen")])
+        self.assertTrue(self.record([(day(17), "Quartalszahlen")]))
+        [event] = self.ctl.store.events()
+        self.assertEqual(event.day, day(17))
+
+    def test_a_date_that_has_passed_stays_as_occurred(self):
+        self.record([(day(-3), "Quartalszahlen")])  # gemeldet, bevor es verging
+        self.record([(day(60), "Quartalszahlen")])
+        statuses = sorted(m.status for m in self.merged())
+        self.assertEqual(statuses, ["expected", "occurred"])
+
+    def test_a_kind_yahoo_does_not_mention_this_time_is_kept(self):
+        self.record([(day(10), "Quartalszahlen"), (day(12), "Ex-Dividende")])
+        self.record([(day(10), "Quartalszahlen")])
+        self.assertEqual({m.event.kind for m in self.merged()}, {"earnings", "ex_dividend"})
+
+    def test_an_empty_answer_deletes_nothing(self):
+        self.record([(day(10), "Quartalszahlen")])
+        self.assertFalse(self.record([]))
+        self.assertFalse(self.record(None))
+        self.assertEqual(len(self.ctl.store.events()), 1)
+
+    def test_unknown_labels_are_ignored(self):
+        self.assertFalse(self.record([(day(10), "Mondfinsternis")]))
+        self.assertEqual(self.ctl.store.events(), [])
+
+    def test_stocks_are_kept_apart(self):
+        self.record([(day(10), "Quartalszahlen")], "AAPL")
+        self.record([(day(11), "Quartalszahlen")], "MSFT")
+        self.assertEqual([m.event.day for m in self.merged("MSFT")], [day(11)])
+
+    def test_loading_in_the_background_fills_the_calendar_and_the_cards_column(self):
+        with mock.patch.object(sd, "fetch_events", lambda s: [(day(6), "Ex-Dividende"), (day(20), "Quartalszahlen")]):
+            self.ctl.load_events("AAPL")
+            self.assertTrue(wait_until(lambda: "AAPL" in self.ctl.events))
+        self.assertEqual(self.ctl.events["AAPL"], [(day(6), "Ex-Dividende"), (day(20), "Quartalszahlen")])
+        self.assertEqual(len(self.ctl.store.events()), 2)
+
+    def test_a_failed_download_keeps_what_is_stored(self):
+        self.record([(day(10), "Quartalszahlen")])
+        with mock.patch.object(sd, "fetch_events", side_effect=RuntimeError("offline")):
+            self.ctl.load_events("AAPL")
+            wait_until(lambda: False, 300)
+        self.assertEqual(len(self.merged()), 1)
+
+
+class ManualEventsTests(AppTestCase):
+    def add(self, **overrides):
+        args = dict(symbol="AAPL", kind="product", title="Vision Pro 3", when="Mai 2027", status="speculative")
+        args.update(overrides)
+        return self.ctl.add_event(**args)
+
+    def test_a_manual_event_is_saved_and_shown(self):
+        event_id = self.add()
+        [item] = self.ctl.calendar_events("AAPL")
+        self.assertEqual((item.event.id, item.event.source, item.event.precision, item.status),
+                         (event_id, "manual", "month", "speculative"))
+        self.assertEqual(item.event.title, "Vision Pro 3")
+
+    def test_the_stock_must_be_on_one_of_the_lists(self):
+        with self.assertRaisesRegex(ValueError, "Aktie"):
+            self.add(symbol="NIRGENDS")
+
+    def test_invalid_input_is_reported_and_nothing_is_saved(self):
+        for overrides in ({"when": "bald"}, {"status": "sicher"}, {"kind": "party"}):
+            with self.assertRaises(ValueError):
+                self.add(**overrides)
+        self.assertEqual(self.ctl.store.events(), [])
+
+    def test_the_stock_may_be_given_in_lower_case(self):
+        self.add(symbol="aapl")
+        self.assertEqual(self.ctl.calendar_events("AAPL")[0].event.symbol, "AAPL")
+
+    def test_update_changes_the_event_but_not_its_stock_or_source(self):
+        event_id = self.add()
+        self.ctl.update_event(event_id, "product", "Neuer Titel", "15.05.2027", "confirmed", 3, "Notiz")
+        [item] = self.ctl.calendar_events("AAPL")
+        self.assertEqual((item.event.title, item.event.precision, item.event.relevance, item.event.note),
+                         ("Neuer Titel", "day", 3, "Notiz"))
+        self.assertEqual((item.status, item.event.symbol, item.event.source), ("confirmed", "AAPL", "manual"))
+
+    def test_delete_removes_the_event(self):
+        event_id = self.add()
+        self.ctl.delete_event(event_id)
+        self.assertEqual(self.ctl.calendar_events("AAPL"), [])
+
+    def test_yahoo_events_cannot_be_changed_or_deleted(self):
+        self.ctl.record_yahoo_events("AAPL", [(day(10), "Quartalszahlen")])
+        event_id = self.ctl.store.events()[0].id
+        with self.assertRaisesRegex(ValueError, "Yahoo Finance"):
+            self.ctl.update_event(event_id, "earnings", "x", "01.01.2027", "confirmed")
+        with self.assertRaisesRegex(ValueError, "Yahoo Finance"):
+            self.ctl.delete_event(event_id)
+        self.assertEqual(len(self.ctl.store.events()), 1)
+
+    def test_a_missing_event_is_reported(self):
+        with self.assertRaisesRegex(ValueError, "existiert nicht mehr"):
+            self.ctl.delete_event(999)
+
+    def test_a_manual_event_merges_with_the_same_event_from_yahoo(self):
+        self.ctl.record_yahoo_events("AAPL", [(day(10), "Quartalszahlen")])
+        self.add(kind="earnings", title="Zahlen laut IR", when=day(12).strftime("%d.%m.%Y"), status="confirmed")
+        [item] = self.ctl.calendar_events("AAPL")
+        self.assertEqual((item.status, item.sources), ("confirmed", ("Yahoo Finance", "Manuell")))
+        self.assertEqual(item.event.title, "Zahlen laut IR")
+        self.assertEqual(item.other_dates, [(evt.date_text(self.ctl.store.events()[0]), "Yahoo Finance")])
+
+    def test_events_survive_a_restart(self):
+        self.add()
+        self.ctl.shutdown()
+        self.ctl.store.close()
+        self.ctl = w.Controller()
+        self.assertEqual(len(self.ctl.calendar_events("AAPL")), 1)
+
+    def test_events_of_a_removed_stock_are_hidden_and_come_back_with_it(self):
+        self.add()
+        self.ctl.remove("AAPL")
+        self.assertEqual(self.ctl.calendar_events(), [])
+        self.assertEqual(len(self.ctl.store.events()), 1)
+        self.ctl.store.add_symbol("AAPL")
+        self.ctl.symbols = self.ctl.store.symbols()
+        self.assertEqual(len(self.ctl.calendar_events()), 1)
+
+    def test_calendar_signals(self):
+        seen = []
+        self.ctl.calendar_changed.connect(lambda: seen.append(1))
+        event_id = self.add()
+        self.ctl.update_event(event_id, "product", "x", "2027", "speculative")
+        self.ctl.delete_event(event_id)
+        self.assertEqual(len(seen), 3)
+
+
+class CalendarViewTests(AppTestCase):
+    def setUp(self):
+        super().setUp()
+        self.ctl.record_yahoo_events("AAPL", [(day(3), "Quartalszahlen"), (day(25), "Ex-Dividende")])
+        self.ctl.record_yahoo_events("MSFT", [(day(5), "Quartalszahlen")])
+        self.ctl.add_event("DELL", "product", "Release", "Oktober 2099", "speculative")
+        self.ctl.record_trade("AAPL", "buy", 1, 100, 0, day(-30))
+
+    def symbols(self, window):
+        return [m.event.symbol + ":" + m.event.kind for m in window]
+
+    def test_windows_of_7_30_and_90_days(self):
+        self.assertEqual(self.symbols(self.ctl.calendar_window(7)[0]), ["AAPL:earnings", "MSFT:earnings"])
+        self.assertEqual(self.symbols(self.ctl.calendar_window(30)[0]),
+                         ["AAPL:earnings", "MSFT:earnings", "AAPL:ex_dividend"])
+
+    def test_only_positions(self):
+        self.assertEqual(self.symbols(self.ctl.calendar_window(30, positions_only=True)[0]),
+                         ["AAPL:earnings", "AAPL:ex_dividend"])
+
+    def test_events_without_an_exact_day_are_listed_apart_and_only_when_they_overlap(self):
+        self.ctl.add_event("DELL", "product", "Jetzt", TODAY.strftime("%m/%Y"), "expected")
+        dated, undated = self.ctl.calendar_window(30)
+        self.assertEqual([m.event.title for m in undated], ["Jetzt"])
+        self.assertNotIn("DELL:product", self.symbols(dated))
+
+    def test_the_cards_column_gets_precise_upcoming_events_only(self):
+        self.ctl.events["DELL"] = None  # als geladen markieren
+        self.ctl.add_event("DELL", "product", "Release", day(15).strftime("%d.%m.%Y"), "confirmed")
+        self.ctl.add_event("DELL", "conference", "Messe", TODAY.strftime("%m/%Y"), "expected")
+        self.assertEqual(self.ctl.events["DELL"], [(day(15), "Produktstart")])
+
+    def test_the_cards_column_uses_the_kind_not_the_free_title(self):
+        self.ctl.events["MSFT"] = []
+        self.ctl.add_event("MSFT", "regulatory", "Sehr langer eigener Titel der Behörde", day(2).strftime("%d.%m.%Y"), "expected")
+        self.assertEqual(self.ctl.events["MSFT"][0], (day(2), "Genehmigung oder Entscheidung"))
+
+    def test_a_range_that_is_running_starts_today_in_the_cards_column(self):
+        self.ctl.record_yahoo_events("DELL", [(day(-1), "Quartalszahlen"), (day(2), "Quartalszahlen")])
+        self.assertEqual(self.ctl.upcoming_pairs("DELL")[0][0], TODAY)
+
+    def test_stocks_not_loaded_yet_get_no_card_entry_from_the_calendar(self):
+        self.ctl.add_event("DELL", "product", "Release", day(15).strftime("%d.%m.%Y"), "confirmed")
+        self.assertNotIn("DELL", self.ctl.events)
+
+    def test_short_names_exist_for_every_kind(self):
+        for label in evt.KINDS.values():
+            self.assertIn(label, sd.EVENT_SHORT)
+        self.assertTrue(sd.format_event((day(5), "Produktstart"), short=True).startswith("Release"))
 
 
 class SignalTests(AppTestCase):

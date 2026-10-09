@@ -16,7 +16,8 @@ statt eine Zahl zu erfinden.
 from dataclasses import dataclass, field
 
 import ledger
-from fx import BASE, currency_code
+import fx as fx_module
+from fx import currency_code
 
 UNKNOWN = "Unbekannt"
 DIMENSIONS = ("position", "sector", "country", "currency")
@@ -45,7 +46,9 @@ class Holding:
 
     @property
     def pl_pct(self):
-        return self.unrealized / self.cost * 100 if self.cost else None
+        if not self.cost:  # zugeteilte Aktie ohne Einstand: der ganze Wert ist Gewinn
+            return 100.0 if self.value > 0 else None
+        return self.unrealized / self.cost * 100
 
 
 @dataclass
@@ -59,7 +62,13 @@ class Summary:
     realized_price: float = 0.0
     realized_fx: float = 0.0
     sold_cost: float = 0.0            # Anschaffungskosten der verkauften Stücke
+    cash: float = 0.0                 # verfügbares Guthaben beim Anbieter, in der Basiswährung
     warnings: list = field(default_factory=list)
+
+    @property
+    def total_value(self):
+        """Positionen plus Guthaben: das, was das Konto insgesamt wert ist."""
+        return self.value + self.cash
 
     @property
     def unrealized(self):
@@ -86,11 +95,12 @@ def _missing_rates(rates):
     return any(rate is None for rate in rates)
 
 
-def summarize(states, quotes, instruments, fx, opening_realized=None, order=None):
+def summarize(states, quotes, instruments, fx, opening_realized=None, order=None, cash=None):
     """Rechnet alle Positionen und Verkäufe in die Basiswährung um.
 
     states: Symbol -> ledger.PositionState; quotes: Symbol -> {price, currency}; instruments: Symbol -> Stammdaten;
-    fx: fx.FxTable; opening_realized: übernommene realisierte Gewinne je Symbol (Notierungswährung)."""
+    fx: fx.FxTable; opening_realized: übernommene realisierte Gewinne je Symbol (Notierungswährung);
+    cash: [(Betrag, Währung)] verfügbares Guthaben bei den Anbietern."""
     opening_realized = opening_realized or {}
     summary = Summary()
     warnings = summary.warnings
@@ -113,7 +123,7 @@ def summarize(states, quotes, instruments, fx, opening_realized=None, order=None
                 now = fx.now(currency)
                 rates = [fx.on(currency, lot.day) for lot in state.lots]
                 if now is None or _missing_rates(rates):
-                    warnings.append(f"{symbol}: kein Wechselkurs {currency_code(currency)} → {BASE}, nicht enthalten")
+                    warnings.append(f"{symbol}: kein Wechselkurs {currency_code(currency)} → {fx_module.BASE}, nicht enthalten")
                 else:
                     cost = sum(lot.shares * lot.unit_cost * rate for lot, rate in zip(state.lots, rates))
                     value = state.shares * quote["price"] * now
@@ -123,7 +133,7 @@ def summarize(states, quotes, instruments, fx, opening_realized=None, order=None
                         symbol, info.get("name", ""), currency, state.shares, state.avg_cost, quote["price"],
                         value, cost, price_effect, (value - cost) - price_effect,
                         info.get("sector", ""), info.get("country", "")))
-                    if currency_code(currency) != BASE and any(lot.opening for lot in state.lots):
+                    if currency_code(currency) != fx_module.BASE and any(lot.opening for lot in state.lots):
                         foreign_opening += 1
 
         # --- Verkäufe ---
@@ -163,6 +173,14 @@ def summarize(states, quotes, instruments, fx, opening_realized=None, order=None
     summary.invested = sum(h.cost for h in summary.holdings)
     summary.price_effect = sum(h.price_effect for h in summary.holdings)
     summary.fx_effect = sum(h.fx_effect for h in summary.holdings)
+
+    for amount, currency in cash or []:
+        rate = fx.now(currency)
+        if rate is None:
+            warnings.append(f"Guthaben {amount:,.2f} {currency}: kein Wechselkurs {currency_code(currency)} → {fx_module.BASE}, "
+                            "nicht enthalten")
+        else:
+            summary.cash += amount * rate
 
     if foreign_opening:
         warnings.append(f"Startbestand ({foreign_opening} Positionen in Fremdwährung): Das Kaufdatum ist unbekannt, "

@@ -5,9 +5,19 @@ Ein Kurs bedeutet immer: so viele Einheiten der Basiswährung kostet eine Einhei
 """
 import bisect
 
-BASE = "EUR"
+BASE = "EUR"           # Basiswährung; set_base() ändert sie, alle Module lesen sie als fx.BASE
+BASES = ("EUR", "USD")  # zur Wahl stehen Euro und Dollar (eToro rechnet in Dollar)
 # Notierungswährung -> (Währung, Faktor auf die Haupteinheit)
 SUBUNITS = {"GBp": ("GBP", 0.01), "GBX": ("GBP", 0.01), "ZAc": ("ZAR", 0.01)}
+
+
+def set_base(code):
+    """Stellt die Basiswährung um. Gespeicherte Wechselkurse gelten nur für eine Basis und müssen danach neu geladen
+    werden (Controller.set_base kümmert sich darum)."""
+    global BASE
+    if code not in BASES:
+        raise ValueError(f"Basiswährung {code} ist nicht vorgesehen")
+    BASE = code
 
 
 def split_currency(currency):

@@ -12,20 +12,23 @@ from concurrent.futures import ThreadPoolExecutor
 
 from PySide6.QtCore import (QEasingCurve, QEvent, QObject, QPoint, QPointF, QRectF, QSize, Qt, QTimer, QUrl,
                             QVariantAnimation, Signal)
-from PySide6.QtGui import (QColor, QCursor, QDesktopServices, QGuiApplication, QIcon, QPainter, QPainterPath,
-                           QPalette, QPen, QPixmap, QPolygonF)
+from PySide6.QtGui import (QColor, QCursor, QDesktopServices, QFont, QFontMetrics, QGuiApplication, QIcon,
+                           QPainter, QPainterPath, QPalette, QPen, QPixmap, QPolygonF)
 from PySide6.QtWidgets import (QApplication, QDialog, QFrame, QGraphicsDropShadowEffect,
-                               QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMenu, QPushButton, QScrollArea, QSystemTrayIcon, QVBoxLayout, QWidget)
+                               QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMenu, QPushButton, QScrollArea, QSizePolicy, QSystemTrayIcon, QVBoxLayout,
+                               QWidget)
 
 import glossary
 import history
 import ledger
 import portfolio
 import etoro
+import events as evt
 import sources
 import stock_data as sd
-from fx import BASE, FxTable, currency_code
-from PySide6.QtWidgets import QAbstractButton, QButtonGroup
+import fx as fx_module
+from fx import BASES, FxTable, currency_code
+from PySide6.QtWidgets import QAbstractButton, QButtonGroup, QComboBox
 from store import Store
 
 REFRESH_SECONDS = 60
@@ -67,6 +70,11 @@ QPushButton#segment:checked {{ background: {SURFACE2}; color: {TEXT}; }}
 QPushButton#option {{ text-align: left; padding: 11px 16px; background: {SURFACE}; font-weight: 600; }}
 QPushButton#option:hover {{ background: {SURFACE2}; }}
 QPushButton#option:focus {{ border: 1px solid {ACCENT}; }}
+QComboBox {{ background: {SURFACE}; border: 1px solid transparent; border-radius: 14px; padding: 8px 14px; }}
+QComboBox:focus {{ border: 1px solid {ACCENT}; }}
+QComboBox::drop-down {{ border: none; width: 26px; }}
+QComboBox QAbstractItemView {{ background: {SURFACE}; border: 1px solid #2b2f3d; border-radius: 10px; padding: 4px;
+                               selection-background-color: {SURFACE2}; outline: 0; }}
 QScrollArea {{ border: none; background: transparent; }}
 QScrollBar:vertical {{ background: transparent; width: 8px; margin: 4px 0; }}
 QScrollBar::handle:vertical {{ background: #333849; border-radius: 4px; min-height: 30px; }}
@@ -634,6 +642,8 @@ class Controller(QObject):
     changed = Signal()
     ledger_changed = Signal()
     history_changed = Signal()  # neue Tageskurse oder Importe: Verlaufsdiagramme neu zeichnen
+    base_changed = Signal(str)  # die Basiswährung wurde umgestellt (EUR oder USD)
+    calendar_changed = Signal()  # Termine wurden angelegt, geändert, gelöscht oder von Yahoo aktualisiert
     trade_recorded = Signal(str, str)  # Symbol, "buy" oder "sell"
     status = Signal(str)
     _result = Signal(object, object, object, object)
@@ -644,9 +654,12 @@ class Controller(QObject):
         self.store.import_legacy(sd.LEGACY_FILE)
         self.symbols = self.store.symbols()
         self.pinned = self._load_pins()
+        self._apply_saved_base()
         self.quotes, self.events = {}, {}
         self.transactions, self.positions, self.realized, self.sales = {}, {}, {}, {}
         self.states, self.opening, self.removed_holdings = {}, {}, []
+        self.cash = self._load_cash()
+        self.calendar = self.store.events()  # alle Termine; angezeigt wird, was zur Watchlist gehört
         self.reload_ledger()
         self.quote_times, self.quote_errors, self.instruments = {}, {}, {}
         self.instrument_tried = set()  # Stammdaten werden je Start höchstens einmal je Aktie versucht
@@ -669,6 +682,70 @@ class Controller(QObject):
 
     # Angeheftete Boxen: Schlüssel "main", "detail:SYMBOL", "tx:SYMBOL" und "portfolio", in der Datenbank gemerkt
     PINS_KEY = "pinned_windows"
+
+    BASE_KEY, FX_BASE_KEY = "base_currency", "fx_base"
+
+    def _apply_saved_base(self):
+        """Stellt die gemerkte Basiswährung ein (ohne Merkzettel Euro). Gespeicherte Wechselkurse gelten nur für die
+        Basis, mit der sie geholt wurden; passen sie nicht, werden sie verworfen und neu geladen."""
+        saved = self.store.meta(self.BASE_KEY)
+        fx_module.set_base(saved if saved in BASES else "EUR")
+        if (self.store.meta(self.FX_BASE_KEY) or "EUR") != fx_module.BASE:  # ältere Kurse stammen von der Euro-Basis
+            self.store.clear_fx()
+        self.store.set_meta(self.FX_BASE_KEY, fx_module.BASE)
+
+    def set_base(self, code):
+        """Rechnet das Portfolio ab jetzt in code (EUR oder USD). Die Wechselkurse werden für die neue Basis neu geholt."""
+        if code not in BASES or code == fx_module.BASE:
+            return
+        fx_module.set_base(code)
+        self.store.set_meta(self.BASE_KEY, code)
+        self.store.clear_fx()
+        self.store.set_meta(self.FX_BASE_KEY, code)
+        self.fx = FxTable()
+        self.fx_history_tried = set()
+        self.base_changed.emit(code)
+        self.changed.emit()
+        self.history_changed.emit()
+        self.refresh_fx()
+
+    CASH_KEY = "cash:"  # je Anbindung: {"amount": ..., "currency": ..., "at": ...}
+
+    def _load_cash(self):
+        """Verfügbares Guthaben je Anbindung, zuletzt beim Abgleich gemerkt: {Name: (Betrag, Währung, Zeitpunkt)}."""
+        result = {}
+        for name in ("etoro",):
+            try:
+                data = json.loads(self.store.meta(self.CASH_KEY + name) or "null")
+                if data:
+                    result[name] = (float(data["amount"]), data["currency"], dt.datetime.fromisoformat(data["at"]))
+            except (ValueError, KeyError, TypeError):
+                continue
+        return result
+
+    def set_cash(self, name, cash):
+        """Merkt das Guthaben einer Anbindung; cash = (Betrag, Währung) oder None (dann bleibt der alte Stand)."""
+        if not cash:
+            return
+        now = dt.datetime.now().replace(microsecond=0)
+        self.store.set_meta(self.CASH_KEY + name, json.dumps({"amount": cash[0], "currency": cash[1],
+                                                              "at": now.isoformat()}))
+        self.cash[name] = (cash[0], cash[1], now)
+
+    SORT_KEY = "sort:"  # je Box ("positions", "watchlist"): {"key": Spalte, "desc": bool}
+
+    def saved_sort(self, box):
+        """Gemerkte Sortierung einer Liste als (Spalte, absteigend); ohne gültigen Merkzettel (None, False)."""
+        try:
+            data = json.loads(self.store.meta(self.SORT_KEY + box) or "null")
+            if data and data["key"] in [column[0] for column in COLUMNS]:
+                return data["key"], bool(data["desc"])
+        except (ValueError, KeyError, TypeError):
+            pass
+        return None, False
+
+    def set_sort(self, box, key, desc):
+        self.store.set_meta(self.SORT_KEY + box, json.dumps({"key": key, "desc": desc}))
 
     def _load_pins(self):
         try:
@@ -756,7 +833,7 @@ class Controller(QObject):
         for symbol in self.symbols:
             transactions = self.transactions.get(symbol)
             currency = (self.quotes.get(symbol) or {}).get("currency") or self.instruments.get(symbol, {}).get("currency")
-            if not transactions or not currency or currency_code(currency) == BASE:
+            if not transactions or not currency or currency_code(currency) == fx_module.BASE:
                 continue
             code, first = currency_code(currency), min(t.day for t in transactions)
             needed[code] = min(needed.get(code, first), first)
@@ -774,8 +851,9 @@ class Controller(QObject):
             self.fx.set_latest(code, rate, now, sd.SOURCE)
             self.store.save_fx_latest(code, rate, now, sd.SOURCE)
             self.changed.emit()
-        self.run(lambda: sd.fetch_fx_rate(code, BASE), done,
-                 lambda exc: self.status.emit(f"Wechselkurs {code} → {BASE} nicht abrufbar"))
+        base = fx_module.BASE
+        self.run(lambda: sd.fetch_fx_rate(code, base), done,
+                 lambda exc: self.status.emit(f"Wechselkurs {code} → {base} nicht abrufbar"))
 
     def load_fx_history(self, code, first_day):
         self.fx_history_tried.add(code)
@@ -788,7 +866,8 @@ class Controller(QObject):
             self.fx.add_history(code, rates)
             self.store.save_fx_rates(code, rates, sd.SOURCE)
             self.changed.emit()
-        self.run(lambda: sd.fetch_fx_history(code, BASE, start), done,
+        base = fx_module.BASE
+        self.run(lambda: sd.fetch_fx_history(code, base, start), done,
                  lambda exc: self.status.emit(f"Wechselkurs-Historie {code} nicht abrufbar"))
 
     def refresh_closes(self):
@@ -824,7 +903,8 @@ class Controller(QObject):
 
     def portfolio_summary(self):
         """Kennzahlen des ganzen Portfolios in der Basiswährung (siehe portfolio.py)."""
-        summary = portfolio.summarize(self.states, self.quotes, self.instruments, self.fx, self.opening, self.symbols)
+        summary = portfolio.summarize(self.states, self.quotes, self.instruments, self.fx, self.opening, self.symbols,
+                                      [(amount, currency) for amount, currency, _ in self.cash.values()])
         if self.removed_holdings:
             summary.warnings.append("Entfernte Aktien mit Bestand sind nicht enthalten: "
                                     + ", ".join(self.removed_holdings))
@@ -899,9 +979,94 @@ class Controller(QObject):
     def load_events(self, symbol):
         def done(events):
             if symbol in self.symbols:
-                self.events[symbol] = events
+                self.apply_fetched_events(symbol, events)
                 self.changed.emit()
         self.run(lambda: sd.fetch_events(symbol), done)
+
+    def apply_fetched_events(self, symbol, fetched):
+        """Bucht die von Yahoo gemeldeten Termine und aktualisiert die Spalte „Termin“ dieser Aktie."""
+        self.record_yahoo_events(symbol, fetched)
+        self.events[symbol] = self.upcoming_pairs(symbol)
+
+    # Termine (Ereigniskalender), siehe events.py
+    def reload_calendar(self):
+        """Lädt die Termine neu; die Spalte „Termin“ der schon geladenen Aktien folgt dem Kalender."""
+        self.calendar = self.store.events()
+        for symbol in list(self.events):
+            self.events[symbol] = self.upcoming_pairs(symbol)
+        self.calendar_changed.emit()
+        self.changed.emit()
+
+    def calendar_events(self, symbol=None, today=None):
+        """Die Termine der Watchlist (oder einer Aktie), Doppelte zusammengeführt (events.MergedEvent)."""
+        scope = [e for e in self.calendar if e.symbol in self.symbols and (symbol is None or e.symbol == symbol)]
+        return evt.merge_duplicates(scope, today or dt.date.today())
+
+    def upcoming_pairs(self, symbol, today=None):
+        """Kommende Termine mit genauem Tag als [(Tag, Art)], wie sie die Spalte „Termin“ braucht."""
+        today = today or dt.date.today()
+        return [(max(m.event.day, today), evt.KINDS[m.event.kind])
+                for m in evt.upcoming(self.calendar_events(symbol, today), today) if m.event.precision == "day"]
+
+    def calendar_window(self, days, positions_only=False, today=None, symbol=None):
+        """Kommende Termine der nächsten days Tage: (mit genauem Tag, ohne genauen Tag)."""
+        today = today or dt.date.today()
+        merged = [m for m in self.calendar_events(symbol, today)
+                  if not positions_only or m.event.symbol in self.positions]
+        return evt.calendar_window(merged, today, days)
+
+    def record_yahoo_events(self, symbol, fetched, today=None):
+        """Bucht die von Yahoo gemeldeten künftigen Termine [(Tag, Bezeichnung)] als „erwartet“: Yahoo sagt nicht, ob
+        das Unternehmen den Termin bestätigt hat. Nennt Yahoo für eine Art mehrere Tage, ist das ein Zeitraum.
+        Verschiebt sich ein Termin, ersetzt der neue den alten; vergangene bleiben als „eingetreten“ stehen."""
+        today = today or dt.date.today()
+        by_kind = {}
+        for day, label in fetched or []:
+            kind = evt.YAHOO_KINDS.get(label)
+            if kind:
+                by_kind.setdefault(kind, []).append(day)
+        changed = False
+        for kind, days in by_kind.items():
+            start, end = min(days), max(days)
+            external_id = f"{kind}:{start.isoformat()}"
+            fields = {"symbol": symbol, "kind": kind, "title": evt.KINDS[kind], "day": start, "end": end,
+                      "precision": "day", "status": "expected", "relevance": evt.default_relevance(kind),
+                      "note": "", "source_url": ""}
+            changed |= self.store.upsert_event(sd.SOURCE, external_id, fields)[1]
+            changed |= bool(self.store.delete_stale_events(sd.SOURCE, symbol, kind, {external_id}, today))
+        if changed:
+            self.calendar = self.store.events()
+            self.calendar_changed.emit()
+        return changed
+
+    def _manual_event(self, event_id):
+        event = next((e for e in self.calendar if e.id == event_id), None)
+        if event is None:
+            raise ValueError("Der Termin existiert nicht mehr")
+        if not event.is_manual:
+            raise ValueError(f"Dieser Termin stammt von {event.source} und lässt sich nicht ändern. "
+                             "Lege bei Bedarf einen eigenen Termin an.")
+        return event
+
+    def add_event(self, symbol, kind, title, when, status, relevance=None, note="", source_url=""):
+        """Legt einen eigenen Termin an (ValueError bei ungültigen Eingaben); gibt seine Nummer zurück."""
+        if symbol.strip().upper() not in self.symbols:
+            raise ValueError("Die Aktie steht nicht auf deinen Listen")
+        fields = evt.make_event(symbol, kind, title, when, status, relevance, note, source_url)
+        event_id = self.store.add_event(fields)
+        self.reload_calendar()
+        return event_id
+
+    def update_event(self, event_id, kind, title, when, status, relevance=None, note="", source_url=""):
+        event = self._manual_event(event_id)
+        self.store.update_event(event_id, evt.make_event(event.symbol, kind, title, when, status, relevance, note,
+                                                         source_url))
+        self.reload_calendar()
+
+    def delete_event(self, event_id):
+        self._manual_event(event_id)
+        self.store.delete_event(event_id)
+        self.reload_calendar()
 
     def add_symbol(self, text, on_error, on_choices=None):
         """Fügt eine Aktie hinzu. Fremde Börsenendungen werden übersetzt (ABBN.ZU -> ABBN.SW). Passt das
@@ -999,18 +1164,23 @@ class Controller(QObject):
     def known_symbols(self):
         return set(self.symbols) | set(self.transactions)
 
-    def import_trades(self, source, trades, replace_openings=False, cursor="", notes=()):
+    def import_trades(self, source, trades, replace_openings=False, cursor="", notes=(), adopt_unknown=False,
+                      cash=None):
         """Bucht die Einträge einer Anbindung und gibt den sources.ImportPlan zurück: was neu ist, was schon
         da war, was ein unbekanntes Kürzel hat und was den Verlauf ungültig machen würde (wird nicht gebucht).
         Mit replace_openings ersetzen echte Käufe den Startbestand der betroffenen Aktien."""
+        known = self.known_symbols()
+        if adopt_unknown:  # die Anbindung liefert Yahoo-Kürzel: unbekannte Aktien kommen auf die Watchlist
+            known |= {trade.symbol.upper() for trade in trades}
         plan = sources.plan_import(source, trades, self.store.transactions(), self.store.aliases(source),
-                                   self.known_symbols(), replace_openings)
+                                   known, replace_openings)
         before = set(self.symbols)
         for symbol, trade in plan.new:
             self.store.add_symbol(symbol)  # nimmt auch eine zuvor entfernte Aktie wieder auf
             self.store.add_transaction(symbol, trade.kind, trade.shares, trade.price, trade.fee, trade.day,
                                        trade.note, source, trade.external_id)
         self.store.delete_transactions(plan.remove_ids)
+        self.set_cash(source, cash)
         self.symbols = self.store.symbols()
         self.store.save_sync_state(source, cursor, dt.datetime.now(),
                                    f"{len(plan.new)} neu, {plan.duplicates} schon vorhanden, "
@@ -1025,14 +1195,15 @@ class Controller(QObject):
         self.history_changed.emit()
         return plan
 
-    def sync_source(self, name, on_done, on_error, replace_openings=False):
+    def sync_source(self, name, on_done, on_error, replace_openings=False, adopt_unknown=False):
         """Holt neue Einträge von der Anbindung name (im Hintergrund) und bucht sie."""
         source = self.sources[name]
         state = self.store.sync_state(name)
         cursor = state["cursor"] if state else ""
 
         def done(batch):
-            on_done(self.import_trades(name, batch.trades, replace_openings, batch.cursor, batch.notes))
+            on_done(self.import_trades(name, batch.trades, replace_openings, batch.cursor, batch.notes, adopt_unknown,
+                                       getattr(batch, "cash", None)))
         self.run(lambda: source.fetch(cursor), done, on_error)
 
     # eToro (nur lesend), siehe etoro.py
@@ -1055,7 +1226,7 @@ class Controller(QObject):
 
     def sync_etoro(self, on_done, on_error):
         """Gleicht mit eToro ab; echte Käufe ersetzen dabei den Startbestand."""
-        self.sync_source("etoro", on_done, on_error, replace_openings=True)
+        self.sync_source("etoro", on_done, on_error, replace_openings=True, adopt_unknown=True)
 
     def set_alias(self, source, source_symbol, symbol):
         """Ordnet das Kürzel einer Anbindung einem Yahoo-Kürzel zu (gilt für spätere Importe)."""
@@ -1064,10 +1235,19 @@ class Controller(QObject):
 
 # ---------- Dialoge ----------
 
-class FieldDialog(QDialog):
-    """Dialog mit Zahlenfeldern. apply(werte) darf ValueError werfen; die Meldung erscheint im Dialog."""
+class Choice:
+    """Auswahlfeld für FieldDialog: options = [(Beschriftung, Wert)], current = der vorgewählte Wert."""
 
-    def __init__(self, title, intro, fields, apply=lambda values: None, ok_text="OK", cancel=True, modal=True):
+    def __init__(self, options, current=None):
+        self.options, self.current = list(options), current
+
+
+class FieldDialog(QDialog):
+    """Dialog mit Eingabefeldern (Zahlen, Text, Datum) und Auswahlfeldern (Choice). apply(werte) darf ValueError
+    werfen; die Meldung erscheint im Dialog."""
+
+    def __init__(self, title, intro, fields, apply=lambda values: None, ok_text="OK", cancel=True, modal=True,
+                 field_width=150):
         super().__init__()
         self.apply = apply
         self.setModal(modal)
@@ -1079,12 +1259,19 @@ class FieldDialog(QDialog):
 
         self.entries, self.parsers = [], []
         for label, default, *parser in fields:
-            self.parsers.append(parser[0] if parser else sd.parse_number)
             row = QHBoxLayout()
             row.addWidget(QLabel(label))
-            entry = QLineEdit(default)
-            entry.setFixedWidth(150)
-            entry.returnPressed.connect(self.submit)
+            if isinstance(default, Choice):
+                self.parsers.append(lambda value: value)
+                entry = QComboBox()
+                for text, value in default.options:
+                    entry.addItem(text, value)
+                entry.setCurrentIndex(max(entry.findData(default.current), 0))
+            else:
+                self.parsers.append(parser[0] if parser else sd.parse_number)
+                entry = QLineEdit(default)
+                entry.returnPressed.connect(self.submit)
+            entry.setFixedWidth(field_width)
             row.addStretch()
             row.addWidget(entry)
             body.addLayout(row)
@@ -1113,7 +1300,12 @@ class FieldDialog(QDialog):
         self.setFixedHeight(self.layout().totalHeightForWidth(400))
         if self.entries:
             self.entries[0].setFocus()
-            self.entries[0].selectAll()
+            if hasattr(self.entries[0], "selectAll"):
+                self.entries[0].selectAll()
+
+    @staticmethod
+    def value_of(entry):
+        return entry.currentData() if isinstance(entry, QComboBox) else entry.text()
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -1129,11 +1321,12 @@ class FieldDialog(QDialog):
         self.raise_()
         self.activateWindow()
         self.entries[0].setFocus(Qt.ActiveWindowFocusReason)
-        self.entries[0].selectAll()
+        if hasattr(self.entries[0], "selectAll"):
+            self.entries[0].selectAll()
 
     def submit(self):
         try:
-            values = [parse(entry.text()) for parse, entry in zip(self.parsers, self.entries)]
+            values = [parse(self.value_of(entry)) for parse, entry in zip(self.parsers, self.entries)]
             self.apply(values)
         except ValueError as exc:
             return self.show_error(str(exc))
@@ -1260,6 +1453,7 @@ COLUMNS = (
     ("amount", "G/V", 80, Qt.AlignRight),
     ("event", "Termin", None, Qt.AlignLeft),
 )
+WATCHLIST_HIDDEN = ("value", "pl", "amount")  # ohne Position gibt es dort nichts anzuzeigen
 ROW_MARGINS = (12, 0, 12, 0)
 ROW_SPACING = 8
 MARKET_LAMPS = {"open": (GREEN, "Börse geöffnet"), "extended": (AMBER, "Vor- oder Nachbörse"),
@@ -1271,7 +1465,7 @@ class StockCard(QFrame):
     clicked = Signal(str)
     menu_requested = Signal(str)
 
-    def __init__(self, symbol):
+    def __init__(self, symbol, hidden=()):
         super().__init__()
         self.symbol = symbol
         self.values = {"symbol": symbol}  # Sortierwerte je Spalte; None = leer, kommt beim Sortieren ans Ende
@@ -1285,6 +1479,7 @@ class StockCard(QFrame):
         for key, _, width, align in COLUMNS:
             label = QLabel()
             label.setAlignment(align | Qt.AlignVCenter)
+            label.setVisible(key not in hidden)  # bleibt als Label da, belegt aber keinen Platz
             if key == "day":
                 # Statuslampe der Börse links neben der Tagesveränderung
                 self.lamp = QLabel()
@@ -1389,13 +1584,23 @@ class StockCard(QFrame):
 
 
 class MainWindow(QWidget):
-    def __init__(self, ctl):
+    """Die Box „Positionen“: Aktien, von denen Stücke gehalten werden. Mit watchlist_of=<Positionen-Fenster> ist es
+    stattdessen die Box „Watchlist“ mit den übrigen Aktien; sie teilen sich die offenen Detailfenster."""
+
+    def __init__(self, ctl, watchlist_of=None):
         super().__init__()
         self.ctl = ctl
         self.cards = {}
-        self.details = {}
+        self.is_watchlist = watchlist_of is not None
+        self.details = watchlist_of.details if self.is_watchlist else {}
+        self.peers = [watchlist_of] if self.is_watchlist else []
+        if self.is_watchlist:
+            watchlist_of.peers.append(self)
+        self.hidden = WATCHLIST_HIDDEN if self.is_watchlist else ()  # Spalten, die diese Box nicht zeigt
+        self.watchlist = None   # nur in der Box „Positionen“: die Box „Watchlist“, sobald sie einmal geöffnet wurde
         self.add_dialog = None
-        self.sort_key, self.sort_desc = None, False  # None = Reihenfolge der Watchlist
+        self.box = "watchlist" if self.is_watchlist else "positions"
+        self.sort_key, self.sort_desc = ctl.saved_sort(self.box)  # None = Reihenfolge der Aktien
 
         self.pin =QPushButton("◉")
         self.pin.setObjectName("icon")
@@ -1407,7 +1612,7 @@ class MainWindow(QWidget):
 
         self.add_button = QPushButton("+")
         self.add_button.setObjectName("icon")
-        self.add_button.setToolTip("Aktie hinzufügen")
+        self.add_button.setToolTip("Aktie zur Watchlist hinzufügen")
         self.add_button.setCursor(Qt.PointingHandCursor)
         self.add_button.clicked.connect(self.ask_symbol)
 
@@ -1417,8 +1622,24 @@ class MainWindow(QWidget):
         self.portfolio_button.setCursor(Qt.PointingHandCursor)
         self.portfolio_button.clicked.connect(lambda: open_portfolio(self.ctl, above=self))
 
-        body = make_panel(self, "Watchlist", self.hide_docked,
-                          extras=[self.portfolio_button, self.add_button, self.pin])
+        self.calendar_button = QPushButton("▦")
+        self.calendar_button.setObjectName("icon")
+        self.calendar_button.setToolTip("Termine der nächsten Tage")
+        self.calendar_button.setCursor(Qt.PointingHandCursor)
+        self.calendar_button.clicked.connect(lambda: open_calendar(self.ctl, open_symbol=self.open_detail))
+
+        self.watchlist_button = QPushButton("☆")
+        self.watchlist_button.setObjectName("icon")
+        self.watchlist_button.setToolTip("Watchlist öffnen oder schließen")
+        self.watchlist_button.setCursor(Qt.PointingHandCursor)
+        self.watchlist_button.clicked.connect(self.toggle_watchlist)
+
+        if self.is_watchlist:
+            body = make_panel(self, "Watchlist", self.hide_docked, extras=[self.add_button],
+                              pin=(ctl, "watchlist"))
+        else:
+            body = make_panel(self, "Positionen", self.hide_docked,
+                              extras=[self.calendar_button, self.portfolio_button, self.watchlist_button, self.pin])
 
         self.header = QWidget()
         header = QHBoxLayout(self.header)
@@ -1428,6 +1649,7 @@ class MainWindow(QWidget):
         for key, title, width, align in COLUMNS:
             button = QPushButton(title)
             button.setObjectName("head")
+            button.setVisible(key not in self.hidden)
             button.setCursor(Qt.PointingHandCursor)
             if key in HEAD_TERMS:
                 explain(button, HEAD_TERMS[key], note="Ein Klick sortiert die Liste nach dieser Spalte.")
@@ -1441,7 +1663,10 @@ class MainWindow(QWidget):
         body.addWidget(self.header)
 
         self.area, self.list = scroll_area()
-        self.empty = QLabel("Noch keine Aktien.\nMit + oben ein Kürzel oder einen Namen eingeben.")
+        self.empty = QLabel("Keine Aktie auf der Watchlist.\nMit + oben ein Kürzel oder einen Namen eingeben."
+                            if self.is_watchlist else
+                            "Noch keine Positionen.\nMit ☆ oben die Watchlist öffnen, dort eine Aktie hinzufügen "
+                            "und einen Kauf eintragen.")
         self.empty.setAlignment(Qt.AlignCenter)
         self.empty.setStyleSheet(f"color: {MUTED};")
         self.list.addWidget(self.empty)
@@ -1480,6 +1705,22 @@ class MainWindow(QWidget):
         Dock.remove(self)
         self.hide()
 
+    def closeEvent(self, event):
+        Dock.remove(self)
+        super().closeEvent(event)
+
+    def toggle_watchlist(self):
+        """Öffnet die Box „Watchlist“ (beim ersten Mal wird sie angelegt) oder schließt sie wieder."""
+        if self.watchlist is not None and self.watchlist.isVisible():
+            self.watchlist.hide_docked()
+        else:
+            self.open_watchlist()
+
+    def open_watchlist(self):
+        if self.watchlist is None:
+            self.watchlist = MainWindow(self.ctl, watchlist_of=self)
+        self.watchlist.show_docked()
+
     def toggle_pin(self):
         PIN["on"] = self.pin.isChecked()
         apply_pin()
@@ -1517,13 +1758,18 @@ class MainWindow(QWidget):
         if chosen:
             self.ctl.add_symbol(chosen, self.symbol_not_found)
 
+    def shown_symbols(self):
+        """Positionen: Aktien mit gehaltenen Stücken. Watchlist: alle übrigen. Eine Aktie wechselt von selbst die Box."""
+        return [s for s in self.ctl.symbols if (s in self.ctl.positions) != self.is_watchlist]
+
     def sync(self):
+        shown = self.shown_symbols()
         for symbol in list(self.cards):
-            if symbol not in self.ctl.symbols:
+            if symbol not in shown:
                 self.cards.pop(symbol).deleteLater()
-        for symbol in self.ctl.symbols:
+        for symbol in shown:
             if symbol not in self.cards:
-                card = StockCard(symbol)
+                card = StockCard(symbol, self.hidden)
                 card.clicked.connect(self.toggle_detail)
                 card.menu_requested.connect(self.show_menu)
                 self.cards[symbol] = card
@@ -1555,7 +1801,7 @@ class MainWindow(QWidget):
         for card in self.cards.values():
             card.event.setMinimumWidth(event)
         self.heads["event"].setMinimumWidth(event)
-        fixed = [width for _, _, width, _ in COLUMNS if width]
+        fixed = [width for key, _, width, _ in COLUMNS if width and key not in self.hidden]
         row = ROW_MARGINS[0] + ROW_MARGINS[2] + sum(fixed) + event + ROW_SPACING * len(fixed)
         # + Scrollleiste samt Rand (12), Innenrand des Panels (32), Rahmen (2), Schattenrand des Fensters (28)
         width = row + 12 + 32 + 2 + 28
@@ -1567,10 +1813,11 @@ class MainWindow(QWidget):
         """Erster Klick sortiert aufsteigend, jeder weitere auf dieselbe Spalte kehrt die Richtung um."""
         self.sort_desc = (not self.sort_desc) if key == self.sort_key else False
         self.sort_key = key
+        self.ctl.set_sort(self.box, key, self.sort_desc)
         self.reorder()
 
     def ordered_symbols(self):
-        symbols = [s for s in self.ctl.symbols if s in self.cards]
+        symbols = [s for s in self.shown_symbols() if s in self.cards]
         key = self.sort_key
         if key is None:
             return symbols
@@ -1624,9 +1871,10 @@ class MainWindow(QWidget):
         return menu
 
     def mark_open(self, symbol):
-        card = self.cards.get(symbol)
-        if card:
-            card.set_open(symbol in self.details)
+        for window in [self, *self.peers]:
+            card = window.cards.get(symbol)
+            if card:
+                card.set_open(symbol in self.details)
 
     def on_detail_closed(self, symbol):
         self.details.pop(symbol, None)
@@ -2026,6 +2274,23 @@ class DetailWindow(QWidget):
         column.addWidget(self.position_info)
         body.addWidget(position_card)
 
+        # Kursziele der Analysten
+        self.targets_card = targets_card = QFrame()
+        targets_card.setObjectName("plain")
+        column = QVBoxLayout(targets_card)
+        column.setContentsMargins(16, 14, 16, 14)
+        column.setSpacing(4)
+        column.addWidget(caption_label("Kursziel der Analysten"))
+        self.target_mean = QLabel("Wird geladen …")
+        self.target_mean.setStyleSheet(f"color: {MUTED}; font-size: 17px; font-weight: 700;")
+        self.target_upside = QLabel()
+        self.target_range = QLabel()
+        self.target_range.setStyleSheet(f"color: {MUTED}; font-size: 12px;")
+        column.addWidget(self.target_mean)
+        column.addWidget(self.target_upside)
+        column.addWidget(self.target_range)
+        body.addWidget(targets_card)
+
         # Historie
         history_card = QFrame()
         history_card.setObjectName("plain")
@@ -2056,11 +2321,36 @@ class DetailWindow(QWidget):
         self.event_title = QLabel("Wird geladen …")
         self.event_title.setStyleSheet(f"color: {ACCENT}; font-size: 17px; font-weight: 700;")
         self.event_when = QLabel()
-        self.event_more = QLabel()
-        self.event_more.setStyleSheet(f"color: {MUTED}; font-size: 12px;")
+        self.event_status = QLabel()
+        self.event_status.hide()
+        when_row = QHBoxLayout()
+        when_row.setSpacing(8)
+        when_row.addWidget(self.event_when)
+        when_row.addWidget(self.event_status)
+        when_row.addStretch()
+        self.event_note = QLabel()
+        self.event_note.setWordWrap(True)
+        self.event_note.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        self.event_note.hide()
+        self.event_rows = QVBoxLayout()
+        self.event_rows.setSpacing(6)
+        self.events_failed = False
+        buttons = QHBoxLayout()
+        buttons.setSpacing(6)
+        self.add_event_button = QPushButton("+ Termin")
+        self.add_event_button.setCursor(Qt.PointingHandCursor)
+        self.add_event_button.clicked.connect(lambda: event_dialog(ctl, symbol))
+        self.all_events_button = QPushButton("Alle Termine")
+        self.all_events_button.setCursor(Qt.PointingHandCursor)
+        self.all_events_button.clicked.connect(lambda: open_calendar(ctl, symbol))
+        buttons.addWidget(self.add_event_button)
+        buttons.addWidget(self.all_events_button)
         column.addWidget(self.event_title)
-        column.addWidget(self.event_when)
-        column.addWidget(self.event_more)
+        column.addLayout(when_row)
+        column.addWidget(self.event_note)
+        column.addLayout(self.event_rows)
+        column.addSpacing(4)
+        column.addLayout(buttons)
         body.addWidget(event_card)
 
         body.addWidget(caption_label("News"))
@@ -2076,12 +2366,15 @@ class DetailWindow(QWidget):
         ctl.changed.connect(self.refresh_view)
         ctl.trade_recorded.connect(self.on_trade)
         ctl.ledger_changed.connect(self.refresh_history)
+        ctl.calendar_changed.connect(self.refresh_events)
         self.refresh_history()
+        self.refresh_events()
         self.fresh_timer = QTimer(self)
         self.fresh_timer.timeout.connect(self.refresh_view)
         self.fresh_timer.start(15_000)
         self.refresh_view()
         ctl.run(self.load, self.show_loaded)
+        ctl.run(lambda: sd.fetch_targets(symbol), self.show_targets, lambda exc: self.show_targets(None, exc))
         self.load_history(self.range_key)
 
     def load_history(self, key):
@@ -2214,21 +2507,81 @@ class DetailWindow(QWidget):
             error = error or exc
         return events, news, error
 
+    def show_targets(self, targets, error=None):
+        """Durchschnittliches Kursziel, Zahl der Analysten, höchstes und niedrigstes Ziel; None = keine Daten."""
+        if not self.alive:
+            return
+        self.targets = targets
+        if not targets:
+            self.target_mean.setText("Nicht ladbar" if error else "Keine Kursziele vorhanden")
+            self.target_upside.setText("")
+            self.target_range.setText(str(error) if error else "")
+            return
+        cur = targets["currency"]
+        self.target_mean.setText(f"Ø {targets['mean']:.2f} {cur}".strip())
+        self.target_mean.setStyleSheet("font-size: 17px; font-weight: 700;")
+        quote = self.ctl.quotes.get(self.symbol)
+        if quote and quote["price"] and (not cur or cur == quote["currency"]):
+            upside = (targets["mean"] / quote["price"] - 1) * 100
+            self.target_upside.setText(f"{upside:+.1f} % zum aktuellen Kurs")
+            self.target_upside.setStyleSheet(f"color: {sign_color(upside)}; font-size: 12px; font-weight: 600;")
+        else:
+            self.target_upside.setText("")
+        parts = []
+        if targets.get("high"):
+            parts.append(f"Höchstes {targets['high']:.2f}")
+        if targets.get("low"):
+            parts.append(f"Niedrigstes {targets['low']:.2f}")
+        if targets.get("count"):
+            parts.append(f"{targets['count']} Analyst{'en' if targets['count'] != 1 else ''}")
+        self.target_range.setText(" · ".join(parts))
+        self.targets_card.setToolTip("Schätzungen einzelner Analysten (Quelle: Yahoo Finance), keine Prognose. "
+                                     "Wenige Analysten machen den Durchschnitt unsicher.")
+
+    def refresh_events(self):
+        """Der nächste Termin groß, die folgenden darunter, jeweils mit Status und Quelle (aus dem Kalender)."""
+        if not self.alive:
+            return
+        today = dt.date.today()
+        upcoming = evt.upcoming(self.ctl.calendar_events(self.symbol, today), today)
+        while self.event_rows.count():
+            widget = self.event_rows.takeAt(0).widget()
+            if widget:
+                widget.hide()
+                widget.setParent(None)
+                widget.deleteLater()
+        if not upcoming:
+            self.event_title.setText("Termine nicht ladbar" if self.events_failed else "Kein bevorstehender Termin")
+            explain(self.event_title, "termin")
+            self.event_when.setText("")
+            self.event_status.hide()
+            self.event_note.hide()
+            return
+        first = upcoming[0]
+        self.event_title.setText(first.event.title)
+        explain(self.event_title, KIND_TERMS.get(first.event.kind, "termin"))
+        self.event_when.setText(evt.when_text(first.event, today))
+        style_status_badge(self.event_status, first.status)
+        self.event_status.show()
+        note = event_note(first, today)
+        self.event_note.setText(note)
+        self.event_note.setVisible(bool(note))
+        for item in upcoming[1:5]:
+            self.event_rows.addWidget(EventRow(self.ctl, item, today))
+        if len(upcoming) > 5:
+            more = QLabel(f"… und {len(upcoming) - 5} weitere")
+            more.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+            self.event_rows.addWidget(more)
+
     def show_loaded(self, result):
         if not self.alive:
             return
         events, news, error = result
-        if events:
-            title, when = sd.describe_event(events[0])
-            self.event_title.setText(title)
-            explain(self.event_title, EVENT_TERMS.get(title, "termin"))
-            self.event_when.setText(when)
-            self.event_more.setText("\n".join("Danach: " + sd.format_event(e) for e in events[1:4]))
-        else:
-            self.event_title.setText("Kein bevorstehender Termin" if events is not None
-                                     else "Termine nicht ladbar")
-            self.event_when.setText("")
-            self.event_more.setText("")
+        self.events_failed = events is None
+        if events is not None:
+            self.ctl.apply_fetched_events(self.symbol, events)
+            self.ctl.changed.emit()
+        self.refresh_events()
         if not news:
             note = QLabel("Keine News gefunden." if news is not None else f"News nicht ladbar: {error}")
             note.setStyleSheet(f"color: {MUTED};")
@@ -2240,7 +2593,8 @@ class DetailWindow(QWidget):
         Dock.remove(self)
         self.alive = False
         for signal, slot in ((self.ctl.changed, self.refresh_view), (self.ctl.trade_recorded, self.on_trade),
-                             (self.ctl.ledger_changed, self.refresh_history)):
+                             (self.ctl.ledger_changed, self.refresh_history),
+                             (self.ctl.calendar_changed, self.refresh_events)):
             try:
                 signal.disconnect(slot)
             except (RuntimeError, TypeError):
@@ -2272,6 +2626,405 @@ class NewsCard(QFrame):
             QDesktopServices.openUrl(QUrl(self.link))
 
 
+# ---------- Termine ----------
+
+STATUS_COLORS = {"confirmed": GREEN, "expected": AMBER, "speculative": "#a78bfa", "occurred": MUTED}
+STATUS_TERMS = {"confirmed": "status_bestaetigt", "expected": "status_erwartet", "speculative": "status_spekulativ",
+                "occurred": "status_eingetreten"}
+# Art eines Termins -> Begriff im Glossar
+KIND_TERMS = {**{kind: EVENT_TERMS[label] for label, kind in evt.YAHOO_KINDS.items()}, "guidance": "guidance"}
+WEEKDAYS = ("Mo", "Di", "Mi", "Do", "Fr", "Sa", "So")
+CALENDAR_WINDOWS = {}
+
+
+def style_status_badge(label, status):
+    """Schild mit dem Status eines Termins; spekulative haben zusätzlich einen gestrichelten Rand."""
+    color = STATUS_COLORS[status]
+    label.setText(evt.STATUS_LABELS[status])
+    style_pill(label, color, strong=status == "confirmed")
+    if status == "speculative":
+        label.setStyleSheet(label.styleSheet() + f" border: 1px dashed {color};")
+    explain(label, STATUS_TERMS[status])
+    return label
+
+
+def event_note(item, today):
+    """Quelle, Relevanz, Hinweise und abweichende Angaben zu einem Termin in einer Zeile."""
+    event = item.event
+    parts = ["Quelle: " + ", ".join(item.sources)]
+    if event.relevance != 2:
+        parts.append(f"Relevanz {evt.RELEVANCE[event.relevance]}")
+    if evt.is_overdue(event, today):
+        parts.append("Datum verstrichen")
+    parts += [f"{source} nennt {text}" for text, source in item.other_dates]
+    if event.note:
+        parts.append(event.note)
+    return " · ".join(parts)
+
+
+def check_when(text):
+    evt.parse_when(text)
+    return text
+
+
+def event_dialog(ctl, symbol=None, event=None):
+    """Dialog zum Anlegen eines eigenen Termins (zu symbol oder mit Auswahl der Aktie) oder zum Ändern von event."""
+    editing = event is not None
+    fields = []
+    if not editing and symbol is None:
+        fields.append(("Aktie", Choice([(s, s) for s in ctl.symbols], ctl.symbols[0] if ctl.symbols else None)))
+    fields += [
+        ("Titel", event.title if editing else "", str),
+        ("Datum", evt.date_text(event) if editing else "", check_when),
+        ("Art", Choice([(label, key) for key, label in evt.KINDS.items()], event.kind if editing else "product")),
+        ("Status", Choice([(evt.STATUS_LABELS[st], st) for st in evt.STATUSES], event.status if editing else "expected")),
+        ("Relevanz", Choice([("passend zur Art", None)] + [(evt.RELEVANCE[r], r) for r in (3, 2, 1)],
+                            event.relevance if editing else None)),
+        ("Notiz", event.note if editing else "", str),
+    ]
+
+    def apply(values):
+        values = list(values)
+        target = symbol if (editing or symbol is not None) else values.pop(0)
+        title, when, kind, status, relevance, note = values
+        if editing:
+            ctl.update_event(event.id, kind, title, when, status, relevance, note)
+        else:
+            ctl.add_event(target, kind, title, when, status, relevance, note)
+
+    who = event.symbol if editing else symbol
+    intro = (f"Eigener Termin{f' für {who}' if who else ''}. Datum: 08.10.2026, 10/2026 (Monat) oder 2026 (Jahr). "
+             "Der Status sagt, wie verlässlich der Termin ist.")
+    return FieldDialog("Termin ändern" if editing else "Termin anlegen", intro, fields, apply,
+                       ok_text="Speichern" if editing else "Anlegen", field_width=190).run()
+
+
+def delete_event_dialog(ctl, event):
+    return FieldDialog("Termin löschen", f"„{event.title}“ ({evt.date_text(event)}, {event.symbol}) wirklich löschen?",
+                       [], lambda _values: ctl.delete_event(event.id), ok_text="Löschen").run()
+
+
+class EventRow(QFrame):
+    """Ein Termin als Zeile: Titel, Datum, Quelle und Status; eigene Termine lassen sich ändern und löschen."""
+    clicked = Signal(str)
+
+    def __init__(self, ctl, item, today, show_symbol=False, editable=False):
+        super().__init__()
+        self.setObjectName("plain")
+        event = item.event
+        self.item, self.symbol, self.show_symbol = item, event.symbol, show_symbol
+        row = QHBoxLayout(self)
+        row.setContentsMargins(14, 8, 8, 8)
+        row.setSpacing(8)
+        left = QVBoxLayout()
+        left.setSpacing(1)
+        self.title = QLabel(f"{event.symbol} · {event.title}" if show_symbol else event.title)
+        self.title.setStyleSheet("font-weight: 700;")
+        self.when = QLabel(evt.when_text(event, today))
+        self.meta = QLabel(event_note(item, today))
+        self.meta.setWordWrap(True)
+        self.meta.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        for label in (self.title, self.when, self.meta):
+            left.addWidget(label)
+        row.addLayout(left, 1)
+        self.badge = style_status_badge(QLabel(), item.status)
+        row.addWidget(self.badge, 0, Qt.AlignTop)
+        if editable and event.is_manual:
+            for text, tip, action in (("✎", "Termin ändern", lambda: event_dialog(ctl, event=event)),
+                                      ("✕", "Termin löschen", lambda: delete_event_dialog(ctl, event))):
+                button = QPushButton(text)
+                button.setObjectName("icon")
+                button.setToolTip(tip)
+                button.setCursor(Qt.PointingHandCursor)
+                button.clicked.connect(lambda _checked=False, a=action: a())
+                row.addWidget(button, 0, Qt.AlignTop)
+        if show_symbol:
+            self.setCursor(Qt.PointingHandCursor)
+
+    def mouseReleaseEvent(self, event):
+        if self.show_symbol and event.button() == Qt.LeftButton and self.rect().contains(event.position().toPoint()):
+            self.clicked.emit(self.symbol)
+
+
+def open_calendar(ctl, symbol=None, open_symbol=None):
+    key = symbol or ""
+    existing = CALENDAR_WINDOWS.get(key)
+    if existing:
+        existing.raise_()
+        existing.activateWindow()
+        return
+    window = CalendarWindow(ctl, symbol, open_symbol)
+    window.closed.connect(lambda k: CALENDAR_WINDOWS.pop(k, None))
+    CALENDAR_WINDOWS[key] = window
+    Dock.add(window)
+    window.show()
+
+
+MONTHS = ("Januar", "Februar", "März", "April", "Mai", "Juni", "Juli", "August", "September", "Oktober",
+          "November", "Dezember")
+CHIPS_PER_DAY = 3
+
+
+class ElidedLabel(QLabel):
+    """Einzeiliges Label, das zu langen Text mit „…“ kürzt, statt das Layout aufzuweiten."""
+
+    def __init__(self, text=""):
+        super().__init__()
+        self.full_text = text
+        self.setMinimumWidth(10)
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self._elide()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._elide()
+
+    def _elide(self):
+        self.setText(self.fontMetrics().elidedText(self.full_text, Qt.ElideRight, max(self.width() - 12, 10)))
+
+
+def style_chip(label, status):
+    """Termin im Tagesfeld: Farbe und Rand folgen dem Status; spekulative sind gestrichelt, eingetretene blass."""
+    color = STATUS_COLORS[status]
+    c = QColor(color)
+    border = "1px dashed" if status == "speculative" else "1px solid"
+    label.setStyleSheet(f"background: rgba({c.red()},{c.green()},{c.blue()},{26 if status == 'occurred' else 46}); "
+                        f"color: {color}; border: {border} rgba({c.red()},{c.green()},{c.blue()},150); "
+                        "border-radius: 5px; padding: 0px 3px; font-size: 11px; font-weight: 600;")
+    label.setFixedHeight(18)
+    return label
+
+
+class DayCell(QFrame):
+    """Ein Tag im Monatsraster mit Tageszahl und seinen Terminen als Chips."""
+    clicked = Signal(object)
+
+    def __init__(self, day, items, in_month, is_today, selected, show_symbol):
+        super().__init__()
+        self.day, self.items = day, items
+        self.setObjectName("daycell")
+        self.setMinimumHeight(98)
+        self.setCursor(Qt.PointingHandCursor)
+        border = ACCENT if selected else (BG if not is_today else "#3a4157")
+        self.setStyleSheet(f"QFrame#daycell {{ background: {SURFACE if in_month else BG}; border-radius: 8px; "
+                           f"border: {2 if selected else 1}px solid {border}; }}")
+        column = QVBoxLayout(self)
+        column.setContentsMargins(5, 3, 5, 4)
+        column.setSpacing(3)
+        self.number = QLabel(str(day.day))
+        weight = "700" if is_today else "500"
+        color = ACCENT if is_today else (TEXT if in_month else "#5b6178")
+        self.number.setStyleSheet(f"color: {color}; font-size: 12px; font-weight: {weight};")
+        column.addWidget(self.number)
+        self.chips = []
+        for item in items[:CHIPS_PER_DAY]:
+            event = item.event
+            chip = ElidedLabel(f"{event.symbol} · {event.title}" if show_symbol else event.title)
+            style_chip(chip, item.status)
+            chip.setToolTip(f"{event.symbol}: {event.title} ({STATUS_LABEL_OF[item.status]})")
+            column.addWidget(chip)
+            self.chips.append(chip)
+        self.more = None
+        if len(items) > CHIPS_PER_DAY:
+            self.more = QLabel(f"+ {len(items) - CHIPS_PER_DAY} weitere")
+            self.more.setStyleSheet(f"color: {MUTED}; font-size: 10px;")
+            column.addWidget(self.more)
+        column.addStretch()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self.rect().contains(event.position().toPoint()):
+            self.clicked.emit(self.day)
+
+
+STATUS_LABEL_OF = evt.STATUS_LABELS
+
+
+class CalendarWindow(QWidget):
+    """Monatskalender mit den Terminen (aller Aktien der Watchlist oder einer Aktie) in den Tagesfeldern.
+    Ein Klick auf einen Tag zeigt darunter dessen Termine mit Quelle und Status."""
+    closed = Signal(str)
+
+    def __init__(self, ctl, symbol=None, open_symbol=None):
+        super().__init__()
+        self.setAttribute(Qt.WA_DeleteOnClose)
+        self.ctl, self.symbol, self.open_symbol = ctl, symbol, open_symbol
+        today = dt.date.today()
+        self.positions_only = False
+        self.month = today.replace(day=1)
+        self.selected = today
+        self.cells = {}
+        body = make_panel(self, "Termine" if symbol is None else f"{symbol}: Termine", self.close,
+                          pin=(ctl, "calendar" if symbol is None else f"calendar:{symbol}"))
+        controls = QHBoxLayout()
+        controls.setSpacing(6)
+        self.prev_button = QPushButton("‹")
+        self.prev_button.setObjectName("icon")
+        self.prev_button.setToolTip("Voriger Monat")
+        self.prev_button.setStyleSheet("font-size: 20px;")
+        self.prev_button.clicked.connect(lambda: self.shift_month(-1))
+        self.next_button = QPushButton("›")
+        self.next_button.setObjectName("icon")
+        self.next_button.setToolTip("Nächster Monat")
+        self.next_button.setStyleSheet("font-size: 20px;")
+        self.next_button.clicked.connect(lambda: self.shift_month(1))
+        self.month_label = QLabel()
+        self.month_label.setMinimumWidth(150)
+        self.month_label.setAlignment(Qt.AlignCenter)
+        self.month_label.setStyleSheet("font-size: 16px; font-weight: 700;")
+        self.today_button = QPushButton("Heute")
+        self.today_button.clicked.connect(self.go_today)
+        for widget in (self.prev_button, self.month_label, self.next_button, self.today_button):
+            controls.addWidget(widget)
+        controls.addStretch()
+        self.only_positions = QPushButton("Nur Positionen")
+        self.only_positions.setObjectName("segment")
+        self.only_positions.setCheckable(True)
+        self.only_positions.clicked.connect(self.toggle_positions)
+        self.only_positions.setVisible(symbol is None)
+        controls.addWidget(self.only_positions)
+        self.add_button = QPushButton("+ Termin")
+        self.add_button.clicked.connect(lambda: event_dialog(ctl, symbol))
+        controls.addWidget(self.add_button)
+        body.addLayout(controls)
+        self.legend = enable_term_links(QLabel(" · ".join(
+            term_link(evt.STATUS_LABELS[st], STATUS_TERMS[st]) for st in evt.STATUSES)))
+        self.legend.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        body.addWidget(self.legend)
+        self.grid_host = QWidget()
+        self.grid_host.setObjectName("clear")
+        self.grid = QGridLayout(self.grid_host)
+        self.grid.setContentsMargins(0, 0, 0, 0)
+        self.grid.setSpacing(4)
+        body.addWidget(self.grid_host, 3)
+        area, self.detail = scroll_area()
+        self.detail.addStretch()
+        body.addWidget(area, 2)
+        screen = QApplication.primaryScreen().availableGeometry()
+        self.setFixedSize(min(1020, screen.width() - 20), min(900, screen.height() - 20))
+        self.update_timer = QTimer(self)
+        self.update_timer.setSingleShot(True)
+        self.update_timer.setInterval(150)
+        self.update_timer.timeout.connect(self.refresh)
+        ctl.calendar_changed.connect(self.update_timer.start)
+        self.refresh()
+
+    # ----- Bedienung -----
+
+    def shift_month(self, step):
+        index = self.month.year * 12 + self.month.month - 1 + step
+        self.month = dt.date(index // 12, index % 12 + 1, 1)
+        self.refresh()
+
+    def go_today(self):
+        today = dt.date.today()
+        self.month, self.selected = today.replace(day=1), today
+        self.refresh()
+
+    def select(self, day):
+        self.selected = day
+        if day.replace(day=1) != self.month:
+            self.month = day.replace(day=1)
+        self.refresh()
+
+    def toggle_positions(self):
+        self.positions_only = self.only_positions.isChecked()
+        self.refresh()
+
+    # ----- Aufbau -----
+
+    def _events(self, today):
+        return [m for m in self.ctl.calendar_events(self.symbol, today)
+                if not self.positions_only or m.event.symbol in self.ctl.positions]
+
+    def month_days(self):
+        """Alle Tage des Rasters: volle Wochen von Montag bis Sonntag um den Monat."""
+        first = self.month
+        start = first - dt.timedelta(days=first.weekday())
+        next_month = (first.replace(day=28) + dt.timedelta(days=4)).replace(day=1)
+        weeks = ((next_month - dt.timedelta(days=1)) - start).days // 7 + 1
+        return [start + dt.timedelta(days=i) for i in range(weeks * 7)]
+
+    @staticmethod
+    def _clear(layout, keep_last=False):
+        while layout.count() > (1 if keep_last else 0):
+            widget = layout.takeAt(0).widget()
+            if widget:
+                widget.hide()
+                widget.setParent(None)
+                widget.deleteLater()
+
+    def refresh(self):
+        today = dt.date.today()
+        merged = self._events(today)
+        exact = [m for m in merged if m.event.precision == "day"]
+        by_day = {}
+        for item in sorted(exact, key=evt.sort_key):
+            by_day.setdefault(item.event.day, []).append(item)
+        days = self.month_days()
+        self.month_label.setText(f"{MONTHS[self.month.month - 1]} {self.month.year}")
+        self._clear(self.grid)
+        self.cells = {}
+        for column, name in enumerate(WEEKDAYS):
+            label = QLabel(name)
+            label.setAlignment(Qt.AlignCenter)
+            label.setStyleSheet(f"color: {MUTED}; font-size: 11px; font-weight: 700;")
+            self.grid.addWidget(label, 0, column)
+        for index, day in enumerate(days):
+            cell = DayCell(day, by_day.get(day, []), day.month == self.month.month, day == today,
+                           day == self.selected, self.symbol is None)
+            cell.clicked.connect(self.select)
+            self.grid.addWidget(cell, 1 + index // 7, index % 7)
+            self.cells[day] = cell
+        for column in range(7):
+            self.grid.setColumnStretch(column, 1)
+        for row in range(1, 1 + len(days) // 7):
+            self.grid.setRowStretch(row, 1)
+        self._fill_detail(today, by_day, merged)
+
+    def _add(self, widget):
+        self.detail.insertWidget(self.detail.count() - 1, widget)
+
+    def _header(self, text, key=None):
+        label = QLabel(text.upper())
+        label.setStyleSheet(f"color: {MUTED}; font-size: 10px; font-weight: 700; letter-spacing: 1px;")
+        self._add(explain(label, key) if key else label)
+
+    def _fill_detail(self, today, by_day, merged):
+        self._clear(self.detail, keep_last=True)
+        day = self.selected
+        self._header(f"{WEEKDAYS[day.weekday()]} {day:%d.%m.%Y} · {evt.relative_day(day, today)}")
+        chosen = by_day.get(day, [])
+        for item in chosen:
+            self._add(self._row(item, today))
+        if not chosen:
+            note = QLabel("Keine Termine an diesem Tag. Mit „+ Termin“ legst du einen eigenen an.")
+            note.setStyleSheet(f"color: {MUTED};")
+            note.setWordWrap(True)
+            self._add(note)
+        vague = [m for m in merged if m.event.precision != "day" and m.event.end >= self.month
+                 and m.event.day <= (self.month.replace(day=28) + dt.timedelta(days=4)).replace(day=1)
+                 - dt.timedelta(days=1)]
+        if vague:
+            self._header("Ohne genauen Tag in diesem Monat", "ungenau")
+            for item in vague:
+                self._add(self._row(item, today))
+
+    def _row(self, item, today):
+        row = EventRow(self.ctl, item, today, show_symbol=self.symbol is None, editable=True)
+        if self.open_symbol:
+            row.clicked.connect(self.open_symbol)
+        return row
+
+    def closeEvent(self, event):
+        Dock.remove(self)
+        try:
+            self.ctl.calendar_changed.disconnect(self.update_timer.start)
+        except (RuntimeError, TypeError):
+            pass
+        self.closed.emit(self.symbol or "")
+        super().closeEvent(event)
+
+
 # ---------- Portfolio-Übersicht ----------
 
 PORTFOLIO_WINDOWS = {}
@@ -2279,11 +3032,11 @@ _BASE_PALETTE = [ACCENT, GREEN, AMBER, "#a78bfa", "#22d3ee", "#fb923c", "#f472b6
 PALETTE = _BASE_PALETTE + [QColor(c).lighter(145).name() for c in _BASE_PALETTE]  # 16 unterscheidbare Farben
 ALLOCATION_ITEMS = len(PALETTE)  # so viele Einträge zeigt die Aufteilung einzeln; erst darüber steht "Übrige"
 ALLOCATIONS = (("position", "Position"), ("sector", "Branche"), ("country", "Land"), ("currency", "Währung"))
-SYMBOL_OF_BASE = {"EUR": "€"}
+SYMBOL_OF_BASE = {"EUR": "€", "USD": "$"}
 
 
 def money(value):
-    return f"{value:,.2f} {SYMBOL_OF_BASE.get(BASE, BASE)}"
+    return f"{value:,.2f} {SYMBOL_OF_BASE.get(fx_module.BASE, fx_module.BASE)}"
 
 
 def signed_number(value):
@@ -2292,7 +3045,7 @@ def signed_number(value):
 
 
 def signed_money(value):
-    return f"{signed_number(value)} {SYMBOL_OF_BASE.get(BASE, BASE)}"
+    return f"{signed_number(value)} {SYMBOL_OF_BASE.get(fx_module.BASE, fx_module.BASE)}"
 
 
 def signed_percent(value):
@@ -2360,10 +3113,14 @@ class StatTile(QFrame):
         column = QVBoxLayout(self)
         column.setContentsMargins(14, 12, 14, 12)
         column.setSpacing(3)
-        label = caption_label(caption)
+        label = self.caption = caption_label(caption)
+        label.setWordWrap(True)  # ein langer Titel bricht um, statt die Kachel aus der Box zu schieben
         column.addWidget(explain(label, term) if term else label)
         self.value = QLabel("–")
-        self.value.setStyleSheet("font-size: 17px; font-weight: 700;")
+        self.value.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)  # die Schrift passt sich der Breite an
+        self.color = None
+        self.size = self.VALUE_SIZE
+        self._style_value()
         self.sub = enable_term_links(QLabel())  # Zusatzzeilen enthalten erklärbare Wörter (Rich Text, Zeilen mit <br>)
         self.sub.setWordWrap(True)
         self.sub.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
@@ -2371,10 +3128,38 @@ class StatTile(QFrame):
         column.addWidget(self.sub)
         column.addStretch()
 
+    VALUE_SIZE, MIN_VALUE_SIZE = 17, 10  # Schriftgröße des Werts in Pixeln, von groß nach klein
+
+    def _style_value(self):
+        self.value.setStyleSheet(f"font-size: {self.size}px; font-weight: 700;"
+                                 + (f" color: {self.color};" if self.color else ""))
+
+    def _fit_value(self):
+        """Wählt die größte Schrift, in der der Wert in die Kachel passt."""
+        available = self.width() - 28  # Ränder links und rechts
+        font = QFont(self.value.font())
+        font.setBold(True)
+        size = self.VALUE_SIZE
+        while size > self.MIN_VALUE_SIZE:
+            font.setPixelSize(size)
+            if QFontMetrics(font).horizontalAdvance(self.value.text()) <= available:
+                break
+            size -= 1
+        if size != self.size:
+            self.size = size
+            self._style_value()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._fit_value()
+
     def set(self, value, color=None, sub=""):
         self.value.setText(value)
-        self.value.setStyleSheet("font-size: 17px; font-weight: 700;" + (f" color: {color};" if color else ""))
+        self.color = color
+        self._style_value()
+        self._fit_value()
         self.sub.setText(sub)
+        self.sub.setVisible(bool(sub))
 
 
 class PerformanceChart(QWidget):
@@ -2495,30 +3280,38 @@ class PortfolioWindow(QWidget):
         self.summary = None
         self.dock_above = None
         self.desired_height = 600
-        body = make_panel(self, "Portfolio", self.close, pin=(ctl, "portfolio"))
+        self.base_buttons = {}
+        switch = QWidget()
+        switch_row = QHBoxLayout(switch)
+        switch_row.setContentsMargins(0, 0, 4, 0)
+        switch_row.setSpacing(2)
+        self.base_group = QButtonGroup(self)
+        for code in BASES:
+            button = QPushButton(code)
+            button.setObjectName("segment")
+            button.setCheckable(True)
+            button.setChecked(code == fx_module.BASE)
+            button.setCursor(Qt.PointingHandCursor)
+            button.setToolTip(f"Alles in {code} rechnen")
+            button.clicked.connect(lambda _checked=False, c=code: ctl.set_base(c))
+            self.base_group.addButton(button)
+            self.base_buttons[code] = button
+            switch_row.addWidget(button)
+        body = make_panel(self, "Portfolio", self.close, extras=[switch], pin=(ctl, "portfolio"))
+        ctl.base_changed.connect(self.on_base_changed)
         self.area, content = scroll_area()
         body.addWidget(self.area, 1)
 
-        hero = QFrame()
-        hero.setObjectName("plain")
-        column = QVBoxLayout(hero)
-        column.setContentsMargins(18, 14, 18, 14)
-        column.setSpacing(2)
-        column.addWidget(explain(caption_label(f"Gesamtwert in {BASE}"), "gesamtwert"))
-        self.total = QLabel("–")
-        self.total.setStyleSheet("font-size: 32px; font-weight: 700;")
-        self.total_sub = enable_term_links(QLabel())
-        self.total_sub.setStyleSheet(f"color: {MUTED};")
-        column.addWidget(self.total)
-        column.addWidget(self.total_sub)
-        # Gesamtwert und die drei Kennzahlen stehen in einer Reihe, damit die Breite genutzt wird
+        # Vier gleich breite Kennzahlen ohne Zusatzzeilen in einer Reihe
         top = QHBoxLayout()
         top.setSpacing(8)
-        top.addWidget(hero, 2)
-        self.unrealized = StatTile("Unrealisiert", "unrealisiert")
-        self.realized = StatTile("Realisiert", "realisiert")
-        self.result = StatTile("Gesamt", "gesamtergebnis")
-        for tile in (self.unrealized, self.realized, self.result):
+        self.total_tile = StatTile(f"Gesamtwert in {fx_module.BASE}", "gesamtwert")
+        self.total_caption = self.total_tile.caption
+        self.total = self.total_tile.value
+        self.invested = StatTile("Investiert", "investiert")
+        self.cash = StatTile("Guthaben", "guthaben")
+        self.result = StatTile("Gesamtgewinn", "gesamtergebnis")
+        for tile in (self.total_tile, self.invested, self.cash, self.result):
             top.addWidget(tile, 1)
         content.addLayout(top)
 
@@ -2618,24 +3411,19 @@ class PortfolioWindow(QWidget):
         self.performance_note.setText("\n".join(notes))
         self.performance_note.setVisible(bool(notes))
 
+    def on_base_changed(self, code):
+        self.base_buttons[code].setChecked(True)
+        self.refresh()
+
     def refresh(self):
         summary = self.ctl.portfolio_summary()
         self.summary = summary
-        self.total.setText(money(summary.value))
-        self.total_sub.setText(f"{term_link('investiert', 'investiert')} {money(summary.invested)}")
-
-        def split(price, fx_part):
-            return (f"{term_link('Kurs', 'kursgewinn')} {signed_money(price)}<br>"
-                    f"{term_link('Währung', 'waehrungseffekt')} {signed_money(fx_part)}")
-
-        self.unrealized.set(signed_money(summary.unrealized), sign_color(summary.unrealized),
-                            f"{signed_percent(summary.unrealized_pct)}<br>"
-                            + split(summary.price_effect, summary.fx_effect))
-        self.realized.set(signed_money(summary.realized), sign_color(summary.realized),
-                          "aus Verkäufen<br>" + split(summary.realized_price, summary.realized_fx))
-        self.result.set(signed_money(summary.total_result), sign_color(summary.total_result),
-                        f"{term_link('Rendite', 'gesamtrendite')} {signed_percent(summary.total_return_pct)}<br>"
-                        f"auf {money(summary.total_invested)} eingesetzt")
+        self.total_caption.setText(f"Gesamtwert in {fx_module.BASE}".upper())
+        self.base_buttons[fx_module.BASE].setChecked(True)
+        self.total_tile.set(money(summary.total_value))
+        self.invested.set(money(summary.invested))
+        self.cash.set(money(summary.cash or 0))
+        self.result.set(signed_money(summary.total_result), sign_color(summary.total_result))
         self.notes.setText("\n".join("⚠ " + warning for warning in summary.warnings))
         self.notes.setVisible(bool(summary.warnings))
         self.refresh_performance()
@@ -2703,6 +3491,10 @@ class PortfolioWindow(QWidget):
                 signal.disconnect(self.update_timer.start)
             except (RuntimeError, TypeError):
                 pass
+        try:
+            self.ctl.base_changed.disconnect(self.on_base_changed)
+        except (RuntimeError, TypeError):
+            pass
         self.closed.emit()
         super().closeEvent(event)
 
@@ -2724,11 +3516,15 @@ def claim_single_instance(port=LOCK_PORT):
 
 
 def restore_pinned(ctl, main):
-    """Öffnet alle angehefteten Boxen, die gerade nicht offen sind. Die Watchlist ist nie angeheftet, sie öffnet immer."""
+    """Öffnet alle angehefteten Boxen, die gerade nicht offen sind. Die Positionen sind nie angeheftet, sie öffnen immer."""
     for key in ctl.pinned:
         kind, _, symbol = key.partition(":")
         if kind == "portfolio":
             open_portfolio(ctl, above=main)
+        elif kind == "watchlist":
+            main.open_watchlist()
+        elif kind == "calendar" and (not symbol or symbol in ctl.symbols):
+            open_calendar(ctl, symbol or None, open_symbol=main.open_detail)
         elif symbol in ctl.symbols and kind == "detail":
             main.open_detail(symbol)
         elif symbol in ctl.symbols and kind == "tx":
@@ -2740,7 +3536,7 @@ def widget_is_open(main):
 
 
 def open_widget(ctl, main):
-    """Öffnet die Watchlist, die immer dabei ist, und dazu die angehefteten Boxen; mehr nicht."""
+    """Öffnet die Positionen, die immer dabei sind, und dazu die angehefteten Boxen; mehr nicht."""
     main.show_docked()
     restore_pinned(ctl, main)
 
@@ -2815,6 +3611,7 @@ def main():
     tray_menu.addAction("Öffnen", lambda: open_widget(ctl, window))
     tray_menu.addAction("Alle Fenster schließen", lambda: close_widget(window))
     tray_menu.addAction("Portfolio", lambda: open_portfolio(ctl, above=window))
+    tray_menu.addAction("Termine", lambda: open_calendar(ctl, open_symbol=window.open_detail))
     tray = QSystemTrayIcon(icon, app)
     notify = lambda title, text: tray.showMessage(title, text, QSystemTrayIcon.Information, 8000)
     tray_menu.addSeparator()

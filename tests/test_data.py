@@ -46,6 +46,27 @@ def patch_yf(**ticker_kwargs):
     return mock.patch.object(sd, "yf", fake), fake
 
 
+class TargetTests(unittest.TestCase):
+    def test_targets_come_from_yahoo_info(self):
+        details = {"targetMeanPrice": 328.09, "targetHighPrice": 405.0, "targetLowPrice": 215.0,
+                   "numberOfAnalystOpinions": 39, "currency": "USD", "financialCurrency": "USD"}
+        patcher, _ = patch_yf(details=details)
+        with patcher:
+            self.assertEqual(sd.fetch_targets("AAPL"), {"mean": 328.09, "high": 405.0, "low": 215.0, "count": 39,
+                                                        "currency": "USD"})
+
+    def test_no_mean_target_means_no_targets(self):
+        patcher, _ = patch_yf(details={"currency": "USD", "numberOfAnalystOpinions": None})
+        with patcher:
+            self.assertIsNone(sd.fetch_targets("GC=F"))
+
+    def test_missing_financial_currency_falls_back_to_the_quote_currency(self):
+        patcher, _ = patch_yf(details={"targetMeanPrice": 2.0, "currency": "AUD"})
+        with patcher:
+            result = sd.fetch_targets("DRO.AX")
+        self.assertEqual((result["currency"], result["high"], result["count"]), ("AUD", None, None))
+
+
 class InputTests(unittest.TestCase):
     def test_parse_number_accepts_comma_and_dot(self):
         self.assertEqual(sd.parse_number("12,5"), 12.5)
@@ -180,6 +201,21 @@ class QuoteTests(unittest.TestCase):
         patcher, _ = patch_yf(info=info)
         with patcher:
             self.assertAlmostEqual(sd.fetch_quote("X")["change_pct"], 10.0)
+
+    def test_nan_regular_close_falls_back_instead_of_producing_a_nan_change(self):
+        """Regression: SWDA.L und XAIX.DE liefern NaN; ein NaN-Änderung ließ das Speichern des Kurses scheitern."""
+        info = FakeInfo(last_price=110.0, previous_close=100.0, regular_market_previous_close=float("nan"),
+                        currency="USD")
+        patcher, _ = patch_yf(info=info)
+        with patcher:
+            self.assertAlmostEqual(sd.fetch_quote("X")["change_pct"], 10.0)
+
+    def test_nan_in_every_previous_close_is_an_error_not_a_nan_change(self):
+        info = FakeInfo(last_price=110.0, previous_close=float("nan"), regular_market_previous_close=float("nan"),
+                        currency="USD")
+        patcher, _ = patch_yf(info=info)
+        with patcher, self.assertRaises(ValueError):
+            sd.fetch_quote("X")
 
     def test_before_the_session_starts_there_is_no_change_yet(self):
         # Freitag 9.10.2026, 10:00 New York; Sitzung beginnt 13:30 UTC, letzter Handel gestern

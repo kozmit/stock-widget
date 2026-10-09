@@ -35,7 +35,8 @@ class GlossaryContentTests(unittest.TestCase):
                     "gv_prozent", "unrealisiert", "realisiert", "gesamtergebnis", "gesamtrendite", "investiert",
                     "gesamtwert", "basiswaehrung", "kursgewinn", "waehrungseffekt", "kurs_waehrung", "anteil",
                     "aufteilung", "verlauf", "historie", "veraltet", "termin", "quartalszahlen", "ex_dividende",
-                    "dividendenzahlung"):
+                    "dividendenzahlung", "termine", "termin_status", "status_bestaetigt", "status_erwartet",
+                    "status_spekulativ", "status_eingetreten", "relevanz", "ungenau"):
             self.assertIn(key, GLOSSARY)
 
     def test_ratios_name_their_formula_and_unit(self):
@@ -54,7 +55,7 @@ class GlossaryContentTests(unittest.TestCase):
         self.assertEqual([name for name, _ in glossary.term("kgv").sections()],
                          ["Formel", "Einheit", "Deutung", "Beispiel"])
         self.assertEqual([name for name, _ in glossary.term("dividendenzahlung").sections()], ["Deutung"])
-        self.assertEqual(glossary.term("basiswaehrung").sections(), [("Einheit", "EUR")])
+        self.assertEqual(glossary.term("basiswaehrung").sections(), [("Einheit", "EUR oder USD")])
 
     def test_worked_examples_are_correct(self):
         self.assertEqual(120 / 6, 20)                      # KGV

@@ -172,7 +172,7 @@ class SnapshotAndInstrumentTests(unittest.TestCase):
         old.close()
         upgraded = Store(old_path)
         self.addCleanup(upgraded.close)
-        self.assertEqual(upgraded.meta("schema_version"), "4")
+        self.assertEqual(upgraded.meta("schema_version"), "5")
         self.assertEqual(upgraded.symbols(), ["GEV"])
         self.assertEqual(upgraded.opening_realized(), {"GEV": 5.0})
         self.assertEqual(upgraded.transactions()[0].shares, 7.36)
@@ -315,12 +315,40 @@ class SourceStoreTests(unittest.TestCase):
         old.close()
         upgraded = Store(old_path)
         self.addCleanup(upgraded.close)
-        self.assertEqual(upgraded.meta("schema_version"), "4")
+        self.assertEqual(upgraded.meta("schema_version"), "5")
         first, second = upgraded.transactions()
         self.assertEqual((first.source, second.source), ("opening", "manual"))
         self.assertEqual((first.shares, second.price), (7.36, 900))
         upgraded.add_transaction("GEV", "buy", 1, 10, 0, dt.date(2026, 1, 5), "", "etoro", "X")  # neue Spalten benutzbar
         self.assertEqual(upgraded.external_ids("etoro"), {"X"})
+
+    def test_database_that_requires_a_positive_price_is_rebuilt_to_allow_free_allocations(self):
+        import sqlite3
+        old_path = os.path.join(self.dir.name, "positive.db")
+        old = sqlite3.connect(old_path)
+        old.executescript("""
+            CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE transactions (id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK (kind IN ('buy', 'sell')), shares REAL NOT NULL CHECK (shares > 0),
+                price REAL NOT NULL CHECK (price > 0), fee REAL NOT NULL DEFAULT 0 CHECK (fee >= 0),
+                executed_on TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'manual', external_id TEXT, imported_at TEXT);
+            CREATE INDEX transactions_symbol ON transactions (symbol);
+            INSERT INTO transactions (id, symbol, kind, shares, price, fee, executed_on, note, created_at, source, external_id)
+                VALUES (4, 'GEV', 'buy', 1, 900, 0, '2026-10-08', '', '2026-10-08T23:00:00', 'etoro', 'A:open'),
+                       (97, 'TKMS.DE', 'buy', 2.63158, 70.2, 0, '2025-10-23', '', '2026-10-09T12:00:00', 'etoro', 'B:open');
+        """)
+        old.commit()
+        old.close()
+        upgraded = Store(old_path)
+        self.addCleanup(upgraded.close)
+        self.assertEqual([(t.id, t.symbol, t.price, t.external_id) for t in upgraded.transactions()],
+                         [(4, "GEV", 900, "A:open"), (97, "TKMS.DE", 70.2, "B:open")])  # die Nummern bleiben
+        upgraded.add_transaction("TKMS.DE", "buy", 1, 0, 0, dt.date(2025, 10, 24), "", "etoro", "C:open")  # Kurs 0 geht jetzt
+        with self.assertRaises(sqlite3.IntegrityError):
+            upgraded.add_transaction("TKMS.DE", "buy", 1, 5, 0, dt.date(2025, 10, 24), "", "etoro", "C:open")  # Kennung bleibt eindeutig
+        with self.assertRaises(sqlite3.IntegrityError):
+            upgraded.add_transaction("TKMS.DE", "buy", 1, -1, 0, dt.date(2025, 10, 24), "", "etoro", "D:open")  # negativ nicht
 
     def test_upgrading_twice_changes_nothing(self):
         self.add("etoro", "1")
@@ -328,6 +356,135 @@ class SourceStoreTests(unittest.TestCase):
         again = Store(self.path)
         self.addCleanup(again.close)
         self.assertEqual([(t.source, t.external_id) for t in again.transactions()], [("etoro", "1")])
+
+
+class EventStoreTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.path = os.path.join(self.dir.name, "test.db")
+        self.store = Store(self.path)
+        self.addCleanup(self.store.close)
+
+    def fields(self, **overrides):
+        fields = {"symbol": "AAPL", "kind": "earnings", "title": "Quartalszahlen", "day": dt.date(2026, 11, 2),
+                  "end": dt.date(2026, 11, 2), "precision": "day", "status": "expected", "relevance": 3,
+                  "note": "", "source_url": ""}
+        fields.update(overrides)
+        return fields
+
+    def test_a_manual_event_roundtrips_with_every_field(self):
+        event_id = self.store.add_event(self.fields(note="laut Trailer", source_url="https://x", status="speculative"))
+        [event] = self.store.events()
+        self.assertEqual((event.id, event.symbol, event.kind, event.title), (event_id, "AAPL", "earnings", "Quartalszahlen"))
+        self.assertEqual((event.day, event.end, event.precision), (dt.date(2026, 11, 2), dt.date(2026, 11, 2), "day"))
+        self.assertEqual((event.status, event.source, event.external_id, event.relevance), ("speculative", "manual", "", 3))
+        self.assertEqual((event.note, event.source_url, event.is_manual), ("laut Trailer", "https://x", True))
+
+    def test_month_events_keep_their_period(self):
+        self.store.add_event(self.fields(day=dt.date(2026, 10, 1), end=dt.date(2026, 10, 31), precision="month"))
+        [event] = self.store.events()
+        self.assertEqual((event.day, event.end, event.precision), (dt.date(2026, 10, 1), dt.date(2026, 10, 31), "month"))
+
+    def test_events_come_back_ordered_by_date(self):
+        self.store.add_event(self.fields(day=dt.date(2026, 12, 1), end=dt.date(2026, 12, 1)))
+        self.store.add_event(self.fields(day=dt.date(2026, 11, 1), end=dt.date(2026, 11, 1)))
+        self.assertEqual([e.day.month for e in self.store.events()], [11, 12])
+
+    def test_update_changes_the_fields_and_keeps_the_source(self):
+        event_id = self.store.add_event(self.fields())
+        self.store.update_event(event_id, self.fields(title="Neu", status="confirmed", day=dt.date(2026, 11, 5),
+                                                      end=dt.date(2026, 11, 5)))
+        [event] = self.store.events()
+        self.assertEqual((event.title, event.status, event.day, event.source), ("Neu", "confirmed",
+                                                                              dt.date(2026, 11, 5), "manual"))
+
+    def test_delete(self):
+        event_id = self.store.add_event(self.fields())
+        self.store.delete_event(event_id)
+        self.assertEqual(self.store.events(), [])
+
+    def test_upsert_creates_then_leaves_an_unchanged_event_alone(self):
+        first, created = self.store.upsert_event("Yahoo Finance", "earnings:2026-11-02", self.fields())
+        second, changed = self.store.upsert_event("Yahoo Finance", "earnings:2026-11-02", self.fields())
+        self.assertEqual((created, changed, first == second), (True, False, True))
+        self.assertEqual(len(self.store.events()), 1)
+
+    def test_upsert_updates_a_changed_event_in_place(self):
+        first, _ = self.store.upsert_event("Yahoo Finance", "earnings:2026-11-02", self.fields())
+        second, changed = self.store.upsert_event("Yahoo Finance", "earnings:2026-11-02",
+                                                  self.fields(end=dt.date(2026, 11, 6)))
+        self.assertEqual((changed, first == second), (True, True))
+        self.assertEqual(self.store.events()[0].end, dt.date(2026, 11, 6))
+
+    def test_the_same_external_id_of_another_stock_or_source_is_a_different_event(self):
+        self.store.upsert_event("Yahoo Finance", "earnings:2026-11-02", self.fields())
+        self.store.upsert_event("Yahoo Finance", "earnings:2026-11-02", self.fields(symbol="MSFT"))
+        self.store.upsert_event("Andere Quelle", "earnings:2026-11-02", self.fields())
+        self.assertEqual(len(self.store.events()), 3)
+
+    def test_the_database_refuses_a_second_row_for_the_same_source_stock_and_id(self):
+        import sqlite3
+        self.store.add_event(self.fields(), "Yahoo Finance", "x")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store.add_event(self.fields(), "Yahoo Finance", "x")
+
+    def test_many_manual_events_without_an_id_are_fine(self):
+        for _ in range(3):
+            self.store.add_event(self.fields())
+        self.assertEqual(len(self.store.events()), 3)
+
+    def test_the_database_refuses_invalid_status_precision_and_relevance(self):
+        import sqlite3
+        for overrides in ({"status": "sicher"}, {"precision": "week"}, {"relevance": 7}):
+            with self.assertRaises(sqlite3.IntegrityError):
+                self.store.add_event(self.fields(**overrides))
+
+    def test_stale_future_events_of_a_source_are_removed_but_past_ones_stay(self):
+        today = dt.date(2026, 10, 9)
+        for external, day in (("earnings:2026-07-28", dt.date(2026, 7, 28)), ("earnings:2026-11-02", dt.date(2026, 11, 2)),
+                              ("earnings:2026-11-09", dt.date(2026, 11, 9))):
+            self.store.upsert_event("Yahoo Finance", external, self.fields(day=day, end=day))
+        removed = self.store.delete_stale_events("Yahoo Finance", "AAPL", "earnings", {"earnings:2026-11-09"}, today)
+        self.assertEqual(removed, 1)
+        self.assertEqual([e.external_id for e in self.store.events()], ["earnings:2026-07-28", "earnings:2026-11-09"])
+
+    def test_stale_removal_touches_neither_manual_events_nor_other_kinds_or_stocks(self):
+        today = dt.date(2026, 10, 9)
+        self.store.add_event(self.fields())
+        self.store.upsert_event("Yahoo Finance", "dividend:x", self.fields(kind="dividend"))
+        self.store.upsert_event("Yahoo Finance", "earnings:y", self.fields(symbol="MSFT"))
+        self.store.upsert_event("Yahoo Finance", "earnings:z", self.fields())
+        self.store.delete_stale_events("Yahoo Finance", "AAPL", "earnings", set(), today)
+        self.assertEqual(sorted(e.external_id for e in self.store.events()), ["", "dividend:x", "earnings:y"])
+
+    def test_events_survive_reopening(self):
+        self.store.add_event(self.fields())
+        self.store.close()
+        reopened = Store(self.path)
+        self.addCleanup(reopened.close)
+        self.assertEqual(len(reopened.events()), 1)
+
+    def test_a_schema_version_4_database_gets_the_events_table_and_keeps_its_data(self):
+        import sqlite3
+        old_path = os.path.join(self.dir.name, "v4.db")
+        old = sqlite3.connect(old_path)
+        old.executescript("""
+            CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE watchlist (symbol TEXT PRIMARY KEY, sort INTEGER NOT NULL,
+                opening_realized REAL NOT NULL DEFAULT 0);
+            INSERT INTO meta VALUES ('schema_version', '4'), ('legacy_imported', '2026-10-08');
+            INSERT INTO watchlist VALUES ('GEV', 1, 0);
+        """)
+        old.commit()
+        old.close()
+        upgraded = Store(old_path)
+        self.addCleanup(upgraded.close)
+        self.assertEqual(upgraded.meta("schema_version"), "5")
+        self.assertEqual(upgraded.symbols(), ["GEV"])
+        self.assertEqual(upgraded.events(), [])
+        upgraded.add_event(self.fields(symbol="GEV"))
+        self.assertEqual(len(upgraded.events()), 1)
 
 
 if __name__ == "__main__":

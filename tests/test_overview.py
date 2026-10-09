@@ -110,6 +110,41 @@ class SummaryTests(unittest.TestCase):
         args.update(overrides)
         return portfolio.summarize(**args)
 
+    def test_a_free_allocation_is_all_profit_100_percent(self):
+        free = ledger.Transaction(1, "TKMS.DE", "buy", 2.0, 0.0, 0.0, D1, "Zuteilung", "etoro", "9:open")
+        state = ledger.replay([free])
+        self.assertEqual((state.shares, state.avg_cost), (2.0, 0.0))
+        s = portfolio.summarize({"TKMS.DE": state}, {"TKMS.DE": {"price": 70.0, "currency": "EUR"}}, {}, self.fx)
+        [holding] = s.holdings
+        self.assertEqual((holding.cost, holding.unrealized, holding.pl_pct), (0.0, 140.0, 100.0))
+
+    def test_selling_a_free_allocation_is_all_gain(self):
+        txs = [ledger.Transaction(1, "T", "buy", 2.0, 0.0, 0.0, D1, "", "etoro", "1"),
+               ledger.Transaction(2, "T", "sell", 2.0, 50.0, 0.0, D2, "", "etoro", "2")]
+        self.assertAlmostEqual(ledger.replay(txs).realized, 100.0)
+
+    def test_a_free_sale_or_a_negative_price_stays_invalid(self):
+        for kind, price in (("sell", 0.0), ("buy", -1.0)):
+            with self.assertRaises(ValueError):
+                ledger.validate(ledger.Transaction(1, "T", kind, 1.0, price, 0.0, D1, "", "etoro", "1"))
+
+    def test_cash_is_converted_and_counts_to_the_total_value_but_not_to_invested_or_result(self):
+        plain = self.summary()
+        with_cash = self.summary(cash=[(1000.0, "USD")])
+        self.assertAlmostEqual(with_cash.cash, 800.0)                     # 1000 USD zum aktuellen Kurs 0,80
+        self.assertAlmostEqual(with_cash.total_value, plain.value + 800.0)
+        self.assertEqual((with_cash.value, with_cash.invested, with_cash.total_result),
+                         (plain.value, plain.invested, plain.total_result))
+
+    def test_cash_without_a_rate_is_named_in_the_warnings_instead_of_guessed(self):
+        s = self.summary(cash=[(500.0, "CHF")])
+        self.assertEqual(s.cash, 0.0)
+        self.assertTrue(any("Guthaben 500.00 CHF" in w for w in s.warnings))
+
+    def test_no_cash_means_the_total_value_is_just_the_positions(self):
+        s = self.summary()
+        self.assertEqual((s.cash, s.total_value), (0.0, s.value))
+
     def holding(self, summary, symbol):
         return next(h for h in summary.holdings if h.symbol == symbol)
 

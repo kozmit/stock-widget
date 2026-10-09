@@ -8,6 +8,7 @@ import os
 import shutil
 import sqlite3
 
+from events import Event
 from ledger import Transaction
 
 SCHEMA = """
@@ -22,7 +23,7 @@ CREATE TABLE IF NOT EXISTS transactions (
     symbol TEXT NOT NULL,
     kind TEXT NOT NULL CHECK (kind IN ('buy', 'sell')),
     shares REAL NOT NULL CHECK (shares > 0),
-    price REAL NOT NULL CHECK (price > 0),
+    price REAL NOT NULL CHECK (price >= 0),  -- 0 nur für zugeteilte Aktien, das prüft ledger.validate
     fee REAL NOT NULL DEFAULT 0 CHECK (fee >= 0),
     executed_on TEXT NOT NULL,
     note TEXT NOT NULL DEFAULT '',
@@ -84,12 +85,33 @@ CREATE TABLE IF NOT EXISTS fx_latest (
     source TEXT NOT NULL,
     fetched_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    title TEXT NOT NULL,
+    day TEXT NOT NULL,
+    end_day TEXT NOT NULL,
+    precision TEXT NOT NULL DEFAULT 'day' CHECK (precision IN ('day', 'month', 'year')),
+    status TEXT NOT NULL CHECK (status IN ('confirmed', 'expected', 'speculative', 'occurred')),
+    source TEXT NOT NULL,
+    source_url TEXT NOT NULL DEFAULT '',
+    external_id TEXT,
+    relevance INTEGER NOT NULL DEFAULT 2 CHECK (relevance BETWEEN 1 AND 3),
+    note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS events_symbol ON events (symbol);
+CREATE UNIQUE INDEX IF NOT EXISTS events_external ON events (source, symbol, external_id) WHERE external_id IS NOT NULL;
 """
 # 1: Watchlist und Transaktionen. 2: dazu letzter Kurs und Stammdaten je Aktie, jeweils mit Quelle und Zeitpunkt.
 # 3: dazu Wechselkurse in die Basiswährung (Tageskurse und letzter Kurs).
 # 4: Transaktionen kennen ihre Herkunft (manual, opening, etoro, ...) und die Kennung beim Anbieter;
 #    dazu Tageskurse der Aktien (für den Verlauf), Kürzel-Zuordnungen und der Stand der Synchronisation.
-SCHEMA_VERSION = "4"
+# 5: Termine (Ereigniskalender) mit Art, Zeitraum, Status, Quelle und Relevanz.
+SCHEMA_VERSION = "5"
+EVENT_FIELDS = ("symbol", "kind", "title", "day", "end", "precision", "status", "relevance", "note", "source_url")
 INSTRUMENT_FIELDS = ("name", "exchange", "currency", "sector", "industry", "country", "isin")
 DEFAULT_SYMBOLS = ["AAPL", "MSFT", "DELL"]
 
@@ -111,11 +133,32 @@ class Store:
                           ("imported_at", "TEXT")):
             if name not in columns:
                 self.db.execute(f"ALTER TABLE transactions ADD COLUMN {name} {ddl}")
+        self._allow_free_allocations()
         # Startbestände waren bisher nur an der Notiz zu erkennen
         self.db.execute("UPDATE transactions SET source = 'opening' WHERE source = 'manual' AND note LIKE 'Startbestand%'")
         # Eine Kennung beim Anbieter darf nur einmal vorkommen, sonst würde ein erneuter Abgleich doppelt buchen.
         self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS transactions_external ON transactions (source, external_id) "
                         "WHERE external_id IS NOT NULL")
+
+    TRANSACTION_COLUMNS = ("id, symbol, kind, shares, price, fee, executed_on, note, created_at, source, "
+                           "external_id, imported_at")
+
+    def _allow_free_allocations(self):
+        """Ältere Datenbanken verlangen price > 0. Zugeteilte Aktien (Abspaltung) haben den Einstand 0, deshalb wird
+        die Tabelle einmal mit price >= 0 neu angelegt; alle Einträge samt Nummern bleiben erhalten."""
+        sql = self.db.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'transactions'").fetchone()[0]
+        if "price > 0" not in sql:
+            return
+        self.db.commit()
+        self.db.execute("ALTER TABLE transactions RENAME TO transactions_old")
+        self.db.execute("DROP INDEX IF EXISTS transactions_symbol")
+        self.db.execute("DROP INDEX IF EXISTS transactions_external")
+        self.db.execute(sql.replace("price > 0", "price >= 0"))
+        self.db.execute(f"INSERT INTO transactions ({self.TRANSACTION_COLUMNS}) "
+                        f"SELECT {self.TRANSACTION_COLUMNS} FROM transactions_old")
+        self.db.execute("DROP TABLE transactions_old")
+        self.db.execute("CREATE INDEX IF NOT EXISTS transactions_symbol ON transactions (symbol)")
+        self.db.commit()
 
     def close(self):
         self.db.close()
@@ -236,7 +279,74 @@ class Store:
                         (source, cursor, when.isoformat(timespec="seconds"), message))
         self.db.commit()
 
+    # -- Termine (Ereigniskalender) --
+    @staticmethod
+    def _event_row(fields):
+        return (fields["symbol"], fields["kind"], fields["title"], fields["day"].isoformat(),
+                fields["end"].isoformat(), fields["precision"], fields["status"], fields["relevance"],
+                fields.get("note", ""), fields.get("source_url", ""))
+
+    def add_event(self, fields, source="manual", external_id=None):
+        """Legt einen Termin an; fields siehe events.make_event. Gibt die Nummer zurück."""
+        now = dt.datetime.now().isoformat(timespec="seconds")
+        cursor = self.db.execute(
+            "INSERT INTO events (symbol, kind, title, day, end_day, precision, status, relevance, note, source_url, "
+            "source, external_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (*self._event_row(fields), source, external_id, now, now))
+        self.db.commit()
+        return cursor.lastrowid
+
+    def update_event(self, event_id, fields):
+        row = self._event_row(fields)
+        self.db.execute(
+            "UPDATE events SET symbol = ?, kind = ?, title = ?, day = ?, end_day = ?, precision = ?, status = ?, "
+            "relevance = ?, note = ?, source_url = ?, updated_at = ? WHERE id = ?",
+            (*row, dt.datetime.now().isoformat(timespec="seconds"), event_id))
+        self.db.commit()
+
+    def upsert_event(self, source, external_id, fields):
+        """Legt einen Termin einer Quelle an oder aktualisiert ihn (Schlüssel: Quelle, Aktie, Kennung).
+        Gibt (Nummer, geändert) zurück; ein unveränderter Termin wird nicht angefasst."""
+        found = self.db.execute("SELECT id, kind, title, day, end_day, precision, status, relevance, note, source_url "
+                                "FROM events WHERE source = ? AND symbol = ? AND external_id = ?",
+                                (source, fields["symbol"], external_id)).fetchone()
+        if found is None:
+            return self.add_event(fields, source, external_id), True
+        if tuple(found[1:]) == (fields["kind"], fields["title"], fields["day"].isoformat(), fields["end"].isoformat(),
+                                fields["precision"], fields["status"], fields["relevance"], fields.get("note", ""),
+                                fields.get("source_url", "")):
+            return found[0], False
+        self.update_event(found[0], fields)
+        return found[0], True
+
+    def delete_event(self, event_id):
+        self.db.execute("DELETE FROM events WHERE id = ?", (event_id,))
+        self.db.commit()
+
+    def delete_stale_events(self, source, symbol, kind, keep_external_ids, from_day):
+        """Löscht künftige Termine einer Quelle und Art, die sie nicht mehr meldet (der Termin hat sich verschoben).
+        Vergangene bleiben stehen. Gibt die Zahl der gelöschten zurück."""
+        rows = self.db.execute("SELECT id, external_id FROM events WHERE source = ? AND symbol = ? AND kind = ? "
+                               "AND external_id IS NOT NULL AND day >= ?",
+                               (source, symbol, kind, from_day.isoformat())).fetchall()
+        stale = [row[0] for row in rows if row[1] not in keep_external_ids]
+        self.db.executemany("DELETE FROM events WHERE id = ?", [(i,) for i in stale])
+        self.db.commit()
+        return len(stale)
+
+    def events(self):
+        rows = self.db.execute("SELECT id, symbol, kind, title, day, end_day, precision, status, source, source_url, "
+                               "external_id, relevance, note FROM events ORDER BY day, id")
+        return [Event(r[0], r[1], r[2], r[3], dt.date.fromisoformat(r[4]), dt.date.fromisoformat(r[5]), r[6], r[7],
+                      r[8], r[9], r[10] or "", r[11], r[12]) for r in rows]
+
     # -- Wechselkurse (Basiswährung je Einheit Fremdwährung) --
+    def clear_fx(self):
+        """Löscht alle gespeicherten Wechselkurse (nach dem Wechsel der Basiswährung)."""
+        self.db.execute("DELETE FROM fx_rates")
+        self.db.execute("DELETE FROM fx_latest")
+        self.db.commit()
+
     def save_fx_rates(self, currency, rates, source):
         self.db.executemany(
             "INSERT OR REPLACE INTO fx_rates VALUES (?, ?, ?, ?)",

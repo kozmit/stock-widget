@@ -125,6 +125,7 @@ class AppTestCase(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
         for name, fake in (("fetch_quote", fake_quote), ("fetch_events", lambda s: []),
+                           ("fetch_targets", lambda s: None),
                            ("fetch_news", lambda s, count=15: []), ("search_symbols", lambda q, count=8: []),
                            ("fetch_instrument", fake_instrument), ("fetch_history", fake_history), ("fetch_fx_rate", fake_fx_rate),
                            ("fetch_daily_closes", fake_daily_closes),
