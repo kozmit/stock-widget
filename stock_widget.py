@@ -35,6 +35,8 @@ QLabel {{ background: transparent; }}
 QFrame#panel {{ background: {BG}; border: 1px solid #2b2f3d; border-radius: 20px; }}
 QFrame#card {{ background: {SURFACE}; border-radius: 10px; }}
 QFrame#card:hover {{ background: {SURFACE2}; }}
+QFrame#card[open="true"] {{ background: #2c3a78; }}
+QFrame#card[open="true"]:hover {{ background: #34448c; }}
 QFrame#plain {{ background: {SURFACE}; border-radius: 16px; }}
 QWidget#clear {{ background: transparent; }}
 QLineEdit {{ background: {SURFACE}; border: 1px solid transparent; border-radius: 14px; padding: 9px 14px;
@@ -853,6 +855,13 @@ class StockCard(QFrame):
     def flash(self, color):
         flash(self, color)
 
+    def set_open(self, is_open):
+        """Hebt die Zeile hervor, solange das Detailfenster dieser Aktie offen ist."""
+        if bool(self.property("open")) != is_open:
+            self.setProperty("open", is_open)
+            self.style().unpolish(self)
+            self.style().polish(self)
+
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton and self.rect().contains(event.position().toPoint()):
             self.clicked.emit(self.symbol)
@@ -1006,6 +1015,7 @@ class MainWindow(QWidget):
 
     def refresh_cards(self):
         for symbol, card in self.cards.items():
+            card.set_open(symbol in self.details)
             card.set_data(self.ctl.quotes.get(symbol), self.ctl.positions.get(symbol),
                           self.ctl.events.get(symbol), self.ctl.freshness(symbol))
         stale = self.ctl.stale_symbols()
@@ -1092,6 +1102,15 @@ class MainWindow(QWidget):
         add("Entfernen", lambda: self.ctl.remove(symbol))
         return menu
 
+    def mark_open(self, symbol):
+        card = self.cards.get(symbol)
+        if card:
+            card.set_open(symbol in self.details)
+
+    def on_detail_closed(self, symbol):
+        self.details.pop(symbol, None)
+        self.mark_open(symbol)
+
     def open_detail(self, symbol):
         existing = self.details.get(symbol)
         if existing:
@@ -1099,8 +1118,9 @@ class MainWindow(QWidget):
             existing.activateWindow()
             return
         window = DetailWindow(self.ctl, symbol)
-        window.closed.connect(lambda s: self.details.pop(s, None))
+        window.closed.connect(self.on_detail_closed)
         self.details[symbol] = window
+        self.mark_open(symbol)
         Dock.add(window)
         window.show()
 

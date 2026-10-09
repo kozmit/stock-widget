@@ -2,6 +2,7 @@
 import datetime as dt
 import os
 import re
+import socket
 import subprocess
 import sys
 import unittest
@@ -951,6 +952,20 @@ class WindowTests(AppTestCase):
             self.assertTrue(wait_until(lambda: "offline" in detail.chart.note))
             self.assertIsNone(detail.chart.points)
 
+    def test_card_is_highlighted_while_its_detail_window_is_open(self):
+        card, other = self.main.cards["AAPL"], self.main.cards["MSFT"]
+        self.assertFalse(card.property("open"))
+        self.main.open_detail("AAPL")
+        self.assertTrue(card.property("open"))
+        self.assertFalse(other.property("open"))
+        self.main.open_detail("MSFT")
+        self.assertTrue(card.property("open") and other.property("open"))
+        self.main.details["AAPL"].close()
+        self.assertFalse(card.property("open"))
+        self.assertTrue(other.property("open"))
+        self.ctl.changed.emit()  # eine Aktualisierung darf die Markierung nicht verlieren
+        self.assertTrue(other.property("open"))
+
     def test_detail_scrolls_as_a_whole_with_news_inside_it(self):
         news = [("Schlagzeile", "Quelle", dt.datetime(2026, 10, 8, 9, 0), "https://x/1")]
         with mock.patch.object(sd, "fetch_news", lambda s, count=15: news):
@@ -1143,14 +1158,22 @@ class AddSymbolUiTests(AppTestCase):
 
 
 class SingleInstanceTests(unittest.TestCase):
+    @staticmethod
+    def free_port():
+        """Ein freier Port statt eines festen, damit gleichzeitige Testläufe sich nicht stören."""
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            return probe.getsockname()[1]
+
     def test_second_claim_fails_until_the_first_is_released(self):
-        first = w.claim_single_instance(48999)
+        port = self.free_port()
+        first = w.claim_single_instance(port)
         self.assertIsNotNone(first)
         try:
-            self.assertIsNone(w.claim_single_instance(48999))
+            self.assertIsNone(w.claim_single_instance(port))
         finally:
             first.close()
-        again = w.claim_single_instance(48999)
+        again = w.claim_single_instance(port)
         self.assertIsNotNone(again)
         again.close()
 
