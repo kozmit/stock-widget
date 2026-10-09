@@ -7,7 +7,9 @@ import os
 
 import yfinance as yf
 
-DATA_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "StockWidget")
+# Fester Ordner im Benutzerprofil, bewusst nicht unter AppData: Programme aus der Claude-App sehen AppData
+# umgeleitet, ein per Autostart gestartetes Widget das echte. Nur so gibt es genau eine Datenbank.
+DATA_DIR = os.environ.get("STOCKWIDGET_DATA") or os.path.join(os.path.expanduser("~"), "StockWidget")
 LEGACY_FILE = os.path.join(DATA_DIR, "watchlist.json")  # nur noch zur einmaligen Übernahme
 DB_FILE = os.path.join(DATA_DIR, "stock_widget.db")
 
