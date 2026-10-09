@@ -951,6 +951,19 @@ class WindowTests(AppTestCase):
             self.assertTrue(wait_until(lambda: "offline" in detail.chart.note))
             self.assertIsNone(detail.chart.points)
 
+    def test_detail_scrolls_as_a_whole_with_news_inside_it(self):
+        news = [("Schlagzeile", "Quelle", dt.datetime(2026, 10, 8, 9, 0), "https://x/1")]
+        with mock.patch.object(sd, "fetch_news", lambda s, count=15: news):
+            self.main.open_detail("AAPL")
+            detail = self.main.details["AAPL"]
+            self.assertTrue(wait_until(lambda: any("Schlagzeile" in t for t in texts(detail))))
+            areas = detail.findChildren(w.QScrollArea)
+            self.assertEqual(len(areas), 1)
+            inside = areas[0].widget()
+            for widget in (detail.chart, detail.position_card, detail.price):
+                self.assertTrue(inside.isAncestorOf(widget))
+            self.assertTrue(any(inside.isAncestorOf(card) for card in detail.findChildren(w.NewsCard)))
+
     def test_detail_without_events_says_so(self):
         self.main.open_detail("AAPL")
         detail = self.main.details["AAPL"]

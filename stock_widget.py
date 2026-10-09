@@ -1323,7 +1323,12 @@ class DetailWindow(QWidget):
         self.setAttribute(Qt.WA_DeleteOnClose)
         self.ctl, self.symbol = ctl, symbol
         self.alive = True
-        body = make_panel(self, symbol, self.close)
+        frame = make_panel(self, symbol, self.close)
+        # Die ganze Box scrollt, nicht nur die News: aller Inhalt liegt in einer gemeinsamen Scrollfläche.
+        area, body = scroll_area()
+        body.setContentsMargins(0, 0, 4, 0)
+        body.setSpacing(10)
+        frame.addWidget(area)
 
         names = QVBoxLayout()
         names.setSpacing(2)
@@ -1428,9 +1433,11 @@ class DetailWindow(QWidget):
         body.addWidget(event_card)
 
         body.addWidget(caption_label("News"))
-        area, self.news = scroll_area()
+        self.news = QVBoxLayout()
+        self.news.setSpacing(8)
         self.news.addStretch()
-        body.addWidget(area, 1)
+        body.addLayout(self.news)
+        body.addStretch()
 
         screen = QApplication.primaryScreen().availableGeometry()
         self.setFixedSize(460, min(760, screen.height() - 20))
