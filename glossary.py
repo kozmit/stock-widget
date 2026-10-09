@@ -154,6 +154,60 @@ GLOSSARY = _terms(
                                         "Minuten her ist oder der letzte Abruf fehlgeschlagen ist.",
          interpretation="Der letzte bekannte Kurs bleibt sichtbar, aber gelb und kursiv. Werte, die auf ihm beruhen, "
                         "sind dann nicht aktuell."),
+    # ---- Steuer ----
+    Term("steuerbericht", "Steuerbericht",
+         "Eine Schätzung der Steuer auf deine Aktienverkäufe eines Kalenderjahres, Schritt für Schritt gerechnet. Jede "
+         "Zeile sagt, ob ihr Wert berechnet, manuell eingegeben oder geschätzt ist.",
+         interpretation="Der Bericht kennt nur das, was in diesem Widget steht. Verkäufe und Erträge bei anderen Banken, "
+                        "ausländische Quellensteuer und Fonds-Regeln fehlen. Verbindlich ist die Berechnung deiner Bank. "
+                        "Keine Steuerberatung."),
+    Term("sparer_pauschbetrag", "Sparer-Pauschbetrag",
+         "Der Betrag an Kapitalerträgen pro Jahr, auf den keine Steuer anfällt.",
+         full="Sparerpauschbetrag, früher Freistellungsauftrag (§ 20 Abs. 9 EStG)",
+         formula="1.000 € je Person, 2.000 € bei zusammen veranlagten Ehegatten", unit="Euro je Kalenderjahr",
+         interpretation="Er gilt für alle Banken zusammen. Hast du bei einer anderen Bank schon Freibetrag verbraucht, "
+                        "trägst du das unter „Eingaben“ ein, sonst überschätzt der Bericht den Rest.",
+         example="Gewinn 1.500 €, Freibetrag 1.000 € → 500 € sind steuerpflichtig."),
+    Term("abgeltungsteuer", "Abgeltungsteuer",
+         "Die Steuer auf Kapitalerträge, die die Bank automatisch abführt.",
+         full="Kapitalertragsteuer, 25 % (§ 32d EStG)", formula="steuerpflichtiger Betrag × 25 %", unit="Euro",
+         interpretation="Dazu kommen 5,5 % Solidaritätszuschlag auf die Steuer und, falls du kirchensteuerpflichtig "
+                        "bist, Kirchensteuer. Mit Kirchensteuer sinkt die Abgeltungsteuer ein wenig, die Gesamtlast "
+                        "steigt trotzdem."),
+    Term("soli", "Solidaritätszuschlag",
+         "Ein Zuschlag von 5,5 % auf die Abgeltungsteuer.",
+         formula="Abgeltungsteuer × 5,5 %", unit="Euro",
+         interpretation="Ohne Kirchensteuer ergibt das zusammen 26,375 % auf den steuerpflichtigen Betrag."),
+    Term("kirchensteuer", "Kirchensteuer",
+         "Ein Zuschlag, wenn du kirchensteuerpflichtig bist: 8 % in Bayern und Baden-Württemberg, sonst 9 % der Steuer.",
+         formula="Abgeltungsteuer × Kirchensteuersatz, wobei die Abgeltungsteuer vorher durch (1 + 25 % × Satz) geteilt "
+                 "wird", unit="Euro",
+         interpretation="Zusammen mit Soli ergibt sich bei 9 % etwa 27,995 % auf den steuerpflichtigen Betrag."),
+    Term("aktienverlusttopf", "Aktienverluste",
+         "Verluste aus Aktienverkäufen dürfen nur mit Gewinnen aus Aktienverkäufen verrechnet werden, nicht mit "
+         "Dividenden oder Zinsen.",
+         full="Aktienverlustverrechnungstopf (§ 20 Abs. 6 Satz 4 EStG)", unit="Euro",
+         interpretation="Ist das Ergebnis aller Aktienverkäufe eines Jahres negativ, wird der Verlust ins nächste Jahr "
+                        "vorgetragen und mindert dort Aktiengewinne. ETFs und Fonds haben einen eigenen Topf; er "
+                        "ist hier nicht abgebildet."),
+    Term("verlustvortrag", "Verlustvortrag",
+         "Verluste früherer Jahre, die spätere Gewinne mindern.",
+         unit="Euro",
+         interpretation="Der Vortrag aus Aktienverkäufen wird aus dem Vorjahr dieses Widgets berechnet, sofern du keinen "
+                        "eigenen Wert einträgst, zum Beispiel aus der Steuerbescheinigung deiner Bank."),
+    Term("sonstige_kapitalertraege", "Sonstige Kapitalerträge",
+         "Dividenden, Zinsen und andere Erträge des Jahres, die nicht aus Aktienverkäufen stammen.",
+         unit="Euro",
+         interpretation="Diese Erträge kennt das Widget nicht automatisch. Du trägst sie unter „Eingaben“ ein, damit der "
+                        "Sparer-Pauschbetrag richtig verteilt wird."),
+    Term("steuerpflichtiger_betrag", "Steuerpflichtiger Betrag",
+         "Der Betrag, auf den Steuer anfällt, nachdem Verluste und der Sparer-Pauschbetrag abgezogen sind.",
+         formula="Aktiengewinn nach Verlustvortrag + sonstige Erträge − Sparer-Pauschbetrag", unit="Euro",
+         interpretation="Null heißt: Es fällt keine Steuer an."),
+    Term("nettoerloes", "Nettoerlös",
+         "Der Verkaufserlös, abzüglich der Steuer, die durch die Verkäufe entsteht.",
+         formula="Verkaufserlös − Mehrsteuer durch die Verkäufe", unit="Euro",
+         interpretation="Der Erlös ist schon um Verkaufsgebühren gemindert."),
     # ---- Termine ----
     Term("termine", "Termine (Kalender)",
          "Alle bekannten Termine zu deinen Aktien: Quartalszahlen und Dividenden von Yahoo Finance und eigene Einträge wie "

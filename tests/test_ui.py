@@ -324,7 +324,8 @@ class TradeDialogTests(AppTestCase):
         second = DialogDriver(lambda d: self.assertTrue(
             any("+200.00 USD" in t for t in texts(d)) or any("Position geschlossen" in t for t in texts(d))),
             delay=900)
-        w.trade_dialog(self.ctl, "AAPL", "sell")
+        with mock.patch.object(w, "tax_after_sale"):  # der Steuerhinweis hat eigene Tests (test_tax.py)
+            w.trade_dialog(self.ctl, "AAPL", "sell")
         first.check()
         second.check()
         self.assertNotIn("AAPL", self.ctl.positions)
@@ -333,7 +334,8 @@ class TradeDialogTests(AppTestCase):
     def test_partial_sale_shows_no_closing_message(self):
         self.ctl.record_trade("AAPL", "buy", 10, 80, 0, TODAY - dt.timedelta(days=1))
         driver = DialogDriver(self.fill(["4"]))
-        w.trade_dialog(self.ctl, "AAPL", "sell")
+        with mock.patch.object(w, "tax_after_sale"):  # der Steuerhinweis hat eigene Tests (test_tax.py)
+            w.trade_dialog(self.ctl, "AAPL", "sell")
         driver.check()
         self.assertAlmostEqual(self.ctl.positions["AAPL"]["shares"], 6)
         self.assertIsNone(QApplication.activeModalWidget())

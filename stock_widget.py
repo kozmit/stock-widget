@@ -28,6 +28,7 @@ import events as evt
 import fundamentals as fund
 import keywords as kw
 import newsfeed
+import tax
 import sources
 import stock_data as sd
 import fx as fx_module
@@ -335,10 +336,11 @@ def clear_layout(layout):
     """Entfernt alle Einträge eines Layouts samt der Widgets darin (auch aus verschachtelten Layouts)."""
     while layout.count():
         item = layout.takeAt(0)
-        if item.widget():
-            item.widget().hide()
-            item.widget().setParent(None)
-            item.widget().deleteLater()
+        widget = item.widget()
+        if widget:
+            widget.hide()
+            widget.setParent(None)
+            widget.deleteLater()
         elif item.layout():
             clear_layout(item.layout())
 
@@ -665,6 +667,7 @@ class Controller(QObject):
     calendar_changed = Signal()  # Termine wurden angelegt, geändert, gelöscht oder von Yahoo aktualisiert
     fundamentals_changed = Signal(str)  # Kennzahlen einer Aktie wurden geladen (oder der Abruf schlug fehl)
     news_changed = Signal(str)  # die News einer Aktie wurden geladen (oder der Abruf schlug fehl)
+    tax_changed = Signal()  # Einstellungen oder Eingaben der Steuerschätzung wurden geändert
     terms_changed = Signal(str)  # die Suchbegriffe einer Aktie (News-Filter) wurden gesammelt
     trade_recorded = Signal(str, str)  # Symbol, "buy" oder "sell"
     status = Signal(str)
@@ -1029,6 +1032,103 @@ class Controller(QObject):
                 self.changed.emit()
         self.run(lambda: sd.fetch_instrument(symbol), done)
 
+    # Steuerschätzung (siehe tax.py): Einstellungen und Eingaben je Jahr liegen in der Tabelle meta
+    TAX_SETTINGS_KEY = "tax_settings"
+
+    def _meta_json(self, key):
+        try:
+            value = json.loads(self.store.meta(key) or "{}")
+        except ValueError:
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    def tax_settings(self):
+        data = self._meta_json(self.TAX_SETTINGS_KEY)
+        church = data.get("church_rate", 0.0)
+        return tax.Settings(church if church in dict(tax.CHURCH_OPTIONS) else 0.0, bool(data.get("joint", False)))
+
+    def set_tax_settings(self, church_rate, joint):
+        if church_rate not in dict(tax.CHURCH_OPTIONS):
+            raise ValueError("Ungültiger Kirchensteuersatz")
+        self.store.set_meta(self.TAX_SETTINGS_KEY, json.dumps({"church_rate": church_rate, "joint": bool(joint)}))
+        self.tax_changed.emit()
+
+    def tax_inputs(self, year):
+        data = self._meta_json(f"tax_year:{year}")
+
+        def number(key, default):
+            value = data.get(key, default)
+            return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0 else default
+        return tax.YearInputs(number("other_income", 0.0), number("allowance_elsewhere", 0.0),
+                              number("stock_loss_carry", None), number("general_loss_carry", 0.0))
+
+    def set_tax_inputs(self, year, other_income, allowance_elsewhere, stock_loss_carry, general_loss_carry):
+        """Speichert die Eingaben für ein Jahr; stock_loss_carry None heißt: aus dem Vorjahr berechnen."""
+        values = {"other_income": other_income, "allowance_elsewhere": allowance_elsewhere,
+                  "stock_loss_carry": stock_loss_carry, "general_loss_carry": general_loss_carry}
+        for key, value in values.items():
+            if value is not None and value < 0:
+                raise ValueError("Beträge dürfen nicht negativ sein")
+        self.store.set_meta(f"tax_year:{year}", json.dumps({k: v for k, v in values.items() if v is not None}))
+        self.tax_changed.emit()
+
+    def currency_of(self, symbol):
+        """Die Währung, in der eine Aktie notiert ist: aus dem letzten Kurs, sonst aus den Stammdaten."""
+        return (self.quotes.get(symbol) or {}).get("currency") or (self.instruments.get(symbol) or {}).get("currency")
+
+    def tax_sales(self):
+        """Alle Verkäufe in Euro (siehe tax.convert_sale) und die Hinweise, was dabei fehlt oder geschätzt ist."""
+        rate = tax.eur_rates(self.fx)
+        sales, missing, unknown, estimated = [], [], [], 0
+        for symbol, state in self.states.items():
+            for sale in state.sales:
+                currency = self.currency_of(symbol)
+                if not currency:
+                    unknown.append(symbol)
+                    continue
+                figures = tax.convert_sale(symbol, sale, currency, rate)
+                if figures is None:
+                    missing.append(symbol)
+                    continue
+                estimated += figures.estimated
+                sales.append(figures)
+        notes = []
+        if unknown:
+            notes.append("Währung unbekannt, Verkäufe nicht enthalten: " + ", ".join(sorted(set(unknown))))
+        if missing:
+            notes.append("Wechselkurs fehlt, Verkäufe nicht enthalten: " + ", ".join(sorted(set(missing))))
+        if estimated:
+            notes.append(f"{estimated} Verkäufe stammen ganz oder teils aus einem Startbestand: Kaufdatum und "
+                         "Kaufkurs sind geschätzt, die Umrechnung in Euro daher auch.")
+        carried = sum(self.opening.values()) if self.opening else 0.0
+        if carried:
+            notes.append("Übernommene realisierte Gewinne ohne Datum sind in keinem Jahr enthalten.")
+        return sorted(sales, key=lambda s: (s.day, s.transaction_id)), notes
+
+    def tax_years(self):
+        """Die Jahre mit Verkäufen und das laufende Jahr, neuestes zuerst."""
+        sales, _ = self.tax_sales()
+        return sorted({s.day.year for s in sales} | {dt.date.today().year}, reverse=True)
+
+    def tax_report(self, year):
+        """Der Steuerbericht eines Jahres (tax.YearReport) mit Hinweisen auf fehlende oder geschätzte Angaben."""
+        sales, notes = self.tax_sales()
+        inputs = {y: self.tax_inputs(y) for y in {s.day.year for s in sales} | {year}}
+        for y in range(min(inputs), max(inputs) + 1):
+            inputs.setdefault(y, self.tax_inputs(y))
+        report = tax.compute_years(sales, inputs, self.tax_settings(), [year])[year]
+        report.warnings = list(notes)
+        return report
+
+    def tax_impact(self, transaction_id):
+        """Die steuerliche Wirkung eines Verkaufs (tax.Impact); None, wenn er nicht in Euro umrechenbar ist."""
+        sales, _ = self.tax_sales()
+        sale = next((s for s in sales if s.transaction_id == transaction_id), None)
+        if sale is None:
+            return None
+        inputs = {y: self.tax_inputs(y) for y in range(min(s.day.year for s in sales), dt.date.today().year + 1)}
+        return tax.sale_impact(sales, transaction_id, inputs, self.tax_settings())
+
     def store_news(self, symbol, news, error=None, now=None):
         """Merkt sich die News einer Aktie (auch die, die das Detailfenster selbst geladen hat). Schlug der Abruf
         fehl, bleiben frühere News stehen und der Fehler wird mitgemerkt."""
@@ -1253,9 +1353,10 @@ class Controller(QObject):
     def record_trade(self, symbol, kind, shares, price, fee, day, note="", source="manual"):
         candidate = ledger.Transaction(0, symbol, kind, shares, price, fee, day, note, source)
         ledger.replay(self.transactions.get(symbol, []) + [candidate])  # prüft den ganzen Verlauf
-        self.store.add_transaction(symbol, kind, shares, price, fee, day, note, source)
+        transaction_id = self.store.add_transaction(symbol, kind, shares, price, fee, day, note, source)
         self._ledger_changed()
         self.trade_recorded.emit(symbol, kind)
+        return transaction_id
 
     def start_position(self, symbol, shares, pl):
         """Startbestand aus Stückzahl und aktuellem Gewinn/Verlust in %, gespeichert als Kauf."""
@@ -1557,13 +1658,16 @@ def trade_dialog(ctl, symbol, mode):
 
     if not position:
         return show_message("Keine Position", "Es gibt nichts zu verkaufen.")
+    sold = []
     accepted = FieldDialog(f"{symbol}: Verkleinern", intro,
                            [("Stück", "", num), ("Verkaufskurs", f"{price:.2f}", num),
                             (f"Gebühr ({cur})", "0", num), ("Datum", today, sd.parse_date)],
-                           lambda values: ctl.record_trade(symbol, "sell", *values)).run()
+                           lambda values: sold.append(ctl.record_trade(symbol, "sell", *values))).run()
     if accepted and symbol not in ctl.positions:
         show_message("Position geschlossen",
                      f"Realisierter Gewinn/Verlust insgesamt: {ctl.realized[symbol]:+.2f} {cur}")
+    if accepted and sold:
+        tax_after_sale(ctl, sold[0])
 
 
 # ---------- Hauptfenster ----------
@@ -3165,6 +3269,269 @@ class NewsFeedWindow(QWidget):
         super().closeEvent(event)
 
 
+# ---------- Steuer ----------
+
+TAX_WINDOWS = {}
+SOURCE_COLORS = {tax.CALCULATED: MUTED, tax.MANUAL: ACCENT, tax.ESTIMATED: AMBER}
+
+
+def parse_amount(text):
+    value = sd.parse_number(text)
+    if value < 0:
+        raise ValueError("Der Betrag darf nicht negativ sein")
+    return value
+
+
+def parse_optional_amount(text):
+    """Leer oder „automatisch“ heißt: nicht eingegeben (None)."""
+    return None if text.strip().lower() in ("", "auto", "automatisch") else parse_amount(text)
+
+
+def tax_settings_dialog(ctl):
+    settings = ctl.tax_settings()
+    return FieldDialog(
+        "Steuer: Einstellungen",
+        "Die Kirchensteuer verändert die Berechnung; zusammen veranlagte Ehegatten haben 2.000 € Sparer-Pauschbetrag.",
+        [("Kirchensteuer", Choice([(label, rate) for rate, label in tax.CHURCH_OPTIONS], settings.church_rate)),
+         ("Veranlagung", Choice([("einzeln", False), ("zusammen", True)], settings.joint))],
+        lambda values: ctl.set_tax_settings(*values), ok_text="Speichern", field_width=230).run()
+
+
+def tax_inputs_dialog(ctl, year):
+    current = ctl.tax_inputs(year)
+    carry = "automatisch" if current.stock_loss_carry is None else f"{current.stock_loss_carry:.2f}"
+    return FieldDialog(
+        f"Steuer {year}: Eingaben",
+        "Das weiß das Widget nicht selbst. Beträge in Euro. Beim Aktienverlustvortrag bedeutet „automatisch“: aus dem "
+        "Vorjahr dieses Widgets berechnet.",
+        [("Sonstige Kapitalerträge (Dividenden, Zinsen)", f"{current.other_income:.2f}", parse_amount),
+         ("Anderswo verbrauchter Pauschbetrag", f"{current.allowance_elsewhere:.2f}", parse_amount),
+         ("Aktienverlustvortrag", carry, parse_optional_amount),
+         ("Allgemeiner Verlustvortrag", f"{current.general_loss_carry:.2f}", parse_amount)],
+        lambda values: ctl.set_tax_inputs(year, *values), ok_text="Speichern", field_width=130).run()
+
+
+def tax_after_sale(ctl, transaction_id):
+    """Zeigt nach einem Verkauf die steuerliche Wirkung; „Steuerbericht öffnen“ führt in den Jahresbericht."""
+    impact = ctl.tax_impact(transaction_id)
+    if impact is None:
+        return None
+    sale = impact.sale
+    gain = "Gewinn" if sale.gain >= 0 else "Verlust"
+    text = (f"Erlös {tax.eur(sale.proceeds)}, Anschaffung {tax.eur(sale.cost)}: {gain} {tax.eur(abs(sale.gain))}.\n"
+            f"Sparer-Pauschbetrag übrig: {tax.eur(impact.allowance_before)} → {tax.eur(impact.allowance_after)}.\n"
+            f"Zusätzliche Steuer durch diesen Verkauf (Schätzung): {tax.eur(impact.tax)}.")
+    if sale.estimated:
+        text += "\nAchtung: Die Anschaffung stammt (teils) aus einem Startbestand, Kaufdatum und -kurs sind geschätzt."
+    text += "\nKeine Steuerberatung; verbindlich ist die Berechnung deiner Bank."
+    return FieldDialog(f"{sale.symbol}: Steuer zum Verkauf", text, [], lambda _values: open_tax(ctl, sale.day.year),
+                       ok_text="Steuerbericht öffnen").run()
+
+
+def open_tax(ctl, year=None):
+    existing = TAX_WINDOWS.get("window")
+    if existing:
+        if year is not None:
+            existing.select_year(year)
+        existing.raise_()
+        existing.activateWindow()
+        return
+    window = TaxWindow(ctl, year)
+    window.closed.connect(lambda: TAX_WINDOWS.pop("window", None))
+    TAX_WINDOWS["window"] = window
+    Dock.add(window)
+    window.show()
+
+
+class TaxStepRow(QFrame):
+    """Ein Rechenschritt: Name, Betrag und woher der Wert stammt (berechnet, manuell oder geschätzt)."""
+
+    def __init__(self, step):
+        super().__init__()
+        self.step = step
+        self.setObjectName("plain" if step.strong else "clear")
+        row = QHBoxLayout(self)
+        row.setContentsMargins(14 if step.strong else 4, 5, 14 if step.strong else 4, 5)
+        row.setSpacing(8)
+        left = QVBoxLayout()
+        left.setSpacing(0)
+        self.label = QLabel(step.label)
+        self.label.setStyleSheet("font-weight: 700;" if step.strong else "")
+        if step.term:
+            explain(self.label, step.term)
+        left.addWidget(self.label)
+        self.note = QLabel(step.note)
+        self.note.setWordWrap(True)
+        self.note.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        self.note.setVisible(bool(step.note))
+        left.addWidget(self.note)
+        row.addLayout(left, 1)
+        self.value = QLabel(f"{step.value:+,.2f} €" if step.key in tax.SIGNED_KEYS else tax.eur(step.value))
+        self.value.setStyleSheet("font-weight: 700;" if step.strong else "")
+        self.value.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        row.addWidget(self.value, 0, Qt.AlignVCenter)
+        self.source = QLabel(step.source)
+        style_pill(self.source, SOURCE_COLORS[step.source])
+        self.source.setFixedWidth(74)
+        self.source.setAlignment(Qt.AlignCenter)
+        row.addWidget(self.source, 0, Qt.AlignVCenter)
+
+
+class TaxSaleRow(QFrame):
+    """Ein Verkauf des Jahres in Euro mit Erlös, Anschaffungskosten und Ergebnis."""
+
+    def __init__(self, sale):
+        super().__init__()
+        self.sale = sale
+        self.setObjectName("plain")
+        row = QHBoxLayout(self)
+        row.setContentsMargins(14, 8, 14, 8)
+        row.setSpacing(8)
+        left = QVBoxLayout()
+        left.setSpacing(0)
+        self.title = QLabel(f"{sale.symbol} · {sale.shares:g} Stück")
+        self.title.setStyleSheet("font-weight: 700;")
+        self.meta = QLabel(f"{sale.day:%d.%m.%Y} · Erlös {tax.eur(sale.proceeds)} · Anschaffung {tax.eur(sale.cost)}")
+        self.meta.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        left.addWidget(self.title)
+        left.addWidget(self.meta)
+        row.addLayout(left, 1)
+        self.flag = QLabel("geschätzt")
+        style_pill(self.flag, AMBER)
+        self.flag.setToolTip("Die Anschaffung stammt (teils) aus einem Startbestand: Kaufdatum und Kaufkurs sind geschätzt.")
+        self.flag.setVisible(sale.estimated)
+        row.addWidget(self.flag)
+        self.gain = QLabel(f"{sale.gain:+,.2f} €")
+        self.gain.setStyleSheet(f"color: {sign_color(sale.gain)}; font-weight: 700;")
+        row.addWidget(self.gain)
+
+
+class TaxWindow(QWidget):
+    """Steuerschätzung je Kalenderjahr: Kennzahlen, Rechenweg mit Herkunft jedes Werts und die Verkäufe des Jahres."""
+    closed = Signal()
+
+    def __init__(self, ctl, year=None):
+        super().__init__()
+        self.setAttribute(Qt.WA_DeleteOnClose)
+        self.ctl = ctl
+        years = ctl.tax_years()
+        self.year = year if year in years else years[0]
+        body = make_panel(self, "Steuer", self.close, pin=(ctl, "tax"))
+        controls = QHBoxLayout()
+        controls.setSpacing(4)
+        self.year_row = QHBoxLayout()
+        self.year_row.setSpacing(4)
+        controls.addLayout(self.year_row)
+        controls.addStretch()
+        self.settings_button = QPushButton("Einstellungen")
+        self.settings_button.clicked.connect(lambda: tax_settings_dialog(ctl))
+        self.inputs_button = QPushButton("Eingaben")
+        self.inputs_button.clicked.connect(lambda: tax_inputs_dialog(ctl, self.year))
+        controls.addWidget(self.settings_button)
+        controls.addWidget(self.inputs_button)
+        body.addLayout(controls)
+        area, self.content = scroll_area()
+        body.addWidget(area, 1)
+        tiles = QHBoxLayout()
+        tiles.setSpacing(8)
+        self.tax_tile = StatTile("Geschätzte Steuer", "steuerbericht")
+        self.sales_tile = StatTile("Durch Verkäufe", "steuerbericht")
+        self.allowance_tile = StatTile("Pauschbetrag übrig", "sparer_pauschbetrag")
+        self.net_tile = StatTile("Nettoerlös", "nettoerloes")
+        for tile in (self.tax_tile, self.sales_tile, self.allowance_tile, self.net_tile):
+            tiles.addWidget(tile, 1)
+        self.content.addLayout(tiles)
+        self.sections = QVBoxLayout()
+        self.sections.setSpacing(4)
+        self.content.addLayout(self.sections)
+        self.content.addStretch()
+        screen = QApplication.primaryScreen().availableGeometry()
+        self.setFixedSize(680, min(820, screen.height() - 20))
+        self.update_timer = QTimer(self)
+        self.update_timer.setSingleShot(True)
+        self.update_timer.setInterval(300)
+        self.update_timer.timeout.connect(self.refresh)
+        self.signals = (ctl.tax_changed, ctl.ledger_changed, ctl.base_changed, ctl.changed)
+        for signal in self.signals:
+            signal.connect(self.update_timer.start)
+        self.refresh()
+
+    def select_year(self, year):
+        self.year = year
+        self.refresh()
+
+    def _year_buttons(self, years):
+        clear_layout(self.year_row)
+        self.year_buttons = {}
+        group = QButtonGroup(self)
+        for year in years:
+            button = QPushButton(str(year))
+            button.setObjectName("segment")
+            button.setCheckable(True)
+            button.setChecked(year == self.year)
+            button.clicked.connect(lambda _checked=False, y=year: self.select_year(y))
+            group.addButton(button)
+            self.year_buttons[year] = button
+            self.year_row.addWidget(button)
+        self._group = group
+
+    def _heading(self, text, term=None):
+        label = caption_label(text)
+        label.setStyleSheet(label.styleSheet() + " margin-top: 8px;")
+        self.sections.addWidget(explain(label, term) if term else label)
+
+    def refresh(self):
+        years = self.ctl.tax_years()
+        if self.year not in years:
+            years = sorted(set(years) | {self.year}, reverse=True)
+        self._year_buttons(years)
+        report = self.ctl.tax_report(self.year)
+        self.report = report
+        self.tax_tile.value.setText(tax.eur(report.tax))
+        self.tax_tile.sub.setText(f"Jahr {report.year}, alle Kapitalerträge")
+        self.sales_tile.value.setText(tax.eur(report.tax_on_sales))
+        self.sales_tile.sub.setText("Mehrsteuer durch die Aktienverkäufe")
+        self.allowance_tile.value.setText(tax.eur(report.allowance_left))
+        self.allowance_tile.sub.setText(f"von {tax.eur(report.allowance_available)} verfügbar")
+        self.net_tile.value.setText(tax.eur(report.net_proceeds))
+        self.net_tile.sub.setText(f"Erlös {tax.eur(report.proceeds)} abzüglich Mehrsteuer")
+        clear_layout(self.sections)
+        self._heading("Rechenweg", "steuerbericht")
+        for step in report.steps:
+            self.sections.addWidget(TaxStepRow(step))
+        self._heading(f"Verkäufe {report.year}", "realisiert")
+        if report.sales:
+            for sale in report.sales:
+                self.sections.addWidget(TaxSaleRow(sale))
+        else:
+            note = QLabel(f"Keine Verkäufe im Jahr {report.year}.")
+            note.setStyleSheet(f"color: {MUTED};")
+            self.sections.addWidget(note)
+        if report.warnings:
+            self._heading("Hinweise")
+            for text in report.warnings:
+                label = QLabel(text)
+                label.setWordWrap(True)
+                label.setStyleSheet(f"color: {AMBER}; font-size: 12px;")
+                self.sections.addWidget(label)
+        self._heading("Annahmen")
+        for text in tax.ASSUMPTIONS:
+            label = QLabel("• " + text)
+            label.setWordWrap(True)
+            label.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+            self.sections.addWidget(label)
+
+    def closeEvent(self, event):
+        Dock.remove(self)
+        for signal in self.signals:
+            try:
+                signal.disconnect(self.update_timer.start)
+            except (RuntimeError, TypeError):
+                pass
+        self.closed.emit()
+        super().closeEvent(event)
+
+
 # ---------- Termine ----------
 
 STATUS_COLORS = {"confirmed": GREEN, "expected": AMBER, "speculative": "#a78bfa", "occurred": MUTED}
@@ -3836,7 +4203,12 @@ class PortfolioWindow(QWidget):
             self.base_group.addButton(button)
             self.base_buttons[code] = button
             switch_row.addWidget(button)
-        body = make_panel(self, "Portfolio", self.close, extras=[switch], pin=(ctl, "portfolio"))
+        self.tax_button = QPushButton("Steuer")
+        self.tax_button.setObjectName("segment")
+        self.tax_button.setCursor(Qt.PointingHandCursor)
+        self.tax_button.setToolTip("Steuerschätzung für deine Verkäufe")
+        self.tax_button.clicked.connect(lambda: open_tax(ctl))
+        body = make_panel(self, "Portfolio", self.close, extras=[self.tax_button, switch], pin=(ctl, "portfolio"))
         ctl.base_changed.connect(self.on_base_changed)
         self.area, content = scroll_area()
         body.addWidget(self.area, 1)
@@ -4064,6 +4436,8 @@ def restore_pinned(ctl, main):
             main.open_watchlist()
         elif kind == "news":
             open_news(ctl, open_symbol=main.open_detail)
+        elif kind == "tax":
+            open_tax(ctl)
         elif kind == "calendar" and (not symbol or symbol in ctl.symbols):
             open_calendar(ctl, symbol or None, open_symbol=main.open_detail)
         elif symbol in ctl.symbols and kind == "detail":
@@ -4154,6 +4528,7 @@ def main():
     tray_menu.addAction("Portfolio", lambda: open_portfolio(ctl, above=window))
     tray_menu.addAction("Termine", lambda: open_calendar(ctl, open_symbol=window.open_detail))
     tray_menu.addAction("News", lambda: open_news(ctl, open_symbol=window.open_detail))
+    tray_menu.addAction("Steuer", lambda: open_tax(ctl))
     tray = QSystemTrayIcon(icon, app)
     notify = lambda title, text: tray.showMessage(title, text, QSystemTrayIcon.Information, 8000)
     tray_menu.addSeparator()

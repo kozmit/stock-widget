@@ -5,7 +5,7 @@ import unittest
 from unittest import mock
 
 import pandas as pd
-from PySide6.QtWidgets import QLabel
+from PySide6.QtWidgets import QApplication, QLabel
 
 import consensus as cons
 import glossary
@@ -206,6 +206,7 @@ class DetailConsensusTests(AppTestCase):
         return self.main.details["AAPL"]
 
     def texts(self, detail):
+        QApplication.processEvents()  # neue Widgets in einem sichtbaren Fenster werden erst danach eingeblendet
         return [l.text() for l in detail.consensus_card.findChildren(QLabel) if not l.isHidden()]
 
     def test_the_card_shows_the_distribution_the_trend_and_the_quarters(self):
