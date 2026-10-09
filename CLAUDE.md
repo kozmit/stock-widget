@@ -6,13 +6,25 @@ Aktien-Widget: Taskleisten-Tool (Python 3.12, PySide6, yfinance, SQLite). UI-Tex
 
 Nach jeder Änderung am Code muss das laufende Widget neu gestartet werden, damit sie in der Taskleiste wirkt. Die laufende App ist die installierte Exe `C:\Users\Cedri\AppData\Local\StockWidget\StockWidget.exe` (Autostart mit `--tray`), nicht `dist\`. Ablauf:
 
-1. Tests: `python -m unittest discover -s tests -t .` (müssen grün sein).
+1. Tests: nur die schnelle Stufe, `python run_tests.py` (siehe Regel „Tests“). Die ganze Suite ist dafür nicht nötig.
 2. Bauen: `python -m PyInstaller --noconfirm StockWidget.spec` (Ausgabe `dist\StockWidget.exe`).
 3. Alle `StockWidget`-Prozesse beenden und etwa 5 Sekunden warten, sonst ist die Exe noch gesperrt.
 4. `dist\StockWidget.exe` über die installierte Exe kopieren und prüfen, dass beide denselben Hash haben.
 5. Mit `--tray` neu starten und prüfen, dass der Prozess läuft.
 
 Der Nutzer hat dieses Vorgehen dauerhaft freigegeben; dafür muss nicht jedes Mal gefragt werden.
+
+## Regel: Tests
+
+Die UI-Tests (`tests/test_ui.py`) machen den Großteil der Laufzeit aus. Deshalb nicht bei jeder Änderung alles laufen lassen, sondern über `run_tests.py`:
+
+- `python run_tests.py`: schnelle Stufe, alles außer `test_ui.py` (etwa 10 s). Das ist der Standard während der Arbeit und vor jedem Neubau.
+- `python run_tests.py MainWindow`: zusätzlich nur die UI-Testklassen, deren Name den Text enthält. Bei Änderungen an der Oberfläche die betroffene Klasse mitlaufen lassen.
+- `python run_tests.py all`: die ganze Suite, auf mehrere Prozesse verteilt (etwa 20 s).
+
+**Vor jedem `git push` muss einmal `python run_tests.py all` komplett grün durchlaufen.** Sonst werden nur die günstigen Tests (schnelle Stufe, gezielte UI-Klassen) ausgeführt, nie die ganze Suite „zur Sicherheit“.
+
+Neue Tests dürfen keine festen Ports, keine echte Datenbank und kein Netzwerk nutzen, damit mehrere Testläufe gleichzeitig laufen können.
 
 ## Regel: genau eine Datenbank
 
