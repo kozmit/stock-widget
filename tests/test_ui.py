@@ -948,6 +948,24 @@ class WindowTests(AppTestCase):
             self.assertTrue(wait_until(lambda: "offline" in detail.chart.note))
             self.assertIsNone(detail.chart.points)
 
+    def test_market_lamp_shows_open_extended_closed_and_hides_without_state(self):
+        card = self.main.cards["AAPL"]
+        for state, tip in (("open", "Börse geöffnet"), ("extended", "Vor- oder Nachbörse"),
+                           ("closed", "Börse geschlossen")):
+            self.ctl.quotes["AAPL"]["market_state"] = state
+            self.ctl.changed.emit()
+            self.assertEqual((card.market_state, card.lamp.toolTip()), (state, tip))
+        self.ctl.quotes["AAPL"].pop("market_state")
+        self.ctl.changed.emit()
+        self.assertIsNone(card.market_state)
+        self.assertEqual(card.lamp.toolTip(), "")
+
+    def test_market_lamp_is_off_for_a_stale_quote(self):
+        self.ctl.quotes["AAPL"]["market_state"] = "open"
+        self.ctl.quote_times["AAPL"] = dt.datetime.now() - dt.timedelta(days=3)
+        self.ctl.changed.emit()
+        self.assertIsNone(self.main.cards["AAPL"].market_state)
+
     def test_clicking_a_selected_row_deselects_it_and_closes_its_detail_window(self):
         card = self.main.cards["AAPL"]
         card.clicked.emit("AAPL")
@@ -1227,6 +1245,38 @@ class PinnedBoxTests(AppTestCase):
         self.assertEqual(set(self.main.details), {"AAPL"})
         self.assertEqual(len([x for x in w.Dock.windows if isinstance(x, w.DetailWindow)]), 1)
         self.assertEqual(w.TX_WINDOWS, {})
+
+    def test_tray_click_closes_everything_and_the_next_click_opens_only_pinned_boxes(self):
+        windows = self.open_everything()
+        windows["detail:AAPL"].pin_button.click()
+        self.assertTrue(w.widget_is_open(self.main))
+        w.toggle_widget(self.ctl, self.main)  # alles zu, angeheftet oder nicht
+        self.assertFalse(w.widget_is_open(self.main))
+        self.assertEqual((self.main.details, w.TX_WINDOWS, w.PORTFOLIO_WINDOWS), ({}, {}, {}))
+        self.assertFalse(self.main.isVisible())
+        self.assertEqual(self.ctl.pinned, ["detail:AAPL"])
+        w.toggle_widget(self.ctl, self.main)  # jetzt nur noch die angeheftete Box
+        self.assertEqual(set(self.main.details), {"AAPL"})
+        self.assertFalse(self.main.isVisible())
+        self.assertEqual((w.TX_WINDOWS, w.PORTFOLIO_WINDOWS), ({}, {}))
+        w.toggle_widget(self.ctl, self.main)
+        self.assertFalse(w.widget_is_open(self.main))
+
+    def test_pinned_watchlist_comes_back_with_the_pinned_boxes(self):
+        windows = self.open_everything()
+        windows["main"].pin_button.click()
+        w.close_widget(self.main)
+        w.open_widget(self.ctl, self.main)
+        self.assertTrue(self.main.isVisible())
+        self.assertEqual(self.main.details, {})
+
+    def test_without_any_pinned_box_opening_shows_the_watchlist(self):
+        w.open_widget(self.ctl, self.main)
+        self.assertTrue(self.main.isVisible())
+        w.close_widget(self.main)
+        self.assertFalse(self.main.isVisible())
+        w.open_widget(self.ctl, self.main)
+        self.assertTrue(self.main.isVisible())
 
     def test_closing_a_pinned_box_keeps_it_pinned(self):
         self.ctl.set_pinned("detail:AAPL", True)

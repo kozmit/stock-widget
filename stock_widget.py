@@ -834,7 +834,7 @@ def trade_dialog(ctl, symbol, mode):
 COLUMNS = (
     ("symbol", "Symbol", 70, Qt.AlignLeft),
     ("price", "Kurs", 62, Qt.AlignRight),
-    ("day", "Tag", 74, Qt.AlignRight),
+    ("day", "Tag", 92, Qt.AlignRight),  # 18 davon für die Statuslampe
     ("value", "Position", 76, Qt.AlignRight),
     ("pl", "G/V %", 74, Qt.AlignRight),
     ("amount", "G/V", 80, Qt.AlignRight),
@@ -842,6 +842,8 @@ COLUMNS = (
 )
 ROW_MARGINS = (12, 0, 12, 0)
 ROW_SPACING = 8
+MARKET_LAMPS = {"open": (GREEN, "Börse geöffnet"), "extended": (AMBER, "Vor- oder Nachbörse"),
+                "closed": (MUTED, "Börse geschlossen")}
 
 
 class StockCard(QFrame):
@@ -863,6 +865,21 @@ class StockCard(QFrame):
         for key, _, width, align in COLUMNS:
             label = QLabel()
             label.setAlignment(align | Qt.AlignVCenter)
+            if key == "day":
+                # Statuslampe der Börse links neben der Tagesveränderung
+                self.lamp = QLabel()
+                self.lamp.setFixedSize(8, 8)
+                cell = QWidget()
+                cell.setObjectName("clear")
+                cell.setFixedWidth(width)
+                inner = QHBoxLayout(cell)
+                inner.setContentsMargins(0, 0, 0, 0)
+                inner.setSpacing(10)
+                inner.addWidget(self.lamp, 0, Qt.AlignVCenter)
+                inner.addWidget(label, 1)
+                self.labels[key] = label
+                row.addWidget(cell, 0)
+                continue
             if width:
                 label.setFixedWidth(width)
             self.labels[key] = label
@@ -888,6 +905,7 @@ class StockCard(QFrame):
             self.values[key] = None
         self.price.setToolTip("")
         self.day.setToolTip("")
+        self.set_market(None, stale=False)
         self.value.setToolTip("")
         if not quote:
             return
@@ -901,6 +919,7 @@ class StockCard(QFrame):
         self.day.setText(f"{arrow(change)} {change:+.2f} %")
         self.day.setStyleSheet(f"color: {sign_color(change)}; font-weight: 600;")
         self.values["day"] = change
+        self.set_market(quote.get("market_state"), stale)
         if position:
             pl = sd.pl_percent(position, quote["price"])
             amount = sd.pl_amount(position, quote["price"])
@@ -912,6 +931,19 @@ class StockCard(QFrame):
             self.amount.setText(f"{amount:+.2f}")
             self.amount.setStyleSheet(f"color: {sign_color(amount)};")
             self.values.update(value=value, pl=pl, amount=amount)
+
+    def set_market(self, state, stale):
+        """Statuslampe: grün = Börse offen, gelb = Vor-/Nachbörse, grau = geschlossen; ohne Status oder bei
+        veraltetem Kurs aus, denn dann wüsste man nicht, ob sie noch stimmt."""
+        shown = None if stale else MARKET_LAMPS.get(state)
+        self.market_state = None if shown is None else state
+        if shown is None:
+            self.lamp.setStyleSheet("background: transparent;")
+            self.lamp.setToolTip("")
+            return
+        color, text = shown
+        self.lamp.setStyleSheet(f"background: {color}; border-radius: 4px;")
+        self.lamp.setToolTip(text)
 
     def flash(self, color):
         flash(self, color)
@@ -2052,6 +2084,33 @@ def restore_pinned(ctl, main):
             open_transactions(ctl, symbol)
 
 
+def widget_is_open(main):
+    return main.isVisible() or any(window.isVisible() for window in Dock.windows)
+
+
+def open_widget(ctl, main):
+    """Öffnet nur die angehefteten Boxen. Ist keine angeheftet, kommt die Watchlist, sonst gäbe es nichts zu sehen."""
+    restore_pinned(ctl, main)
+    if not widget_is_open(main):
+        main.show_docked()
+
+
+def close_widget(main):
+    """Schließt alle offenen Fenster des Widgets, angeheftete wie nicht angeheftete. Angeheftet bleibt angeheftet."""
+    for window in list(Dock.windows):
+        if window is not main:
+            window.close()
+    main.hide_docked()
+
+
+def toggle_widget(ctl, main):
+    """Klick aufs Symbol im Infobereich: ist etwas offen, wird alles geschlossen, sonst öffnen die angehefteten Boxen."""
+    if widget_is_open(main):
+        close_widget(main)
+    else:
+        open_widget(ctl, main)
+
+
 def close_all_windows(ctl):
     """Schließt beim Beenden alle Fenster geordnet, sonst räumt Python sie in zufälliger Reihenfolge ab."""
     for window in list(Dock.windows):
@@ -2074,24 +2133,20 @@ def main():
     window = MainWindow(ctl)
     app.aboutToQuit.connect(lambda: close_all_windows(ctl))
 
-    def open_widget():
-        window.show_docked()
-        restore_pinned(ctl, window)
-
     tray_menu = make_menu()
-    tray_menu.addAction("Öffnen", open_widget)
+    tray_menu.addAction("Öffnen", lambda: open_widget(ctl, window))
+    tray_menu.addAction("Alle Fenster schließen", lambda: close_widget(window))
     tray_menu.addAction("Portfolio", lambda: open_portfolio(ctl, window.open_detail))
     tray_menu.addAction("Beenden", app.quit)
     tray = QSystemTrayIcon(icon, app)
     tray.setToolTip("Aktien-Widget")
     tray.setContextMenu(tray_menu)
-    tray.activated.connect(lambda reason: (window.hide_docked() if window.isVisible() else open_widget())
-                           if reason == QSystemTrayIcon.Trigger else None)
+    tray.activated.connect(lambda reason: toggle_widget(ctl, window) if reason == QSystemTrayIcon.Trigger else None)
     tray.show()
 
+    # Mit --tray (Autostart) läuft das Widget nur im Infobereich; geöffnet wird erst per Klick aufs Symbol.
     if "--tray" not in sys.argv:
-        window.show_docked()
-    restore_pinned(ctl, window)  # angeheftete Boxen sind auch beim Start im Infobereich gleich da
+        open_widget(ctl, window)
     ctl.start()
     sys.exit(app.exec())
 
