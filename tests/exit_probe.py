@@ -22,6 +22,15 @@ sd.fetch_events = lambda symbol: []
 sd.fetch_news = lambda symbol, count=15: []
 sd.fetch_daily_closes = lambda symbol, start: {start: 100.0}
 
+
+def no_terms(symbol):
+    raise ValueError("keine Stammdaten")  # weder Netzwerk noch die Claude-CLI starten
+
+
+import keywords as kw
+
+kw.collect = no_terms
+
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication
 

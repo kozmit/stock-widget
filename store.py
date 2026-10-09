@@ -102,6 +102,18 @@ CREATE TABLE IF NOT EXISTS events (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS fundamentals (
+    symbol TEXT PRIMARY KEY,
+    data TEXT NOT NULL,
+    source TEXT NOT NULL,
+    fetched_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS search_terms (
+    symbol TEXT PRIMARY KEY,
+    terms TEXT NOT NULL,
+    source TEXT NOT NULL,
+    fetched_at TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS events_symbol ON events (symbol);
 CREATE UNIQUE INDEX IF NOT EXISTS events_external ON events (source, symbol, external_id) WHERE external_id IS NOT NULL;
 """
@@ -110,7 +122,9 @@ CREATE UNIQUE INDEX IF NOT EXISTS events_external ON events (source, symbol, ext
 # 4: Transaktionen kennen ihre Herkunft (manual, opening, etoro, ...) und die Kennung beim Anbieter;
 #    dazu Tageskurse der Aktien (für den Verlauf), Kürzel-Zuordnungen und der Stand der Synchronisation.
 # 5: Termine (Ereigniskalender) mit Art, Zeitraum, Status, Quelle und Relevanz.
-SCHEMA_VERSION = "5"
+# 6: Kennzahlen (Fundamentaldaten) je Aktie mit Quelle und Zeitpunkt des Abrufs.
+# 7: Suchbegriffe je Aktie (zum Filtern der News) mit Quelle und Zeitpunkt.
+SCHEMA_VERSION = "7"
 EVENT_FIELDS = ("symbol", "kind", "title", "day", "end", "precision", "status", "relevance", "note", "source_url")
 INSTRUMENT_FIELDS = ("name", "exchange", "currency", "sector", "industry", "country", "isin")
 DEFAULT_SYMBOLS = ["AAPL", "MSFT", "DELL"]
@@ -248,6 +262,43 @@ class Store:
             "FROM instruments")
         return {r[0]: {**dict(zip(INSTRUMENT_FIELDS, r[1:8])), "source": r[8],
                        "fetched_at": dt.datetime.fromisoformat(r[9])} for r in rows}
+
+    # -- Kennzahlen (Fundamentaldaten) --
+    def save_fundamentals(self, symbol, data, source, fetched_at):
+        self.db.execute("INSERT OR REPLACE INTO fundamentals VALUES (?, ?, ?, ?)",
+                        (symbol, json.dumps(data), source, fetched_at.isoformat(timespec="seconds")))
+        self.db.commit()
+
+    def fundamentals(self):
+        """{Kürzel: {"data": Kennzahlen, "source": Quelle, "fetched_at": Zeitpunkt}}."""
+        found = {}
+        for symbol, data, source, fetched_at in self.db.execute(
+                "SELECT symbol, data, source, fetched_at FROM fundamentals"):
+            try:
+                found[symbol] = {"data": json.loads(data), "source": source,
+                                 "fetched_at": dt.datetime.fromisoformat(fetched_at)}
+            except ValueError:
+                continue  # beschädigter Eintrag: wird beim nächsten Abruf ersetzt
+        return found
+
+    # -- Suchbegriffe (News-Filter) --
+    def save_search_terms(self, symbol, terms, source, fetched_at):
+        self.db.execute("INSERT OR REPLACE INTO search_terms VALUES (?, ?, ?, ?)",
+                        (symbol, json.dumps(terms, ensure_ascii=False), source,
+                         fetched_at.isoformat(timespec="seconds")))
+        self.db.commit()
+
+    def search_terms(self):
+        """{Kürzel: {"terms": [Begriffe], "source": Quelle, "fetched_at": Zeitpunkt}}."""
+        found = {}
+        for symbol, terms, source, fetched_at in self.db.execute(
+                "SELECT symbol, terms, source, fetched_at FROM search_terms"):
+            try:
+                found[symbol] = {"terms": [t for t in json.loads(terms) if isinstance(t, str)], "source": source,
+                                 "fetched_at": dt.datetime.fromisoformat(fetched_at)}
+            except (ValueError, TypeError):
+                continue  # beschädigter Eintrag: wird beim nächsten Abruf ersetzt
+        return found
 
     # -- Tageskurse der Aktien (für den Verlauf des Portfolios) --
     def save_closes(self, symbol, closes, source):

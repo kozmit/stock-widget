@@ -2249,6 +2249,119 @@ class CalendarWindowTests(AppTestCase):
         self.assertEqual(self.main.calendar_button.toolTip(), "Termine der nächsten Tage")
 
 
+class DetailFundamentalsTests(AppTestCase):
+    """Die Karte „Kennzahlen“ im Detailfenster."""
+
+    def setUp(self):
+        super().setUp()
+        self.main = w.MainWindow(self.ctl)
+        self.served = {"values": None}
+
+    def serve(self, **overrides):
+        import fundamentals
+        from tests.test_fundamentals import info
+        patcher = mock.patch.object(sd, "fetch_fundamentals", lambda s: fundamentals.from_info(info(**overrides)))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def detail(self, symbol="AAPL"):
+        self.main.open_detail(symbol)
+        return self.main.details[symbol]
+
+    def texts_of(self, detail):
+        return [label.text() for label in detail.fundamentals_card.findChildren(QLabel)]
+
+    def test_the_card_says_loading_until_values_arrive(self):
+        detail = self.detail()
+        self.assertIn("Wird geladen …", self.texts_of(detail) + [detail.fundamentals_status.text()])
+
+    def test_loaded_values_are_shown_grouped_with_labels_and_figures(self):
+        self.serve()
+        detail = self.detail()
+        self.assertTrue(wait_until(lambda: "30.50" in self.texts_of(detail)))
+        texts = self.texts_of(detail)
+        for expected in ("BEWERTUNG", "RENTABILITÄT", "KGV", "Bruttomarge", "46.0 %", "400.00 Mrd. USD", "150 %"):
+            self.assertIn(expected, texts)
+        self.assertTrue(detail.fundamentals_status.isHidden())
+
+    def test_every_label_explains_itself(self):
+        self.serve()
+        detail = self.detail()
+        self.assertTrue(wait_until(lambda: "30.50" in self.texts_of(detail)))
+        labels = {l.text(): l for l in detail.fundamentals_card.findChildren(QLabel)}
+        self.assertEqual(labels["KGV"]._term_anchor.key, "kgv")
+        self.assertEqual(labels["Beta"]._term_anchor.key, "beta")
+        self.assertEqual(labels["Verschuldungsgrad"]._term_anchor.key, "verschuldungsgrad")
+
+    def test_the_note_names_source_and_time(self):
+        self.serve()
+        detail = self.detail()
+        self.assertTrue(wait_until(lambda: not detail.fundamentals_note.isHidden()))
+        self.assertIn("Quelle: Yahoo Finance.", detail.fundamentals_note.text())
+        self.assertIn(f"Stand {dt.date.today():%d.%m.%Y}", detail.fundamentals_note.text())
+
+    def test_a_loss_is_called_negative_and_a_missing_value_is_a_dash(self):
+        self.serve(trailingPE=-5.0, forwardPE=None)
+        detail = self.detail()
+        self.assertTrue(wait_until(lambda: "negativ" in self.texts_of(detail)))
+        self.assertIn("–", self.texts_of(detail))
+
+    def test_negative_profit_is_red_and_positive_green(self):
+        self.serve(profitMargins=-0.1, operatingMargins=0.3)
+        detail = self.detail()
+        self.assertTrue(wait_until(lambda: "-10.0 %" in self.texts_of(detail)))
+        colors = {l.text(): l.styleSheet() for l in detail.fundamentals_card.findChildren(QLabel)}
+        self.assertIn(w.RED, colors["-10.0 %"])
+        self.assertIn(w.GREEN, colors["30.0 %"])
+
+    def test_without_figures_the_reason_is_shown(self):
+        detail = self.detail()  # Vorgabe der Tests: Yahoo nennt keine Kennzahlen
+        self.assertTrue(wait_until(lambda: "keine Kennzahlen" in detail.fundamentals_status.text()))
+        self.assertFalse(detail.fundamentals_status.isHidden())
+        self.assertTrue(detail.fundamentals_note.isHidden())
+
+    def test_stored_values_show_at_once_with_their_old_time(self):
+        self.serve()
+        self.ctl.load_fundamentals("AAPL")
+        self.assertTrue(wait_until(lambda: "AAPL" in self.ctl.fundamentals))
+        self.ctl.fundamentals["AAPL"]["fetched_at"] = dt.datetime.now() - dt.timedelta(days=10)
+        mock.patch.object(sd, "fetch_fundamentals", mock.Mock(side_effect=ValueError("offline"))).start()
+        self.addCleanup(mock.patch.stopall)
+        detail = self.detail()
+        self.assertIn("30.50", self.texts_of(detail))
+        self.assertTrue(wait_until(lambda: "Aktualisierung fehlgeschlagen: offline" in detail.fundamentals_note.text()))
+        self.assertTrue(detail.fundamentals_note.text().startswith("Veraltet"))
+        self.assertIn(w.AMBER, detail.fundamentals_note.styleSheet())
+        self.assertIn("30.50", self.texts_of(detail))
+
+    def test_a_later_load_updates_an_open_window(self):
+        detail = self.detail()
+        self.assertTrue(wait_until(lambda: "AAPL" in self.ctl.fundamentals_errors))
+        self.serve(trailingPE=12.0)
+        self.ctl.load_fundamentals("AAPL", force=True)
+        self.assertTrue(wait_until(lambda: "12.00" in self.texts_of(detail)))
+        self.assertTrue(detail.fundamentals_status.isHidden())
+
+    def test_only_the_window_of_that_stock_reacts(self):
+        detail = self.detail("AAPL")
+        calls = []
+        detail.refresh_fundamentals = lambda: calls.append(1)
+        detail.on_fundamentals("MSFT")
+        self.assertEqual(calls, [])
+        detail.on_fundamentals("AAPL")
+        self.assertEqual(calls, [1])
+
+    def test_a_closed_window_is_disconnected(self):
+        detail = self.detail()
+        detail.close()
+        self.ctl.fundamentals_changed.emit("AAPL")  # darf nichts mehr aufrufen
+
+    def test_the_card_has_a_term_for_its_title(self):
+        detail = self.detail()
+        captions = [l for l in detail.fundamentals_card.findChildren(QLabel) if l.text() == "KENNZAHLEN"]
+        self.assertEqual(captions[0]._term_anchor.key, "kennzahlen")
+
+
 class DetailEventsTests(AppTestCase):
     def setUp(self):
         super().setUp()
@@ -2473,7 +2586,7 @@ class WindowTests(AppTestCase):
 
     def test_detail_loads_events_and_news_in_the_background(self):
         events = [(TODAY + dt.timedelta(days=7), "Quartalszahlen")]
-        news = [("Schlagzeile", "Quelle", dt.datetime(2026, 10, 8, 9, 0), "https://x/1")]
+        news = [("AAPL Schlagzeile", "Quelle", dt.datetime(2026, 10, 8, 9, 0), "https://x/1")]
         with mock.patch.object(sd, "fetch_events", lambda s: events), \
                 mock.patch.object(sd, "fetch_news", lambda s, count=15: news):
             self.main.open_detail("AAPL")
@@ -2482,6 +2595,32 @@ class WindowTests(AppTestCase):
             self.assertIn("in 7 Tagen", detail.event_when.text())
             self.assertTrue(wait_until(lambda: any(
                 "Schlagzeile" in t for t in texts(detail))))
+
+    def test_detail_hides_news_that_do_not_fit_the_stock_and_shows_more_once_terms_arrive(self):
+        stamp = dt.datetime(2026, 10, 8, 9, 0)
+        news = [("3 Overrated Stocks We Think Twice About", "Q", stamp, "https://x/1"),
+                ("Neues Spiel von Rockstar angekündigt", "Q", stamp, "https://x/2"),
+                ("Reddit (RDDT) legt zu", "Q", stamp, "https://x/3")]
+        self.ctl.instruments["AAPL"] = {"name": "Reddit, Inc.", "source": "Test", "fetched_at": dt.datetime.now()}
+        with mock.patch.object(sd, "fetch_news", lambda s, count=15: news):
+            self.main.open_detail("AAPL")
+            detail = self.main.details["AAPL"]
+            self.assertTrue(wait_until(lambda: any("Reddit" in t for t in texts(detail))))
+        self.assertEqual(len(detail.findChildren(w.NewsCard)), 1)  # ohne gesammelte Begriffe gilt nur der Firmenname
+        self.assertFalse(any("Overrated" in t or "Rockstar" in t for t in texts(detail)))
+        self.ctl.terms["AAPL"] = {"terms": ["Reddit", "Rockstar"], "source": "Test", "fetched_at": dt.datetime.now()}
+        self.ctl.terms_changed.emit("AAPL")
+        self.assertEqual(len(detail.findChildren(w.NewsCard)), 2)
+        self.assertTrue(any("Rockstar" in t for t in texts(detail)))
+        self.assertFalse(any("Overrated" in t for t in texts(detail)))  # aussortierte News verschwinden ganz
+
+    def test_detail_says_so_when_no_news_fit(self):
+        news = [("Ganz anderes Thema", "Q", dt.datetime(2026, 10, 8, 9, 0), "https://x/1")]
+        with mock.patch.object(sd, "fetch_news", lambda s, count=15: news):
+            self.main.open_detail("AAPL")
+            detail = self.main.details["AAPL"]
+            self.assertTrue(wait_until(lambda: any("Keine News gefunden" in t for t in texts(detail))))
+        self.assertEqual(detail.findChildren(w.NewsCard), [])
 
     def test_detail_chart_defaults_to_six_months_and_switches_range(self):
         calls = []
@@ -2564,7 +2703,7 @@ class WindowTests(AppTestCase):
         self.assertTrue(other.property("open"))
 
     def test_detail_scrolls_as_a_whole_with_news_inside_it(self):
-        news = [("Schlagzeile", "Quelle", dt.datetime(2026, 10, 8, 9, 0), "https://x/1")]
+        news = [("AAPL Schlagzeile", "Quelle", dt.datetime(2026, 10, 8, 9, 0), "https://x/1")]
         with mock.patch.object(sd, "fetch_news", lambda s, count=15: news):
             self.main.open_detail("AAPL")
             detail = self.main.details["AAPL"]

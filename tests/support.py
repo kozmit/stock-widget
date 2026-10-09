@@ -14,6 +14,7 @@ from PySide6.QtCore import QTimer
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
+import keywords as kw
 import stock_data as sd
 import stock_widget as w
 
@@ -112,6 +113,16 @@ class DialogDriver:
             raise self.errors[0]
 
 
+def fake_fundamentals(symbol):
+    """Ohne eigene Vorgabe liefert Yahoo im Test keine Kennzahlen (wie bei ETFs)."""
+    raise ValueError("Yahoo nennt für diesen Wert keine Kennzahlen")
+
+
+def fake_terms(symbol):
+    """Ohne eigene Vorgabe sammeln die Tests keine Suchbegriffe: weder Netzwerk noch die Claude-CLI."""
+    raise ValueError("keine Stammdaten")
+
+
 class AppTestCase(unittest.TestCase):
     """Controller mit temporärer Datenbank. Ohne start(), also ohne Netzwerk; Kurse setzen die Tests selbst."""
     legacy = None  # Inhalt der alten watchlist.json (Liste oder dict), falls vorhanden
@@ -125,7 +136,7 @@ class AppTestCase(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
         for name, fake in (("fetch_quote", fake_quote), ("fetch_events", lambda s: []),
-                           ("fetch_targets", lambda s: None),
+                           ("fetch_targets", lambda s: None), ("fetch_fundamentals", fake_fundamentals),
                            ("fetch_news", lambda s, count=15: []), ("search_symbols", lambda q, count=8: []),
                            ("fetch_instrument", fake_instrument), ("fetch_history", fake_history), ("fetch_fx_rate", fake_fx_rate),
                            ("fetch_daily_closes", fake_daily_closes),
@@ -133,6 +144,9 @@ class AppTestCase(unittest.TestCase):
             patcher = mock.patch.object(sd, name, fake)
             patcher.start()
             self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(kw, "collect", fake_terms)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         if self.legacy is not None:
             with open(sd.LEGACY_FILE, "w", encoding="utf-8") as f:
                 json.dump(self.legacy, f)

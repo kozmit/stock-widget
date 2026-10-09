@@ -24,6 +24,8 @@ import ledger
 import portfolio
 import etoro
 import events as evt
+import fundamentals as fund
+import keywords as kw
 import sources
 import stock_data as sd
 import fx as fx_module
@@ -34,6 +36,8 @@ from store import Store
 REFRESH_SECONDS = 60
 STALE_SECONDS = 3 * REFRESH_SECONDS          # so lange gilt ein Kurs ohne neuen Abruf als aktuell
 INSTRUMENT_MAX_AGE = dt.timedelta(days=7)    # danach werden die Stammdaten neu geladen
+NEWS_FETCH_COUNT = 40                        # so viele News werden geholt; der Filter lässt davon nur einen Teil übrig
+NOT_LOADED = object()                        # Marke: die News einer Aktie sind noch nicht angekommen
 
 BG, SURFACE, SURFACE2 = "#14161c", "#1d2029", "#272b39"
 TEXT, MUTED, ACCENT = "#eceef4", "#8a90a6", "#6c8cff"
@@ -322,6 +326,18 @@ def sign_color(value):
 
 def arrow(value):
     return "▲" if value >= 0 else "▼"
+
+
+def clear_layout(layout):
+    """Entfernt alle Einträge eines Layouts samt der Widgets darin (auch aus verschachtelten Layouts)."""
+    while layout.count():
+        item = layout.takeAt(0)
+        if item.widget():
+            item.widget().hide()
+            item.widget().setParent(None)
+            item.widget().deleteLater()
+        elif item.layout():
+            clear_layout(item.layout())
 
 
 def scroll_area():
@@ -644,6 +660,8 @@ class Controller(QObject):
     history_changed = Signal()  # neue Tageskurse oder Importe: Verlaufsdiagramme neu zeichnen
     base_changed = Signal(str)  # die Basiswährung wurde umgestellt (EUR oder USD)
     calendar_changed = Signal()  # Termine wurden angelegt, geändert, gelöscht oder von Yahoo aktualisiert
+    fundamentals_changed = Signal(str)  # Kennzahlen einer Aktie wurden geladen (oder der Abruf schlug fehl)
+    terms_changed = Signal(str)  # die Suchbegriffe einer Aktie (News-Filter) wurden gesammelt
     trade_recorded = Signal(str, str)  # Symbol, "buy" oder "sell"
     status = Signal(str)
     _result = Signal(object, object, object, object)
@@ -663,6 +681,10 @@ class Controller(QObject):
         self.reload_ledger()
         self.quote_times, self.quote_errors, self.instruments = {}, {}, {}
         self.instrument_tried = set()  # Stammdaten werden je Start höchstens einmal je Aktie versucht
+        self.fundamentals = self.store.fundamentals()  # Kennzahlen je Aktie: {"data", "source", "fetched_at"}
+        self.fundamentals_errors, self.fundamentals_loading = {}, set()
+        self.terms = self.store.search_terms()  # Suchbegriffe je Aktie: {"terms", "source", "fetched_at"}
+        self.terms_loading = set()
         self.load_persisted()
         self.fx = FxTable(self.store.fx_rates(), self.store.fx_latest())
         self.fx_history_tried = set()  # Historie wird je Start und Währung einmal nachgeladen
@@ -671,6 +693,7 @@ class Controller(QObject):
         self.sources = {}  # Anbindungen für Transaktionen von außen: Name -> sources.TransactionSource
         self.load_etoro()
         self.pool = ThreadPoolExecutor(max_workers=6)
+        self.slow_pool = ThreadPoolExecutor(max_workers=1)  # das Sprachmodell braucht Sekunden: eine Aktie nach der anderen
         self.closed = False
         self._result.connect(self._deliver)
         self.timer = QTimer(self)
@@ -766,18 +789,19 @@ class Controller(QObject):
             self.pinned.remove(key)
         self.store.set_meta(self.PINS_KEY, json.dumps(self.pinned))
 
-    def run(self, work, done, fail=None):
+    def run(self, work, done, fail=None, pool=None):
         def task():
             try:
                 self._result.emit(done, work(), None, fail)
             except Exception as exc:
                 self._result.emit(done, None, exc, fail)
-        self.pool.submit(task)
+        (pool or self.pool).submit(task)
 
     def shutdown(self):
         """Beendet die Netzwerkarbeit; später eintreffende Ergebnisse werden verworfen."""
         self.closed = True
         self.pool.shutdown(wait=False, cancel_futures=True)
+        self.slow_pool.shutdown(wait=False, cancel_futures=True)
 
     def _deliver(self, done, value, error, fail):
         if self.closed:
@@ -922,6 +946,30 @@ class Controller(QObject):
                 self.load_events(symbol)
             if self.needs_instrument(symbol):
                 self.load_instrument(symbol)
+            self.load_terms(symbol)
+
+    def load_terms(self, symbol):
+        """Sammelt die Suchbegriffe, wenn sie fehlen oder veraltet sind. Ein Fehlschlag wird je Start nicht
+        wiederholt; die gespeicherten Begriffe bleiben dann stehen."""
+        if symbol in self.terms_loading or not kw.needs_refresh(self.terms.get(symbol)):
+            return False
+        self.terms_loading.add(symbol)  # bleibt auch nach dem Abruf drin: je Start höchstens ein Versuch je Aktie
+
+        def done(found):
+            if symbol in self.symbols:
+                now = dt.datetime.now().replace(microsecond=0)
+                self.store.save_search_terms(symbol, found["terms"], found["source"], now)
+                self.terms[symbol] = {**found, "fetched_at": now}
+                self.terms_changed.emit(symbol)
+        self.run(lambda: kw.collect(symbol), done, pool=self.slow_pool)
+        return True
+
+    def news_terms(self, symbol):
+        """Begriffe, nach denen die News einer Aktie gefiltert werden: die gesammelten, sonst der Firmenname."""
+        entry = self.terms.get(symbol)
+        if entry and entry["terms"]:
+            return entry["terms"]
+        return kw.name_terms((self.instruments.get(symbol) or {}).get("name"))
 
     def load_quote(self, symbol):
         def done(quote):
@@ -975,6 +1023,32 @@ class Controller(QObject):
                 self.instruments[symbol] = {**info, "fetched_at": now}
                 self.changed.emit()
         self.run(lambda: sd.fetch_instrument(symbol), done)
+
+    def load_fundamentals(self, symbol, force=False):
+        """Lädt die Kennzahlen, wenn sie fehlen oder älter als fundamentals.MAX_AGE sind (oder mit force).
+        Schlägt der Abruf fehl, bleiben die gespeicherten Kennzahlen mit ihrem alten Stand stehen."""
+        entry = self.fundamentals.get(symbol)
+        if symbol in self.fundamentals_loading or not (
+                force or entry is None or fund.needs_refresh(entry["fetched_at"])):
+            return False
+        self.fundamentals_loading.add(symbol)
+
+        def done(data):
+            self.fundamentals_loading.discard(symbol)
+            if symbol in self.symbols:
+                now = dt.datetime.now().replace(microsecond=0)
+                self.store.save_fundamentals(symbol, data, sd.SOURCE, now)
+                self.fundamentals[symbol] = {"data": data, "source": sd.SOURCE, "fetched_at": now}
+                self.fundamentals_errors.pop(symbol, None)
+                self.fundamentals_changed.emit(symbol)
+
+        def failed(exc):
+            self.fundamentals_loading.discard(symbol)
+            self.fundamentals_errors[symbol] = str(exc)
+            if symbol in self.symbols:
+                self.fundamentals_changed.emit(symbol)
+        self.run(lambda: sd.fetch_fundamentals(symbol), done, failed)
+        return True
 
     def load_events(self, symbol):
         def done(events):
@@ -1118,8 +1192,10 @@ class Controller(QObject):
         """Nimmt die Aktie aus der Watchlist. Ihre Transaktionen bleiben gespeichert."""
         self.store.remove_symbol(symbol)
         self.symbols = self.store.symbols()
-        for cache in (self.quotes, self.events, self.quote_times, self.quote_errors, self.instruments):
+        for cache in (self.quotes, self.events, self.quote_times, self.quote_errors, self.instruments,
+                      self.fundamentals, self.fundamentals_errors, self.terms):
             cache.pop(symbol, None)
+        self.terms_loading.discard(symbol)
         for key in (f"detail:{symbol}", f"tx:{symbol}"):
             self.set_pinned(key, False)
         self._ledger_changed()
@@ -2291,6 +2367,27 @@ class DetailWindow(QWidget):
         column.addWidget(self.target_range)
         body.addWidget(targets_card)
 
+        # Kennzahlen (Fundamentaldaten)
+        self.fundamentals_card = fundamentals_card = QFrame()
+        fundamentals_card.setObjectName("plain")
+        column = QVBoxLayout(fundamentals_card)
+        column.setContentsMargins(16, 14, 16, 14)
+        column.setSpacing(6)
+        column.addWidget(explain(caption_label("Kennzahlen"), "kennzahlen"))
+        self.fundamentals_status = QLabel("Wird geladen …")
+        self.fundamentals_status.setWordWrap(True)
+        self.fundamentals_status.setStyleSheet(f"color: {MUTED};")
+        column.addWidget(self.fundamentals_status)
+        self.fundamentals_body = QVBoxLayout()
+        self.fundamentals_body.setSpacing(4)
+        column.addLayout(self.fundamentals_body)
+        self.fundamentals_note = QLabel()
+        self.fundamentals_note.setWordWrap(True)
+        self.fundamentals_note.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        self.fundamentals_note.hide()
+        column.addWidget(self.fundamentals_note)
+        body.addWidget(fundamentals_card)
+
         # Historie
         history_card = QFrame()
         history_card.setObjectName("plain")
@@ -2367,14 +2464,19 @@ class DetailWindow(QWidget):
         ctl.trade_recorded.connect(self.on_trade)
         ctl.ledger_changed.connect(self.refresh_history)
         ctl.calendar_changed.connect(self.refresh_events)
+        ctl.fundamentals_changed.connect(self.on_fundamentals)
+        ctl.terms_changed.connect(self.on_terms)
+        self.fetched_news, self.news_error = NOT_LOADED, None
         self.refresh_history()
         self.refresh_events()
+        self.refresh_fundamentals()
         self.fresh_timer = QTimer(self)
         self.fresh_timer.timeout.connect(self.refresh_view)
         self.fresh_timer.start(15_000)
         self.refresh_view()
         ctl.run(self.load, self.show_loaded)
         ctl.run(lambda: sd.fetch_targets(symbol), self.show_targets, lambda exc: self.show_targets(None, exc))
+        ctl.load_fundamentals(symbol)
         self.load_history(self.range_key)
 
     def load_history(self, key):
@@ -2502,7 +2604,7 @@ class DetailWindow(QWidget):
         except Exception as exc:
             error = exc
         try:
-            news = sd.fetch_news(self.symbol)
+            news = sd.fetch_news(self.symbol, count=NEWS_FETCH_COUNT)
         except Exception as exc:
             error = error or exc
         return events, news, error
@@ -2537,6 +2639,63 @@ class DetailWindow(QWidget):
         self.target_range.setText(" · ".join(parts))
         self.targets_card.setToolTip("Schätzungen einzelner Analysten (Quelle: Yahoo Finance), keine Prognose. "
                                      "Wenige Analysten machen den Durchschnitt unsicher.")
+
+    def on_fundamentals(self, symbol):
+        if symbol == self.symbol:
+            self.refresh_fundamentals()
+
+    def refresh_fundamentals(self):
+        """Die Karte „Kennzahlen“: gespeicherte Werte gruppiert, darunter Quelle, Stand und Hinweise.
+        Fehlt jede Angabe, steht der Grund da; schlug nur die Aktualisierung fehl, bleiben die alten Werte stehen."""
+        if not self.alive:
+            return
+        while self.fundamentals_body.count():
+            item = self.fundamentals_body.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.hide()
+                widget.setParent(None)
+                widget.deleteLater()
+            elif item.layout():
+                clear_layout(item.layout())
+        entry = self.ctl.fundamentals.get(self.symbol)
+        error = self.ctl.fundamentals_errors.get(self.symbol)
+        if not entry:
+            self.fundamentals_note.hide()
+            if error:
+                self.fundamentals_status.setText(f"Keine Kennzahlen: {error}")
+            else:
+                self.fundamentals_status.setText("Wird geladen …")
+            self.fundamentals_status.show()
+            return
+        self.fundamentals_status.hide()
+        data = entry["data"]
+        for group, lines in fund.groups(data):
+            title = QLabel(group.upper())
+            title.setStyleSheet(f"color: {MUTED}; font-size: 10px; font-weight: 700; letter-spacing: 1px; "
+                                "margin-top: 6px;")
+            self.fundamentals_body.addWidget(title)
+            grid = QGridLayout()
+            grid.setHorizontalSpacing(10)
+            grid.setVerticalSpacing(3)
+            grid.setColumnStretch(0, 1)
+            for row, (metric, text, tone) in enumerate(lines):
+                label = explain(QLabel(metric.label), metric.term)
+                label.setStyleSheet(f"color: {MUTED}; font-size: 12px;")
+                value = QLabel(text)
+                color = {"good": GREEN, "bad": RED}.get(tone, TEXT if text not in ("–", "negativ") else MUTED)
+                value.setStyleSheet(f"color: {color}; font-size: 12px; font-weight: 600;")
+                value.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                grid.addWidget(label, row, 0)
+                grid.addWidget(value, row, 1)
+            self.fundamentals_body.addLayout(grid)
+        note = fund.age_note(data, entry["fetched_at"])
+        if error:
+            note += f" Aktualisierung fehlgeschlagen: {error}"
+        stale = fund.is_stale(entry["fetched_at"]) or bool(error)
+        self.fundamentals_note.setText(note)
+        self.fundamentals_note.setStyleSheet(f"color: {AMBER if stale else MUTED}; font-size: 11px;")
+        self.fundamentals_note.show()
 
     def refresh_events(self):
         """Der nächste Termin groß, die folgenden darunter, jeweils mit Status und Quelle (aus dem Kalender)."""
@@ -2582,19 +2741,41 @@ class DetailWindow(QWidget):
             self.ctl.apply_fetched_events(self.symbol, events)
             self.ctl.changed.emit()
         self.refresh_events()
+        self.fetched_news, self.news_error = news, error
+        self.render_news()
+
+    def render_news(self):
+        """Zeigt die geladenen News, aber nur die, deren Titel zur Aktie passt (siehe keywords.filter_news).
+        Kommen später Suchbegriffe an, wird neu gezeichnet; aussortierte News sind nicht sichtbar."""
+        if not self.alive or self.fetched_news is NOT_LOADED:
+            return
+        while self.news.count() > 1:  # das letzte Element ist der Abstandshalter
+            item = self.news.takeAt(0)
+            if item.widget():
+                item.widget().setParent(None)
+                item.widget().deleteLater()
+        news = self.fetched_news
+        if news is not None:
+            news = kw.filter_news(news, self.symbol, self.ctl.news_terms(self.symbol))
         if not news:
-            note = QLabel("Keine News gefunden." if news is not None else f"News nicht ladbar: {error}")
+            note = QLabel("Keine News gefunden." if news is not None else f"News nicht ladbar: {self.news_error}")
             note.setStyleSheet(f"color: {MUTED};")
             self.news.insertWidget(0, note)
         for title, source, published, link in news or []:
             self.news.insertWidget(self.news.count() - 1, NewsCard(title, source, published, link))
+
+    def on_terms(self, symbol):
+        if symbol == self.symbol:
+            self.render_news()
 
     def closeEvent(self, event):
         Dock.remove(self)
         self.alive = False
         for signal, slot in ((self.ctl.changed, self.refresh_view), (self.ctl.trade_recorded, self.on_trade),
                              (self.ctl.ledger_changed, self.refresh_history),
-                             (self.ctl.calendar_changed, self.refresh_events)):
+                             (self.ctl.calendar_changed, self.refresh_events),
+                             (self.ctl.fundamentals_changed, self.on_fundamentals),
+                             (self.ctl.terms_changed, self.on_terms)):
             try:
                 signal.disconnect(slot)
             except (RuntimeError, TypeError):

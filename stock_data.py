@@ -9,6 +9,8 @@ import zoneinfo
 
 import yfinance as yf
 
+import fundamentals
+
 # Fester Ordner im Benutzerprofil, bewusst nicht unter AppData: Programme aus der Claude-App sehen AppData
 # umgeleitet, ein per Autostart gestartetes Widget das echte. Nur so gibt es genau eine Datenbank.
 DATA_DIR = os.environ.get("STOCKWIDGET_DATA") or os.path.join(os.path.expanduser("~"), "StockWidget")
@@ -179,6 +181,16 @@ def fetch_targets(symbol):
     return {"mean": float(mean), "high": info.get("targetHighPrice"), "low": info.get("targetLowPrice"),
             "count": info.get("numberOfAnalystOpinions"),
             "currency": info.get("financialCurrency") or info.get("currency") or ""}
+
+
+def fetch_fundamentals(symbol):
+    """Kennzahlen einer Aktie laut Yahoo (siehe fundamentals.from_info). ValueError, wenn Yahoo keine nennt:
+    ETFs, Rohstoffe und kleine Werte haben meist keine, das ist kein Fehler der Verbindung."""
+    info = yf.Ticker(symbol).info or {}
+    data = fundamentals.from_info(info)
+    if fundamentals.is_empty(data):
+        raise ValueError("Yahoo nennt für diesen Wert keine Kennzahlen")
+    return data
 
 
 def _to_date(value):
