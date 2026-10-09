@@ -993,7 +993,7 @@ class MainWindow(QWidget):
         self.portfolio_button.clicked.connect(lambda: open_portfolio(self.ctl, self.open_detail))
 
         body = make_panel(self, "Watchlist", self.hide_docked,
-                          extras=[self.portfolio_button, self.add_button, self.pin], pin=(ctl, "main"))
+                          extras=[self.portfolio_button, self.add_button, self.pin])
 
         self.header = QWidget()
         header = QHBoxLayout(self.header)
@@ -2071,12 +2071,10 @@ def claim_single_instance(port=LOCK_PORT):
 
 
 def restore_pinned(ctl, main):
-    """Öffnet alle angehefteten Boxen, die gerade nicht offen sind; die Watchlist zuerst, damit sie rechts sitzt."""
-    for key in sorted(ctl.pinned, key=lambda k: k != "main"):
+    """Öffnet alle angehefteten Boxen, die gerade nicht offen sind. Die Watchlist ist nie angeheftet, sie öffnet immer."""
+    for key in ctl.pinned:
         kind, _, symbol = key.partition(":")
-        if kind == "main":
-            main.show_docked()
-        elif kind == "portfolio":
+        if kind == "portfolio":
             open_portfolio(ctl, main.open_detail)
         elif symbol in ctl.symbols and kind == "detail":
             main.open_detail(symbol)
@@ -2089,10 +2087,9 @@ def widget_is_open(main):
 
 
 def open_widget(ctl, main):
-    """Öffnet nur die angehefteten Boxen. Ist keine angeheftet, kommt die Watchlist, sonst gäbe es nichts zu sehen."""
+    """Öffnet die Watchlist, die immer dabei ist, und dazu die angehefteten Boxen; mehr nicht."""
+    main.show_docked()
     restore_pinned(ctl, main)
-    if not widget_is_open(main):
-        main.show_docked()
 
 
 def close_widget(main):

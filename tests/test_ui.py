@@ -1196,13 +1196,16 @@ class PinnedBoxTests(AppTestCase):
         self.main.open_detail("AAPL")
         w.open_transactions(self.ctl, "AAPL")
         w.open_portfolio(self.ctl, self.main.open_detail)
-        return {"main": self.main, "detail:AAPL": self.main.details["AAPL"], "tx:AAPL": w.TX_WINDOWS["AAPL"],
+        return {"detail:AAPL": self.main.details["AAPL"], "tx:AAPL": w.TX_WINDOWS["AAPL"],
                 "portfolio": w.PORTFOLIO_WINDOWS["window"]}
 
     def test_every_box_has_a_pin_button_that_starts_unpinned(self):
         for key, window in self.open_everything().items():
             self.assertFalse(window.pin_button.isChecked(), key)
             self.assertIn("Anheften", window.pin_button.toolTip())
+
+    def test_the_watchlist_has_no_pin_button(self):
+        self.assertFalse(hasattr(self.main, "pin_button"))
 
     def test_pin_button_sits_right_before_the_close_button(self):
         self.main.open_detail("AAPL")
@@ -1229,10 +1232,9 @@ class PinnedBoxTests(AppTestCase):
         self.assertTrue(self.main.details["AAPL"].pin_button.isChecked())
 
     def test_restore_opens_all_pinned_boxes_and_nothing_else(self):
-        for key in ("main", "detail:AAPL", "tx:MSFT", "portfolio"):
+        for key in ("detail:AAPL", "tx:MSFT", "portfolio"):
             self.ctl.set_pinned(key, True)
         w.restore_pinned(self.ctl, self.main)
-        self.assertTrue(self.main.isVisible())
         self.assertEqual(set(self.main.details), {"AAPL"})
         self.assertEqual(set(w.TX_WINDOWS), {"MSFT"})
         self.assertIn("window", w.PORTFOLIO_WINDOWS)
@@ -1246,37 +1248,37 @@ class PinnedBoxTests(AppTestCase):
         self.assertEqual(len([x for x in w.Dock.windows if isinstance(x, w.DetailWindow)]), 1)
         self.assertEqual(w.TX_WINDOWS, {})
 
-    def test_tray_click_closes_everything_and_the_next_click_opens_only_pinned_boxes(self):
+    def test_tray_click_closes_everything_and_the_next_click_opens_the_watchlist_and_pinned_boxes_only(self):
         windows = self.open_everything()
         windows["detail:AAPL"].pin_button.click()
         self.assertTrue(w.widget_is_open(self.main))
-        w.toggle_widget(self.ctl, self.main)  # alles zu, angeheftet oder nicht
+        w.toggle_widget(self.ctl, self.main)  # alles zu, angeheftet oder nicht, auch die Watchlist
         self.assertFalse(w.widget_is_open(self.main))
         self.assertEqual((self.main.details, w.TX_WINDOWS, w.PORTFOLIO_WINDOWS), ({}, {}, {}))
         self.assertFalse(self.main.isVisible())
         self.assertEqual(self.ctl.pinned, ["detail:AAPL"])
-        w.toggle_widget(self.ctl, self.main)  # jetzt nur noch die angeheftete Box
+        w.toggle_widget(self.ctl, self.main)  # Watchlist und die angeheftete Box, sonst nichts
+        self.assertTrue(self.main.isVisible())
         self.assertEqual(set(self.main.details), {"AAPL"})
-        self.assertFalse(self.main.isVisible())
         self.assertEqual((w.TX_WINDOWS, w.PORTFOLIO_WINDOWS), ({}, {}))
         w.toggle_widget(self.ctl, self.main)
         self.assertFalse(w.widget_is_open(self.main))
 
-    def test_pinned_watchlist_comes_back_with_the_pinned_boxes(self):
-        windows = self.open_everything()
-        windows["main"].pin_button.click()
-        w.close_widget(self.main)
-        w.open_widget(self.ctl, self.main)
-        self.assertTrue(self.main.isVisible())
-        self.assertEqual(self.main.details, {})
-
-    def test_without_any_pinned_box_opening_shows_the_watchlist(self):
+    def test_the_watchlist_always_opens_even_without_any_pinned_box(self):
+        self.assertEqual(self.ctl.pinned, [])
         w.open_widget(self.ctl, self.main)
         self.assertTrue(self.main.isVisible())
         w.close_widget(self.main)
         self.assertFalse(self.main.isVisible())
         w.open_widget(self.ctl, self.main)
         self.assertTrue(self.main.isVisible())
+
+    def test_a_stale_main_pin_from_an_earlier_version_is_ignored(self):
+        self.ctl.set_pinned("main", True)
+        w.close_widget(self.main)
+        w.open_widget(self.ctl, self.main)
+        self.assertTrue(self.main.isVisible())
+        self.assertEqual((self.main.details, w.TX_WINDOWS), ({}, {}))
 
     def test_closing_a_pinned_box_keeps_it_pinned(self):
         self.ctl.set_pinned("detail:AAPL", True)
