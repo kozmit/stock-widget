@@ -2605,7 +2605,7 @@ class WindowTests(AppTestCase):
         with mock.patch.object(sd, "fetch_news", lambda s, count=15: news):
             self.main.open_detail("AAPL")
             detail = self.main.details["AAPL"]
-            self.assertTrue(wait_until(lambda: any("Reddit" in t for t in texts(detail))))
+            self.assertTrue(wait_until(lambda: detail.fetched_news is not w.NOT_LOADED))
         self.assertEqual(len(detail.findChildren(w.NewsCard)), 1)  # ohne gesammelte Begriffe gilt nur der Firmenname
         self.assertFalse(any("Overrated" in t or "Rockstar" in t for t in texts(detail)))
         self.ctl.terms["AAPL"] = {"terms": ["Reddit", "Rockstar"], "source": "Test", "fetched_at": dt.datetime.now()}

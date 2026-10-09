@@ -123,6 +123,11 @@ def fake_terms(symbol):
     raise ValueError("keine Stammdaten")
 
 
+def fake_consensus(symbol):
+    """Ohne eigene Vorgabe nennt Yahoo im Test keine Einschätzungen von Analysten (wie bei Rohstoffen)."""
+    raise ValueError("Yahoo nennt keine Einschätzungen von Analysten")
+
+
 class AppTestCase(unittest.TestCase):
     """Controller mit temporärer Datenbank. Ohne start(), also ohne Netzwerk; Kurse setzen die Tests selbst."""
     legacy = None  # Inhalt der alten watchlist.json (Liste oder dict), falls vorhanden
@@ -137,6 +142,7 @@ class AppTestCase(unittest.TestCase):
             self.addCleanup(patcher.stop)
         for name, fake in (("fetch_quote", fake_quote), ("fetch_events", lambda s: []),
                            ("fetch_targets", lambda s: None), ("fetch_fundamentals", fake_fundamentals),
+                           ("fetch_consensus", fake_consensus),
                            ("fetch_news", lambda s, count=15: []), ("search_symbols", lambda q, count=8: []),
                            ("fetch_instrument", fake_instrument), ("fetch_history", fake_history), ("fetch_fx_rate", fake_fx_rate),
                            ("fetch_daily_closes", fake_daily_closes),

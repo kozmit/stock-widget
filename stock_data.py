@@ -9,6 +9,7 @@ import zoneinfo
 
 import yfinance as yf
 
+import consensus
 import fundamentals
 
 # Fester Ordner im Benutzerprofil, bewusst nicht unter AppData: Programme aus der Claude-App sehen AppData
@@ -190,6 +191,29 @@ def fetch_fundamentals(symbol):
     data = fundamentals.from_info(info)
     if fundamentals.is_empty(data):
         raise ValueError("Yahoo nennt für diesen Wert keine Kennzahlen")
+    return data
+
+
+def fetch_consensus(symbol):
+    """Empfehlungen der Analysten und Gewinnerwartung gegen Ergebnis laut Yahoo (siehe consensus.py):
+    {recommendations: {now, before}, surprises: [...], fetched_at}. ValueError, wenn Yahoo nichts nennt
+    (Rohstoffe, ETFs und kleine Werte haben meist keine); schlagen beide Abrufe fehl, gilt der erste Fehler."""
+    ticker = yf.Ticker(symbol)
+    rows, errors = {}, []
+    for name in ("recommendations_summary", "earnings_history"):
+        try:
+            frame = getattr(ticker, name)
+            rows[name] = [] if frame is None or frame.empty else frame.reset_index().to_dict("records")
+        except Exception as exc:
+            rows[name] = []
+            errors.append(exc)
+    if len(errors) == 2:
+        raise errors[0]
+    data = {"recommendations": consensus.parse_recommendations(rows["recommendations_summary"]),
+            "surprises": consensus.parse_surprises(rows["earnings_history"]),
+            "fetched_at": dt.datetime.now().replace(microsecond=0)}
+    if consensus.is_empty(data):
+        raise ValueError("Yahoo nennt keine Einschätzungen von Analysten")
     return data
 
 

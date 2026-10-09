@@ -322,6 +322,22 @@ GLOSSARY = _terms(
          unit="Faktor",
          interpretation="1 heißt: so stark wie der Markt. Über 1 schwankt sie stärker, unter 1 schwächer. Beruht auf "
                         "vergangenen Kursen."),
+    Term("empfehlung", "Empfehlungen der Analysten",
+         "Wie viele Analysten die Aktie zum Kaufen, Halten oder Verkaufen einstufen. Gezeigt wird die Verteilung, "
+         "keine Gesamtnote.",
+         full="Analysten-Ratings", unit="Anzahl der Analysten",
+         interpretation="Mit Vorsicht lesen: Analysten und ihre Banken haben Geschäftsbeziehungen zu den Unternehmen, "
+                        "deshalb sind „Verkaufen“-Urteile selten und „Halten“ heißt oft „eher verkaufen“. "
+                        "Aussagekräftiger als das Niveau ist, ob sich die Verteilung verändert. Bei weniger als fünf "
+                        "Analysten sagt sie kaum etwas."),
+    Term("gewinnueberraschung", "Gewinnüberraschung",
+         "Wie weit der tatsächliche Gewinn je Aktie eines Quartals von dem abwich, was Analysten im Durchschnitt "
+         "erwartet hatten.",
+         full="Earnings Surprise", formula="(Gewinn tatsächlich − Gewinn erwartet) ÷ |Gewinn erwartet|", unit="Prozent",
+         interpretation="Positiv heißt: besser als erwartet. Das bewegt den Kurs oft stärker als der Gewinn selbst. "
+                        "Viele Firmen übertreffen die Erwartung regelmäßig, weil sie diese vorher lenken; entscheidend "
+                        "ist deshalb, wie deutlich sie übertroffen wird und ob das Wachstum dahinter stimmt.",
+         example="Erwartet 1,89, tatsächlich 2,02 → +6,9 %."),
     Term("kursziel", "Kursziel", "Der Preis, den ein Analyst für die Aktie in etwa zwölf Monaten erwartet.",
          unit="Währung der Aktie",
          interpretation="Eine Einschätzung, keine Garantie. Viele Analysten liegen oft daneben; wichtiger als eine "

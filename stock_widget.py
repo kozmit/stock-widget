@@ -23,6 +23,7 @@ import history
 import ledger
 import portfolio
 import etoro
+import consensus as cons
 import events as evt
 import fundamentals as fund
 import keywords as kw
@@ -2367,6 +2368,52 @@ class DetailWindow(QWidget):
         column.addWidget(self.target_range)
         body.addWidget(targets_card)
 
+        # Einschätzung der Analysten: Verteilung der Empfehlungen, Gewinnerwartung gegen Ergebnis
+        self.consensus_card = consensus_card = QFrame()
+        consensus_card.setObjectName("plain")
+        column = QVBoxLayout(consensus_card)
+        column.setContentsMargins(16, 14, 16, 14)
+        column.setSpacing(6)
+        column.addWidget(explain(caption_label("Einschätzung der Analysten"), "empfehlung"))
+        self.consensus_status = QLabel("Wird geladen …")
+        self.consensus_status.setWordWrap(True)
+        self.consensus_status.setStyleSheet(f"color: {MUTED};")
+        column.addWidget(self.consensus_status)
+        self.consensus_body = QWidget()
+        self.consensus_body.setObjectName("clear")
+        inner = QVBoxLayout(self.consensus_body)
+        inner.setContentsMargins(0, 0, 0, 0)
+        inner.setSpacing(5)
+        self.rec_bar = QHBoxLayout()
+        self.rec_bar.setSpacing(2)
+        inner.addLayout(self.rec_bar)
+        self.rec_text = QLabel()
+        self.rec_text.setStyleSheet("font-size: 13px; font-weight: 600;")
+        self.rec_trend = QLabel()
+        self.rec_trend.setStyleSheet(f"color: {MUTED}; font-size: 12px;")
+        self.rec_warning = QLabel()
+        self.rec_warning.setWordWrap(True)
+        self.rec_warning.setStyleSheet(f"color: {AMBER}; font-size: 12px;")
+        for label in (self.rec_text, self.rec_trend, self.rec_warning):
+            inner.addWidget(label)
+        self.surprise_title = explain(caption_label("Gewinn je Aktie gegen Erwartung"), "gewinnueberraschung")
+        inner.addSpacing(6)
+        inner.addWidget(self.surprise_title)
+        self.surprise_lines = QVBoxLayout()
+        self.surprise_lines.setSpacing(2)
+        inner.addLayout(self.surprise_lines)
+        self.surprise_summary = QLabel()
+        self.surprise_summary.setStyleSheet(f"color: {MUTED}; font-size: 12px;")
+        inner.addWidget(self.surprise_summary)
+        self.consensus_note = QLabel()
+        self.consensus_note.setWordWrap(True)
+        self.consensus_note.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        inner.addSpacing(4)
+        inner.addWidget(self.consensus_note)
+        self.consensus_body.hide()
+        column.addWidget(self.consensus_body)
+        body.addWidget(consensus_card)
+
         # Kennzahlen (Fundamentaldaten)
         self.fundamentals_card = fundamentals_card = QFrame()
         fundamentals_card.setObjectName("plain")
@@ -2476,6 +2523,7 @@ class DetailWindow(QWidget):
         self.refresh_view()
         ctl.run(self.load, self.show_loaded)
         ctl.run(lambda: sd.fetch_targets(symbol), self.show_targets, lambda exc: self.show_targets(None, exc))
+        ctl.run(lambda: sd.fetch_consensus(symbol), self.show_consensus, lambda exc: self.show_consensus(None, exc))
         ctl.load_fundamentals(symbol)
         self.load_history(self.range_key)
 
@@ -2561,10 +2609,10 @@ class DetailWindow(QWidget):
         self.company_meta.setVisible(bool(instrument))
         if instrument:
             self.company.setText(instrument["name"])
-            isin = f"ISIN {instrument['isin']}" if instrument["isin"] else ""
+            isin = f"ISIN {instrument['isin']}" if instrument.get("isin") else ""
             self.company_meta.setText(" · ".join(part for part in (
-                instrument["exchange"], instrument["sector"], instrument["industry"], instrument["country"], isin)
-                if part))
+                instrument.get("exchange"), instrument.get("sector"), instrument.get("industry"),
+                instrument.get("country"), isin) if part))
             self.company_meta.setToolTip(f"Stammdaten: {instrument['source']}, Stand "
                                          f"{instrument['fetched_at']:%d.%m.%Y %H:%M}")
         if quote:
@@ -2639,6 +2687,51 @@ class DetailWindow(QWidget):
         self.target_range.setText(" · ".join(parts))
         self.targets_card.setToolTip("Schätzungen einzelner Analysten (Quelle: Yahoo Finance), keine Prognose. "
                                      "Wenige Analysten machen den Durchschnitt unsicher.")
+
+    def show_consensus(self, data, error=None):
+        """Verteilung der Empfehlungen (ohne Gesamtnote), Trend, Warnung bei wenigen Analysten und die letzten
+        Quartale mit Gewinnerwartung und Ergebnis. data None: Yahoo nennt nichts oder der Abruf schlug fehl."""
+        if not self.alive:
+            return
+        self.consensus = data
+        if not data:
+            reason = str(error) if isinstance(error, ValueError) else f"Nicht ladbar: {error}"
+            self.consensus_status.setText(reason if error else "Keine Einschätzungen vorhanden")
+            self.consensus_status.show()
+            self.consensus_body.hide()
+            return
+        self.consensus_status.hide()
+        self.consensus_body.show()
+        clear_layout(self.rec_bar)
+        clear_layout(self.surprise_lines)
+        now, before = data["recommendations"]["now"], data["recommendations"]["before"]
+        has_rec = bool(now)
+        for widget in (self.rec_text, self.rec_trend, self.rec_warning):
+            widget.setVisible(has_rec)
+        if has_rec:
+            for number, color in zip(cons.sides(now), (GREEN, "#6b7185", RED)):
+                if number:
+                    segment = QFrame()
+                    segment.setFixedHeight(8)
+                    segment.setStyleSheet(f"background: {color}; border-radius: 4px;")
+                    self.rec_bar.addWidget(segment, number)
+            count = cons.total(now)
+            self.rec_text.setText(f"{cons.distribution_text(now)}  ({count} Analyst{'en' if count != 1 else ''})")
+            self.rec_trend.setText(cons.trend_text(now, before))
+            self.rec_trend.setVisible(bool(self.rec_trend.text()))
+            self.rec_warning.setText(cons.caution(count))
+            self.rec_warning.setVisible(bool(self.rec_warning.text()))
+        surprises = data["surprises"]
+        for widget in (self.surprise_title, self.surprise_summary):
+            widget.setVisible(bool(surprises))
+        for item in surprises:
+            line = QLabel(cons.surprise_line(item))
+            line.setStyleSheet(f"color: {sign_color(item['surprise']) if item['surprise'] is not None else MUTED}; "
+                               "font-size: 12px;")
+            self.surprise_lines.addWidget(line)
+        self.surprise_summary.setText(cons.beat_summary(surprises))
+        self.consensus_note.setText(f"Quelle: Yahoo Finance, Stand {data['fetched_at']:%d.%m.%Y %H:%M}. "
+                                    "Schätzungen von Analysten, keine Prognose.")
 
     def on_fundamentals(self, symbol):
         if symbol == self.symbol:
@@ -2750,10 +2843,10 @@ class DetailWindow(QWidget):
         if not self.alive or self.fetched_news is NOT_LOADED:
             return
         while self.news.count() > 1:  # das letzte Element ist der Abstandshalter
-            item = self.news.takeAt(0)
-            if item.widget():
-                item.widget().setParent(None)
-                item.widget().deleteLater()
+            widget = self.news.takeAt(0).widget()
+            if widget:
+                widget.setParent(None)  # sofort aus dem Fenster, damit nichts Altes mitgezählt wird
+                widget.deleteLater()
         news = self.fetched_news
         if news is not None:
             news = kw.filter_news(news, self.symbol, self.ctl.news_terms(self.symbol))
