@@ -1,8 +1,10 @@
 """Gemeinsame Hilfen für die Tests: temporäre Datenbank, kein Netzwerk, Dialoge fernsteuern."""
 import datetime as dt
 import datetime as dt
+import html
 import json
 import os
+import re
 import shutil
 import tempfile
 import unittest
@@ -16,6 +18,12 @@ import stock_data as sd
 import stock_widget as w
 
 QUOTE = {"price": 100.0, "change_pct": 1.5, "currency": "USD", "source": "Testquelle"}
+
+
+def plain(value):
+    """Der sichtbare Text einer Beschriftung mit Rich Text: ohne Markierungen, Zeilenumbrüche als Leerzeichen."""
+    text = value.text() if hasattr(value, "text") else str(value)
+    return html.unescape(re.sub(r"<[^>]+>", "", re.sub(r"<br\s*/?>", " ", text)))
 
 
 def qapp():
@@ -58,6 +66,11 @@ def fake_fx_history(code, base, start):
         raise ValueError(f"keine Historie {code}")
     days = (dt.date.today() - start).days
     return {start + dt.timedelta(days=i): FX_RATES[code] for i in range(days + 1)}
+
+
+def fake_daily_closes(symbol, start):
+    days = (dt.date.today() - start).days
+    return {start + dt.timedelta(days=i): 100.0 + i for i in range(days + 1)}
 
 
 def wait_until(condition, timeout=3000):
@@ -114,6 +127,7 @@ class AppTestCase(unittest.TestCase):
         for name, fake in (("fetch_quote", fake_quote), ("fetch_events", lambda s: []),
                            ("fetch_news", lambda s, count=15: []), ("search_symbols", lambda q, count=8: []),
                            ("fetch_instrument", fake_instrument), ("fetch_history", fake_history), ("fetch_fx_rate", fake_fx_rate),
+                           ("fetch_daily_closes", fake_daily_closes),
                            ("fetch_fx_history", fake_fx_history)):
             patcher = mock.patch.object(sd, name, fake)
             patcher.start()

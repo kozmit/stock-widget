@@ -26,7 +26,10 @@ CREATE TABLE IF NOT EXISTS transactions (
     fee REAL NOT NULL DEFAULT 0 CHECK (fee >= 0),
     executed_on TEXT NOT NULL,
     note TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'manual',
+    external_id TEXT,
+    imported_at TEXT
 );
 CREATE INDEX IF NOT EXISTS transactions_symbol ON transactions (symbol);
 CREATE TABLE IF NOT EXISTS price_snapshots (
@@ -56,6 +59,25 @@ CREATE TABLE IF NOT EXISTS fx_rates (
     source TEXT NOT NULL,
     PRIMARY KEY (currency, day)
 );
+CREATE TABLE IF NOT EXISTS price_history (
+    symbol TEXT NOT NULL,
+    day TEXT NOT NULL,
+    close REAL NOT NULL,
+    source TEXT NOT NULL,
+    PRIMARY KEY (symbol, day)
+);
+CREATE TABLE IF NOT EXISTS symbol_aliases (
+    source TEXT NOT NULL,
+    source_symbol TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    PRIMARY KEY (source, source_symbol)
+);
+CREATE TABLE IF NOT EXISTS sync_state (
+    source TEXT PRIMARY KEY,
+    cursor TEXT,
+    last_sync_at TEXT NOT NULL,
+    message TEXT NOT NULL DEFAULT ''
+);
 CREATE TABLE IF NOT EXISTS fx_latest (
     currency TEXT PRIMARY KEY,
     rate REAL NOT NULL,
@@ -65,7 +87,9 @@ CREATE TABLE IF NOT EXISTS fx_latest (
 """
 # 1: Watchlist und Transaktionen. 2: dazu letzter Kurs und Stammdaten je Aktie, jeweils mit Quelle und Zeitpunkt.
 # 3: dazu Wechselkurse in die Basiswährung (Tageskurse und letzter Kurs).
-SCHEMA_VERSION = "3"
+# 4: Transaktionen kennen ihre Herkunft (manual, opening, etoro, ...) und die Kennung beim Anbieter;
+#    dazu Tageskurse der Aktien (für den Verlauf), Kürzel-Zuordnungen und der Stand der Synchronisation.
+SCHEMA_VERSION = "4"
 INSTRUMENT_FIELDS = ("name", "exchange", "currency", "sector", "industry", "country", "isin")
 DEFAULT_SYMBOLS = ["AAPL", "MSFT", "DELL"]
 
@@ -75,9 +99,23 @@ class Store:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         self.db = sqlite3.connect(path)
         self.db.executescript(SCHEMA)
-        # Neue Tabellen legt SCHEMA an; bestehende Daten bleiben unverändert, nur die Versionsnummer zieht nach.
+        self._upgrade()
         self.db.execute("INSERT OR REPLACE INTO meta VALUES ('schema_version', ?)", (SCHEMA_VERSION,))
         self.db.commit()
+
+    def _upgrade(self):
+        """Hebt eine ältere Datenbank an. Neue Tabellen legt SCHEMA an; hier kommen neue Spalten und
+        Umbenennungen dazu. Vorhandene Daten bleiben unverändert."""
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(transactions)")}
+        for name, ddl in (("source", "TEXT NOT NULL DEFAULT 'manual'"), ("external_id", "TEXT"),
+                          ("imported_at", "TEXT")):
+            if name not in columns:
+                self.db.execute(f"ALTER TABLE transactions ADD COLUMN {name} {ddl}")
+        # Startbestände waren bisher nur an der Notiz zu erkennen
+        self.db.execute("UPDATE transactions SET source = 'opening' WHERE source = 'manual' AND note LIKE 'Startbestand%'")
+        # Eine Kennung beim Anbieter darf nur einmal vorkommen, sonst würde ein erneuter Abgleich doppelt buchen.
+        self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS transactions_external ON transactions (source, external_id) "
+                        "WHERE external_id IS NOT NULL")
 
     def close(self):
         self.db.close()
@@ -111,16 +149,30 @@ class Store:
     # -- Transaktionen --
     def transactions(self):
         rows = self.db.execute(
-            "SELECT id, symbol, kind, shares, price, fee, executed_on, note FROM transactions ORDER BY id")
-        return [Transaction(r[0], r[1], r[2], r[3], r[4], r[5], dt.date.fromisoformat(r[6]), r[7]) for r in rows]
+            "SELECT id, symbol, kind, shares, price, fee, executed_on, note, source, external_id "
+            "FROM transactions ORDER BY id")
+        return [Transaction(r[0], r[1], r[2], r[3], r[4], r[5], dt.date.fromisoformat(r[6]), r[7], r[8], r[9] or "")
+                for r in rows]
 
-    def add_transaction(self, symbol, kind, shares, price, fee, day, note=""):
+    def add_transaction(self, symbol, kind, shares, price, fee, day, note="", source="manual", external_id=None):
+        now = dt.datetime.now().isoformat(timespec="seconds")
         cursor = self.db.execute(
-            "INSERT INTO transactions (symbol, kind, shares, price, fee, executed_on, note, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (symbol, kind, shares, price, fee, day.isoformat(), note, dt.datetime.now().isoformat(timespec="seconds")))
+            "INSERT INTO transactions (symbol, kind, shares, price, fee, executed_on, note, created_at, "
+            "source, external_id, imported_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (symbol, kind, shares, price, fee, day.isoformat(), note, now, source, external_id,
+             now if external_id else None))
         self.db.commit()
         return cursor.lastrowid
+
+    def external_ids(self, source):
+        """Kennungen beim Anbieter, die schon gespeichert sind."""
+        rows = self.db.execute("SELECT external_id FROM transactions WHERE source = ? AND external_id IS NOT NULL",
+                               (source,))
+        return {r[0] for r in rows}
+
+    def delete_transactions(self, ids):
+        self.db.executemany("DELETE FROM transactions WHERE id = ?", [(i,) for i in ids])
+        self.db.commit()
 
     def delete_transaction(self, transaction_id):
         self.db.execute("DELETE FROM transactions WHERE id = ?", (transaction_id,))
@@ -153,6 +205,36 @@ class Store:
             "FROM instruments")
         return {r[0]: {**dict(zip(INSTRUMENT_FIELDS, r[1:8])), "source": r[8],
                        "fetched_at": dt.datetime.fromisoformat(r[9])} for r in rows}
+
+    # -- Tageskurse der Aktien (für den Verlauf des Portfolios) --
+    def save_closes(self, symbol, closes, source):
+        self.db.executemany("INSERT OR REPLACE INTO price_history VALUES (?, ?, ?, ?)",
+                            [(symbol, day.isoformat(), close, source) for day, close in closes.items()])
+        self.db.commit()
+
+    def closes(self):
+        history = {}
+        for symbol, day, close in self.db.execute("SELECT symbol, day, close FROM price_history"):
+            history.setdefault(symbol, {})[dt.date.fromisoformat(day)] = close
+        return history
+
+    # -- Anbindungen: Kürzel-Zuordnung und Stand der Synchronisation --
+    def aliases(self, source):
+        return dict(self.db.execute("SELECT source_symbol, symbol FROM symbol_aliases WHERE source = ?", (source,)))
+
+    def set_alias(self, source, source_symbol, symbol):
+        self.db.execute("INSERT OR REPLACE INTO symbol_aliases VALUES (?, ?, ?)", (source, source_symbol, symbol))
+        self.db.commit()
+
+    def sync_state(self, source):
+        row = self.db.execute("SELECT cursor, last_sync_at, message FROM sync_state WHERE source = ?",
+                              (source,)).fetchone()
+        return {"cursor": row[0], "last_sync_at": dt.datetime.fromisoformat(row[1]), "message": row[2]} if row else None
+
+    def save_sync_state(self, source, cursor, when, message=""):
+        self.db.execute("INSERT OR REPLACE INTO sync_state VALUES (?, ?, ?, ?)",
+                        (source, cursor, when.isoformat(timespec="seconds"), message))
+        self.db.commit()
 
     # -- Wechselkurse (Basiswährung je Einheit Fremdwährung) --
     def save_fx_rates(self, currency, rates, source):
@@ -201,5 +283,5 @@ class Store:
             self.add_symbol(symbol, position.get("realized", 0.0) if position else 0.0)
             if position and position.get("shares", 0) > 0 and position.get("cost", 0) > 0:
                 self.add_transaction(symbol, "buy", position["shares"], position["cost"], 0.0, today,
-                                     "Startbestand (aus dem bisherigen Widget übernommen)")
+                                     "Startbestand (aus dem bisherigen Widget übernommen)", source="opening")
         self.set_meta("legacy_imported", today.isoformat())

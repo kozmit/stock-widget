@@ -1,8 +1,10 @@
 """Controller: Übernahme, Transaktionen, Watchlist und Signale, mit temporärer Datenbank und ohne Netzwerk."""
 import datetime as dt
+import json
 from unittest import mock
 
 import stock_data as sd
+from sources import ExternalTrade, SyncBatch, TransactionSource
 from tests.support import AppTestCase, QUOTE, wait_until
 import stock_widget as w
 
@@ -629,6 +631,289 @@ class PortfolioSummaryTests(AppTestCase):
         self.ctl.record_trade("AAPL", "sell", 10, 90, 0, dt.date(2026, 2, 1))
         self.assertEqual(self.ctl.states["AAPL"].shares, 0)
         self.assertEqual(len(self.ctl.states["AAPL"].sales), 1)
+
+
+class FakeSource(TransactionSource):
+    name, label = "etoro", "eToro"
+
+    def __init__(self, trades=(), cursor="c1", error=None):
+        self.trades, self.next_cursor, self.error, self.cursors = list(trades), cursor, error, []
+
+    def fetch(self, cursor):
+        self.cursors.append(cursor)
+        if self.error:
+            raise self.error
+        return SyncBatch(tuple(self.trades), self.next_cursor)
+
+
+def trade(id, kind="buy", shares=10, price=100.0, day=DAY1, symbol="AAPL", fee=0.0):
+    return ExternalTrade(id, symbol, kind, shares, price, day, fee)
+
+
+class EtoroConnectionTests(AppTestCase):
+    def test_not_connected_without_keys(self):
+        self.assertNotIn("etoro", self.ctl.sources)
+
+    def test_connect_registers_source_and_disconnect_keeps_transactions(self):
+        self.ctl.connect_etoro("pub", "usr")
+        self.assertEqual(self.ctl.sources["etoro"].label, "eToro")
+        self.ctl.import_trades("etoro", [trade("1")])
+        self.ctl.disconnect_etoro()
+        self.assertNotIn("etoro", self.ctl.sources)
+        self.assertEqual(len(self.ctl.transactions["AAPL"]), 1)
+
+    def test_notes_of_the_source_appear_in_the_sync_state(self):
+        self.ctl.import_trades("etoro", [trade("1")], notes=("2 Position(en) übersprungen",))
+        self.assertIn("2 Position(en) übersprungen", self.ctl.store.sync_state("etoro")["message"])
+
+
+class OpeningSourceTests(AppTestCase):
+    def test_start_position_is_marked_as_opening_balance(self):
+        self.ctl.start_position("AAPL", 10, 0)
+        [tx] = self.ctl.transactions["AAPL"]
+        self.assertEqual((tx.source, tx.note), ("opening", "Startbestand"))
+
+    def test_manual_trades_are_marked_manual(self):
+        self.ctl.record_trade("AAPL", "buy", 10, 100, 0, DAY1)
+        self.assertEqual(self.ctl.transactions["AAPL"][0].source, "manual")
+
+    def test_legacy_positions_are_opening_balances(self):
+        self.ctl.shutdown()
+        self.ctl.store.close()
+        with open(sd.LEGACY_FILE, "w", encoding="utf-8") as f:
+            json.dump({"symbols": ["GEV"], "positions": {"GEV": {"shares": 7.36, "cost": 547.62, "realized": 0}}}, f)
+        import os
+        os.remove(sd.DB_FILE)
+        self.ctl = w.Controller()
+        self.assertEqual(self.ctl.transactions["GEV"][0].source, "opening")
+
+
+class ImportTests(AppTestCase):
+    def signals(self):
+        seen = {"ledger": [], "history": [], "changed": []}
+        self.ctl.ledger_changed.connect(lambda: seen["ledger"].append(1))
+        self.ctl.history_changed.connect(lambda: seen["history"].append(1))
+        self.ctl.changed.connect(lambda: seen["changed"].append(1))
+        return seen
+
+    def test_imported_trades_become_transactions_with_source_and_external_id(self):
+        plan = self.ctl.import_trades("etoro", [trade("1", shares=10, price=100, fee=1.5)])
+        self.assertEqual(len(plan.new), 1)
+        [tx] = self.ctl.transactions["AAPL"]
+        self.assertEqual((tx.source, tx.external_id, tx.shares, tx.price, tx.fee), ("etoro", "1", 10, 100, 1.5))
+        self.assertAlmostEqual(self.ctl.positions["AAPL"]["shares"], 10)
+
+    def test_importing_the_same_trades_again_books_nothing_twice(self):
+        self.ctl.import_trades("etoro", [trade("1"), trade("2", day=DAY2)])
+        plan = self.ctl.import_trades("etoro", [trade("1"), trade("2", day=DAY2), trade("3", day=DAY3)])
+        self.assertEqual((plan.duplicates, len(plan.new)), (2, 1))
+        self.assertEqual(len(self.ctl.transactions["AAPL"]), 3)
+
+    def test_import_tells_the_ui_to_update(self):
+        seen = self.signals()
+        self.ctl.import_trades("etoro", [trade("1")])
+        self.assertTrue(seen["ledger"] and seen["history"] and seen["changed"])
+
+    def test_sync_state_is_saved_with_a_summary(self):
+        self.ctl.import_trades("etoro", [trade("1"), trade("2", "sell", 99, day=DAY2), trade("3", symbol="ZZZ")],
+                               cursor="stand-7")
+        state = self.ctl.store.sync_state("etoro")
+        self.assertEqual(state["cursor"], "stand-7")
+        self.assertEqual(state["message"], "1 neu, 0 schon vorhanden, 1 abgelehnt, 1 mit unbekanntem Kürzel")
+
+    def test_unknown_provider_symbol_is_reported_until_it_is_assigned(self):
+        plan = self.ctl.import_trades("etoro", [trade("1", symbol="AAPL.US")])
+        self.assertEqual((plan.unmapped, plan.new), ({"AAPL.US": 1}, []))
+        self.assertNotIn("AAPL", self.ctl.transactions)
+        self.ctl.set_alias("etoro", "AAPL.US", "aapl")
+        plan = self.ctl.import_trades("etoro", [trade("1", symbol="AAPL.US")])
+        self.assertEqual(len(plan.new), 1)
+        self.assertIn("AAPL", self.ctl.transactions)
+
+    def test_alias_survives_a_restart(self):
+        self.ctl.set_alias("etoro", "AAPL.US", "AAPL")
+        self.ctl.shutdown()
+        self.ctl.store.close()
+        self.ctl = w.Controller()
+        plan = self.ctl.import_trades("etoro", [trade("1", symbol="AAPL.US")])
+        self.assertEqual(len(plan.new), 1)
+
+    def test_rejected_trades_are_not_stored_but_valid_ones_are(self):
+        plan = self.ctl.import_trades("etoro", [trade("1", "buy", 10), trade("2", "sell", 50, day=DAY2)])
+        self.assertEqual([t.external_id for t, _ in plan.rejected], ["2"])
+        self.assertEqual(len(self.ctl.transactions["AAPL"]), 1)
+
+    def test_manual_entries_are_untouched_by_an_import(self):
+        self.ctl.record_trade("AAPL", "buy", 5, 90, 0, DAY1)
+        self.ctl.import_trades("etoro", [trade("1", shares=10, day=DAY2)])
+        self.assertEqual(sorted(t.source for t in self.ctl.transactions["AAPL"]), ["etoro", "manual"])
+        self.assertAlmostEqual(self.ctl.positions["AAPL"]["shares"], 15)
+
+    def test_real_purchases_can_replace_the_opening_balance(self):
+        self.ctl.start_position("AAPL", 10, 0)
+        self.ctl.start_position("MSFT", 5, 0)
+        self.ctl.import_trades("etoro", [trade("1", shares=10, price=80, day=DAY1)], replace_openings=True)
+        self.assertEqual([t.source for t in self.ctl.transactions["AAPL"]], ["etoro"])
+        self.assertAlmostEqual(self.ctl.positions["AAPL"]["cost"], 80.0)
+        self.assertEqual([t.source for t in self.ctl.transactions["MSFT"]], ["opening"])  # andere Aktie bleibt
+
+    def test_without_the_flag_the_opening_balance_stays(self):
+        self.ctl.start_position("AAPL", 10, 0)
+        self.ctl.import_trades("etoro", [trade("1", shares=10, price=80, day=DAY1)])
+        self.assertEqual(sorted(t.source for t in self.ctl.transactions["AAPL"]), ["etoro", "opening"])
+        self.assertAlmostEqual(self.ctl.positions["AAPL"]["shares"], 20)
+
+    def test_imported_trade_brings_back_a_removed_stock(self):
+        self.ctl.record_trade("AAPL", "buy", 10, 100, 0, DAY1)
+        self.ctl.remove("AAPL")
+        self.ctl.import_trades("etoro", [trade("1", "sell", 4, day=DAY2)])
+        self.assertIn("AAPL", self.ctl.symbols)
+        self.assertAlmostEqual(self.ctl.positions["AAPL"]["shares"], 6)
+
+    def test_a_stock_unknown_so_far_is_added_when_its_alias_is_given(self):
+        self.ctl.set_alias("etoro", "NEWCO.US", "NEWCO")
+        self.ctl.import_trades("etoro", [trade("1", symbol="NEWCO.US")])
+        self.assertIn("NEWCO", self.ctl.symbols)
+        self.assertTrue(wait_until(lambda: "NEWCO" in self.ctl.quotes))
+
+    def test_deleting_an_imported_entry_is_possible_like_any_other(self):
+        self.ctl.import_trades("etoro", [trade("1")])
+        self.ctl.delete_transaction("AAPL", self.ctl.transactions["AAPL"][0].id)
+        self.assertNotIn("AAPL", self.ctl.positions)
+        plan = self.ctl.import_trades("etoro", [trade("1")])  # der nächste Abgleich bringt ihn zurück
+        self.assertEqual(len(plan.new), 1)
+
+
+class SyncTests(AppTestCase):
+    def sync(self, name="etoro"):
+        results = []
+        self.ctl.sync_source(name, results.append, lambda exc: results.append(exc))
+        self.assertTrue(wait_until(lambda: results))
+        return results[0]
+
+    def test_sync_fetches_in_the_background_and_books_the_result(self):
+        source = FakeSource([trade("1"), trade("2", day=DAY2)])
+        self.ctl.sources["etoro"] = source
+        plan = self.sync()
+        self.assertEqual(len(plan.new), 2)
+        self.assertEqual(len(self.ctl.transactions["AAPL"]), 2)
+
+    def test_first_sync_starts_without_a_cursor_and_the_next_one_continues_with_the_saved_one(self):
+        source = FakeSource([trade("1")], cursor="stand-1")
+        self.ctl.sources["etoro"] = source
+        self.sync()
+        source.next_cursor = "stand-2"
+        self.sync()
+        self.assertEqual(source.cursors, ["", "stand-1"])
+        self.assertEqual(self.ctl.store.sync_state("etoro")["cursor"], "stand-2")
+
+    def test_repeated_sync_is_harmless(self):
+        self.ctl.sources["etoro"] = FakeSource([trade("1")])
+        self.sync()
+        plan = self.sync()
+        self.assertEqual((len(plan.new), plan.duplicates), (0, 1))
+
+    def test_a_failing_source_reports_the_error_and_changes_nothing(self):
+        self.ctl.sources["etoro"] = FakeSource([trade("1")], error=RuntimeError("API nicht erreichbar"))
+        error = self.sync()
+        self.assertIn("API nicht erreichbar", str(error))
+        self.assertEqual(self.ctl.transactions, {})
+        self.assertIsNone(self.ctl.store.sync_state("etoro"))
+
+    def test_unknown_source_is_a_key_error(self):
+        with self.assertRaises(KeyError):
+            self.ctl.sync_source("nirgends", lambda plan: None, lambda exc: None)
+
+    def test_sync_can_replace_opening_balances(self):
+        self.ctl.start_position("AAPL", 10, 0)
+        self.ctl.sources["etoro"] = FakeSource([trade("1", shares=10, price=70, day=DAY1)])
+        results = []
+        self.ctl.sync_source("etoro", results.append, results.append, replace_openings=True)
+        wait_until(lambda: results)
+        self.assertEqual([t.source for t in self.ctl.transactions["AAPL"]], ["etoro"])
+
+
+class DailyClosesTests(AppTestCase):
+    D1 = dt.date(2026, 1, 5)
+
+    def setUp(self):
+        super().setUp()
+        self.calls = []
+
+        def closes(symbol, start):
+            self.calls.append((symbol, start))
+            return {start + dt.timedelta(days=i): 100.0 + i for i in range((dt.date.today() - start).days + 1)}
+
+        patcher = mock.patch.object(sd, "fetch_daily_closes", closes)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_closes_start_a_week_before_the_first_entry_of_that_stock(self):
+        self.ctl.record_trade("AAPL", "buy", 1, 100, 0, self.D1)
+        self.assertTrue(wait_until(lambda: self.calls))
+        self.assertEqual(self.calls[0], ("AAPL", self.D1 - dt.timedelta(days=7)))
+
+    def test_only_stocks_with_entries_are_loaded(self):
+        self.ctl.record_trade("AAPL", "buy", 1, 100, 0, self.D1)
+        wait_until(lambda: self.calls)
+        wait_until(lambda: False, 300)
+        self.assertEqual({symbol for symbol, _ in self.calls}, {"AAPL"})
+
+    def test_closes_are_saved_and_announced(self):
+        seen = []
+        self.ctl.history_changed.connect(lambda: seen.append(1))
+        self.ctl.record_trade("AAPL", "buy", 1, 100, 0, self.D1)
+        self.assertTrue(wait_until(lambda: "AAPL" in self.ctl.closes and seen))
+        self.assertIn(self.D1, self.ctl.store.closes()["AAPL"])
+
+    def test_loaded_once_per_start_but_again_after_a_new_entry(self):
+        self.ctl.record_trade("AAPL", "buy", 1, 100, 0, self.D1)
+        wait_until(lambda: len(self.calls) == 1)
+        self.ctl.refresh_closes()
+        self.ctl.refresh_closes()
+        wait_until(lambda: False, 300)
+        self.assertEqual(len(self.calls), 1)
+        self.ctl.record_trade("AAPL", "buy", 1, 100, 0, dt.date(2025, 6, 1))
+        self.assertTrue(wait_until(lambda: len(self.calls) == 2))
+        self.assertEqual(self.calls[1][1], dt.date(2025, 6, 1) - dt.timedelta(days=7))
+
+    def test_after_a_restart_the_saved_closes_are_there_and_only_new_days_are_loaded(self):
+        self.ctl.record_trade("AAPL", "buy", 1, 100, 0, self.D1)
+        wait_until(lambda: self.ctl.closes.get("AAPL") and self.calls)
+        self.ctl.shutdown()
+        self.ctl.store.close()
+        self.calls.clear()
+        self.ctl = w.Controller()
+        self.assertIn(self.D1, self.ctl.closes["AAPL"])
+        self.ctl.refresh_closes()
+        self.assertTrue(wait_until(lambda: self.calls))
+        self.assertEqual(self.calls[0][1], dt.date.today() - dt.timedelta(days=7))
+
+    def test_failure_is_reported_and_leaves_no_fake_data(self):
+        seen = []
+        self.ctl.status.connect(seen.append)
+        with mock.patch.object(sd, "fetch_daily_closes", side_effect=RuntimeError("offline")):
+            self.ctl.record_trade("AAPL", "buy", 1, 100, 0, self.D1)
+            self.assertTrue(wait_until(lambda: "AAPL: Kursverlauf nicht abrufbar" in seen))
+        self.assertNotIn("AAPL", self.ctl.closes)
+
+    def test_performance_uses_closes_exchange_rates_and_the_ledger(self):
+        self.ctl.fx.add_history("USD", {self.D1: 0.90})
+        self.ctl.record_trade("AAPL", "buy", 10, 100, 0, self.D1)
+        wait_until(lambda: self.ctl.closes.get("AAPL"))
+        result = self.ctl.performance()
+        self.assertEqual(result.points[0].day, self.D1)
+        self.assertAlmostEqual(result.points[0].invested, 900.0)
+        self.assertAlmostEqual(result.points[0].value, 10 * 107.0 * 0.90)  # Testkurse: 100 + Tage seit Beginn (7 Tage vorher)
+
+    def test_performance_ignores_stocks_that_left_the_watchlist(self):
+        self.ctl.fx.add_history("USD", {self.D1: 0.90})
+        self.ctl.record_trade("AAPL", "buy", 10, 100, 0, self.D1)
+        self.ctl.remove("AAPL")
+        self.assertEqual(self.ctl.performance().points, [])
+
+    def test_performance_without_entries_is_empty(self):
+        self.assertEqual(self.ctl.performance().points, [])
 
 
 class SignalTests(AppTestCase):

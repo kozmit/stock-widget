@@ -10,17 +10,22 @@ import socket
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
-from PySide6.QtCore import (QEasingCurve, QEvent, QObject, QPointF, QRectF, QSize, Qt, QTimer, QUrl, QVariantAnimation,
-                            Signal)
-from PySide6.QtGui import QColor, QCursor, QDesktopServices, QIcon, QPainter, QPainterPath, QPen, QPixmap
+from PySide6.QtCore import (QEasingCurve, QEvent, QObject, QPoint, QPointF, QRectF, QSize, Qt, QTimer, QUrl,
+                            QVariantAnimation, Signal)
+from PySide6.QtGui import (QColor, QCursor, QDesktopServices, QGuiApplication, QIcon, QPainter, QPainterPath,
+                           QPalette, QPen, QPixmap, QPolygonF)
 from PySide6.QtWidgets import (QApplication, QDialog, QFrame, QGraphicsDropShadowEffect,
-                               QHBoxLayout, QLabel, QLineEdit, QMenu, QPushButton, QScrollArea, QSystemTrayIcon, QVBoxLayout, QWidget)
+                               QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMenu, QPushButton, QScrollArea, QSystemTrayIcon, QVBoxLayout, QWidget)
 
+import glossary
+import history
 import ledger
 import portfolio
+import etoro
+import sources
 import stock_data as sd
 from fx import BASE, FxTable, currency_code
-from PySide6.QtWidgets import QButtonGroup
+from PySide6.QtWidgets import QAbstractButton, QButtonGroup
 from store import Store
 
 REFRESH_SECONDS = 60
@@ -39,6 +44,7 @@ QFrame#card {{ background: {SURFACE}; border-radius: 10px; }}
 QFrame#card:hover {{ background: {SURFACE2}; }}
 QFrame#card[open="true"] {{ background: #2c3a78; }}
 QFrame#card[open="true"]:hover {{ background: #34448c; }}
+QFrame#termpanel {{ background: {SURFACE}; border: 1px solid #3a4157; border-radius: 12px; }}
 QFrame#plain {{ background: {SURFACE}; border-radius: 16px; }}
 QWidget#clear {{ background: transparent; }}
 QLineEdit {{ background: {SURFACE}; border: 1px solid transparent; border-radius: 14px; padding: 9px 14px;
@@ -76,8 +82,10 @@ QMenu::separator {{ height: 1px; background: #2b2f3d; margin: 4px 8px; }}
 # ---------- Anordnung: alles unten rechts, nebeneinander ----------
 
 class Dock:
-    """Verwaltet die offenen Fenster: das erste sitzt ganz rechts unten, jedes neue links daneben."""
-    MARGIN, GAP = 6, 4
+    """Verwaltet die offenen Fenster: das erste sitzt ganz rechts unten, jedes neue links daneben.
+    Ein Fenster mit dock_above (und desired_height) sitzt stattdessen über diesem Fenster, so breit wie
+    dieses, und wird nur so hoch, wie darüber Platz ist."""
+    MARGIN, GAP, MIN_STACKED = 6, 4, 280
     windows = []
     frozen = False
 
@@ -94,15 +102,39 @@ class Dock:
         cls.arrange()
 
     @classmethod
+    def fits_above(cls, window):
+        """Ob window über seinem Bezugsfenster sitzt: nur wenn das offen ist und darüber genug Platz bleibt;
+        sonst nimmt es wie jedes andere Fenster den nächsten Platz links."""
+        base = getattr(window, "dock_above", None)
+        if base not in cls.windows:
+            return False
+        area = QApplication.primaryScreen().availableGeometry()
+        base_top = area.bottom() + 1 - cls.MARGIN - base.height()
+        return base_top - cls.GAP - cls.MARGIN - area.top() >= min(cls.MIN_STACKED, window.desired_height)
+
+    @classmethod
     def arrange(cls):
         if cls.frozen:
             return
         area = QApplication.primaryScreen().availableGeometry()
         right = area.right() + 1 - cls.MARGIN
         bottom = area.bottom() + 1 - cls.MARGIN
-        for window in cls.windows:
+        stacked = [w for w in cls.windows if cls.fits_above(w)]
+        for window in (w for w in cls.windows if w not in stacked):
             window.move(max(right - window.width(), area.left()), bottom - window.height())
             right -= window.width() + cls.GAP
+        for window in stacked:
+            base = window.dock_above
+            space = base.y() - cls.GAP - cls.MARGIN - area.top()
+            height = min(window.desired_height, space)
+            if window.width() != base.width():
+                window.setFixedWidth(base.width())
+                window.update_desired_height()  # die Höhe hängt von der Breite ab (umbrechende Texte)
+                height = min(window.desired_height, space)
+            if window.height() != height:
+                window.setFixedHeight(height)
+            window.move(max(base.x() + base.width() - window.width(), area.left()),
+                        max(base.y() - cls.GAP - window.height(), area.top()))
 
 
 PIN = {"on": True}
@@ -313,12 +345,295 @@ def make_icon(size=64):
     return QIcon(pixmap)
 
 
+# ---------- Erklärungen zu Fachbegriffen ----------
+# Der Text zu jedem Begriff steht zentral in glossary.py und ist deshalb überall gleich. explain() macht ein ganzes
+# Widget zum Begriff, term_link() + enable_term_links() einzelne Wörter in einem Text. Die Erklärung erscheint, wenn die
+# Maus kurz auf dem Begriff ruht, bleibt nach einem Klick stehen und lässt sich ohne Maus öffnen: mit Tab zum Begriff,
+# dann Eingabe- oder Leertaste (bei Schaltflächen mit F1). Esc oder ein Klick daneben schließt sie.
+
+HOVER_MS = 350  # so lange ruht die Maus, bevor die Erklärung erscheint
+HEAD_TERMS = {"price": "kurs", "day": "tag", "value": "positionswert", "pl": "gv_prozent", "amount": "gv",
+              "event": "termin"}
+EVENT_TERMS = {"Quartalszahlen": "quartalszahlen", "Ex-Dividende": "ex_dividende",
+               "Dividendenzahlung": "dividendenzahlung"}
+
+
+class _PopupWatcher(QObject):
+    """Hört, solange eine Erklärung festgehalten ist, auf Klicks daneben und auf Esc."""
+
+    def __init__(self, popup):
+        super().__init__(popup)
+        self.popup = popup
+
+    def eventFilter(self, obj, event):
+        popup = self.popup
+        if event.type() == QEvent.MouseButtonPress and hasattr(event, "globalPosition"):
+            # Maßgeblich ist das Widget unter dem Mauszeiger, nicht der Empfänger: Qt reicht einen Klick, den ein Label
+            # nicht verarbeitet, an das übergeordnete Widget weiter.
+            target = QApplication.widgetAt(event.globalPosition().toPoint())
+            owner = popup.owner
+            inside = target is not None and (target is popup or popup.isAncestorOf(target))
+            on_owner = target is not None and owner is not None and (target is owner or owner.isAncestorOf(target))
+            if not inside and not on_owner:  # ein Klick auf den Auslöser selbst schaltet dort um
+                popup.close_term()
+        elif event.type() == QEvent.KeyPress and event.key() == Qt.Key_Escape:
+            popup.close_term()
+            return True
+        return False
+
+
+class TermPopup(QWidget):
+    """Die gemeinsame Erklärungsbox. Es gibt nur eine: ein neuer Begriff ersetzt den vorigen."""
+    WIDTH = 380
+    _instance = None
+
+    @classmethod
+    def instance(cls):
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    def __init__(self):
+        super().__init__(None, Qt.ToolTip | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setFixedWidth(self.WIDTH)
+        self.owner, self.key, self.pinned = None, None, False
+        self.watcher = _PopupWatcher(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(12, 10, 12, 14)
+        self.panel = None
+        self._fill(glossary.term("kurs"), "")  # nur damit die Beschriftungen immer existieren
+
+    def _fill(self, term, note):
+        """Baut den Inhalt für term ganz neu auf. Ein vorhandenes Layout umzubauen ergab falsche Höhen."""
+        outer = self.layout()
+        if self.panel is not None:
+            outer.removeWidget(self.panel)
+            self.panel.hide()
+            self.panel.setParent(None)
+            self.panel.deleteLater()
+        panel = self.panel = QFrame()
+        panel.setObjectName("termpanel")
+        shadow = QGraphicsDropShadowEffect(panel)
+        shadow.setBlurRadius(24)
+        shadow.setOffset(0, 5)
+        shadow.setColor(QColor(0, 0, 0, 170))
+        panel.setGraphicsEffect(shadow)
+        column = QVBoxLayout(panel)
+        column.setContentsMargins(14, 12, 14, 12)
+        column.setSpacing(5)
+
+        def label(text, style=""):
+            item = QLabel(text)
+            item.setWordWrap(True)
+            if style:
+                item.setStyleSheet(style)
+            column.addWidget(item)
+            return item
+
+        self.title = label(term.title, "font-size: 14px; font-weight: 700;")
+        self.full = label(term.full, f"color: {MUTED}; font-size: 11px;")
+        self.full.setVisible(bool(term.full))
+        self.text = label(term.text)
+        for heading, value in term.sections():
+            label(heading.upper(), f"color: {MUTED}; font-size: 10px; font-weight: 700; letter-spacing: 1px;")
+            style = (f'color: {ACCENT}; font-family: "Cascadia Mono", Consolas, monospace; font-size: 12px;'
+                     if heading == "Formel" else "")
+            label(value, style)
+        self.footer = label(note, f"color: {MUTED}; font-size: 11px; font-style: italic;")
+        self.footer.setVisible(bool(note))
+        outer.addWidget(panel)
+        for child in [panel, *panel.findChildren(QWidget)]:  # erst mit der echten Schrift und dem Rahmen messen
+            child.ensurePolished()
+        margins = outer.contentsMargins()
+        inner = panel.layout().totalHeightForWidth(self.WIDTH - margins.left() - margins.right())
+        self.setFixedHeight(inner + margins.top() + margins.bottom())
+
+    def show_term(self, key, owner, pinned=False, point=None, note=""):
+        """Zeigt die Erklärung zu key neben owner (oder an der Bildschirmstelle point)."""
+        self.owner, self.key, self.pinned = owner, key, pinned
+        self._fill(glossary.term(key), note)
+        self.move(self._position(owner, point))
+        self.show()
+        self.raise_()
+        app = QApplication.instance()
+        if pinned:
+            app.installEventFilter(self.watcher)
+        else:
+            app.removeEventFilter(self.watcher)
+
+    def _position(self, owner, point):
+        """Unter dem Begriff (oder neben dem Mauszeiger), und immer ganz auf dem Bildschirm."""
+        anchor = point + QPoint(12, 18) if point is not None else owner.mapToGlobal(QPoint(0, owner.height() + 4))
+        screen = QGuiApplication.screenAt(anchor) or QGuiApplication.primaryScreen()
+        area = screen.availableGeometry()
+        x = min(max(anchor.x(), area.left() + 4), area.right() - self.width() - 4)
+        y = anchor.y()
+        if y + self.height() > area.bottom() - 4:  # unten kein Platz: über den Begriff setzen
+            above = (point.y() - self.height() - 8) if point is not None else owner.mapToGlobal(QPoint(0, 0)).y() - self.height() - 4
+            y = max(above, area.top() + 4)
+        return QPoint(x, y)
+
+    def close_term(self, owner=None, only_unpinned=False):
+        """Schließt die Erklärung; mit owner nur, wenn sie zu diesem Widget gehört."""
+        if owner is not None and owner is not self.owner:
+            return
+        if only_unpinned and self.pinned:
+            return
+        self.hide()
+        self.owner, self.key, self.pinned = None, None, False
+        QApplication.instance().removeEventFilter(self.watcher)
+
+
+class TermAnchor(QObject):
+    """Macht ein ganzes Widget zum Auslöser einer Erklärung (siehe explain)."""
+
+    def __init__(self, widget, key, note=""):
+        super().__init__(widget)
+        self.widget, self.key, self.note = widget, key, note
+        self.is_button = isinstance(widget, QAbstractButton)
+        self.timer = QTimer(self)
+        self.timer.setSingleShot(True)
+        self.timer.setInterval(HOVER_MS)
+        self.timer.timeout.connect(lambda: self.open(pinned=False))
+        widget.installEventFilter(self)
+
+    def is_open(self):
+        popup = TermPopup.instance()
+        return popup.isVisible() and popup.owner is self.widget and popup.key == self.key
+
+    def open(self, pinned):
+        TermPopup.instance().show_term(self.key, self.widget, pinned, note=self.note)
+
+    def toggle(self):
+        if self.is_open() and TermPopup.instance().pinned:
+            TermPopup.instance().close_term()
+        else:
+            self.open(pinned=True)
+
+    def underline(self, on):
+        if not self.is_button:  # Schaltflächen haben ihre eigene Rückmeldung
+            font = self.widget.font()
+            font.setUnderline(on)
+            self.widget.setFont(font)
+
+    def eventFilter(self, obj, event):
+        kind = event.type()
+        if kind == QEvent.Enter:
+            self.timer.start()
+            self.underline(True)
+        elif kind == QEvent.Leave:
+            self.timer.stop()
+            if not self.widget.hasFocus():
+                self.underline(False)
+            TermPopup.instance().close_term(self.widget, only_unpinned=True)
+        elif kind == QEvent.MouseButtonRelease and not self.is_button and event.button() == Qt.LeftButton:
+            self.timer.stop()
+            self.toggle()
+        elif kind == QEvent.KeyPress:
+            key = event.key()
+            if key == Qt.Key_F1 or (not self.is_button and key in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space)):
+                self.timer.stop()
+                self.toggle()
+                return True
+            if key == Qt.Key_Escape and self.is_open():
+                TermPopup.instance().close_term()
+                return True
+        elif kind == QEvent.FocusIn:
+            self.underline(True)
+        elif kind == QEvent.FocusOut:
+            if not self.widget.underMouse():
+                self.underline(False)
+            if self.is_open() and TermPopup.instance().pinned:
+                TermPopup.instance().close_term()
+        elif kind in (QEvent.Hide, QEvent.Close):
+            self.timer.stop()
+            TermPopup.instance().close_term(self.widget)
+        return False
+
+
+def explain(widget, key, note=""):
+    """Macht widget zum Begriff key aus dem Glossar. Gibt widget zurück, damit es sich einreihen lässt.
+    note erscheint unten in der Erklärung (zum Beispiel was ein Klick auf eine Schaltfläche tut)."""
+    term = glossary.term(key)  # ein unbekannter Schlüssel soll sofort auffallen
+    anchor = getattr(widget, "_term_anchor", None)
+    if anchor is not None:
+        anchor.key, anchor.note = key, note
+        return widget
+    widget._term_anchor = TermAnchor(widget, key, note)
+    if not isinstance(widget, QAbstractButton):
+        widget.setCursor(Qt.WhatsThisCursor)
+        if widget.focusPolicy() == Qt.NoFocus:
+            widget.setFocusPolicy(Qt.TabFocus)  # mit Tab erreichbar
+    widget.setAccessibleDescription(term.text)
+    return widget
+
+
+def term_link(text, key):
+    """Ein Wort in einem Rich-Text-Label, das beim Überfahren oder Anklicken erklärt wird."""
+    return glossary.link(text, key)
+
+
+class TermLinks(QObject):
+    """Bedient die term_link-Verweise einer Beschriftung (siehe enable_term_links)."""
+
+    def __init__(self, label):
+        super().__init__(label)
+        self.label, self.pending = label, ""
+        self.timer = QTimer(self)
+        self.timer.setSingleShot(True)
+        self.timer.setInterval(HOVER_MS)
+        self.timer.timeout.connect(self.open_pending)
+        label.linkHovered.connect(self.hovered)
+        label.linkActivated.connect(self.activated)
+
+    def hovered(self, url):
+        key = glossary.key_of_link(url)
+        self.timer.stop()
+        if key:
+            self.pending = key
+            self.timer.start()
+        else:
+            self.pending = ""
+            TermPopup.instance().close_term(self.label, only_unpinned=True)
+
+    def open_pending(self):
+        if self.pending:
+            TermPopup.instance().show_term(self.pending, self.label, False, QCursor.pos())
+
+    def activated(self, url):
+        key = glossary.key_of_link(url)
+        if not key:
+            return
+        self.timer.stop()
+        popup = TermPopup.instance()
+        if popup.isVisible() and popup.owner is self.label and popup.key == key and popup.pinned:
+            popup.close_term()
+        else:  # mit der Maus neben dem Zeiger, mit der Tastatur unter der Beschriftung
+            popup.show_term(key, self.label, True, QCursor.pos() if self.label.underMouse() else None)
+
+
+def enable_term_links(label):
+    """Macht die term_link-Verweise in der Beschriftung bedienbar (auch mit Tab und Eingabetaste)."""
+    if getattr(label, "_term_links", None) is None:
+        label.setTextFormat(Qt.RichText)
+        label.setTextInteractionFlags(Qt.LinksAccessibleByMouse | Qt.LinksAccessibleByKeyboard)
+        palette = label.palette()
+        for role in (QPalette.Link, QPalette.LinkVisited):
+            palette.setColor(role, QColor(TEXT))
+        label.setPalette(palette)
+        label._term_links = TermLinks(label)
+    return label
+
+
 # ---------- Zustand und Netzwerk ----------
 
 class Controller(QObject):
     """Hält Watchlist, Positionen und Kurse; Netzwerkarbeit läuft in Threads."""
     changed = Signal()
     ledger_changed = Signal()
+    history_changed = Signal()  # neue Tageskurse oder Importe: Verlaufsdiagramme neu zeichnen
     trade_recorded = Signal(str, str)  # Symbol, "buy" oder "sell"
     status = Signal(str)
     _result = Signal(object, object, object, object)
@@ -338,6 +653,10 @@ class Controller(QObject):
         self.load_persisted()
         self.fx = FxTable(self.store.fx_rates(), self.store.fx_latest())
         self.fx_history_tried = set()  # Historie wird je Start und Währung einmal nachgeladen
+        self.closes = self.store.closes()  # Tageskurse je Aktie für den Verlauf des Portfolios
+        self.closes_tried = set()
+        self.sources = {}  # Anbindungen für Transaktionen von außen: Name -> sources.TransactionSource
+        self.load_etoro()
         self.pool = ThreadPoolExecutor(max_workers=6)
         self.closed = False
         self._result.connect(self._deliver)
@@ -472,6 +791,37 @@ class Controller(QObject):
         self.run(lambda: sd.fetch_fx_history(code, BASE, start), done,
                  lambda exc: self.status.emit(f"Wechselkurs-Historie {code} nicht abrufbar"))
 
+    def refresh_closes(self):
+        """Lädt die Tageskurse, die der Verlauf braucht: je Aktie ab dem ersten Eintrag."""
+        for symbol in self.symbols:
+            transactions = self.transactions.get(symbol)
+            if transactions and symbol not in self.closes_tried:
+                self.load_closes(symbol, min(t.day for t in transactions))
+
+    def load_closes(self, symbol, first_day):
+        self.closes_tried.add(symbol)
+        start = first_day - dt.timedelta(days=7)  # Puffer für Wochenenden und Feiertage
+        known = sorted(self.closes.get(symbol, {}))
+        if known and known[0] <= start:  # ältere Tage sind schon gespeichert: nur das Neue holen
+            start = known[-1] - dt.timedelta(days=7)
+
+        def done(closes):
+            self.closes.setdefault(symbol, {}).update(closes)
+            self.store.save_closes(symbol, closes, sd.SOURCE)
+            self.history_changed.emit()
+        self.run(lambda: sd.fetch_daily_closes(symbol, start), done,
+                 lambda exc: self.status.emit(f"{symbol}: Kursverlauf nicht abrufbar"))
+
+    def performance(self):
+        """Verlauf des Portfolios Tag für Tag (siehe history.py); nur Aktien der Watchlist."""
+        transactions = {s: self.transactions[s] for s in self.symbols if self.transactions.get(s)}
+        currencies = {}
+        for symbol in transactions:
+            currency = (self.quotes.get(symbol) or {}).get("currency") or self.instruments.get(symbol, {}).get("currency")
+            if currency:
+                currencies[symbol] = currency
+        return history.performance_series(transactions, self.closes, currencies, self.fx)
+
     def portfolio_summary(self):
         """Kennzahlen des ganzen Portfolios in der Basiswährung (siehe portfolio.py)."""
         summary = portfolio.summarize(self.states, self.quotes, self.instruments, self.fx, self.opening, self.symbols)
@@ -485,6 +835,7 @@ class Controller(QObject):
 
     def refresh(self):
         self.refresh_fx()
+        self.refresh_closes()
         for symbol in list(self.symbols):
             self.load_quote(symbol)
             if symbol not in self.events:
@@ -609,10 +960,10 @@ class Controller(QObject):
         self._ledger_changed()
 
     # Transaktionen: die Methoden werfen ValueError bei ungültigen Eingaben
-    def record_trade(self, symbol, kind, shares, price, fee, day, note=""):
-        candidate = ledger.Transaction(0, symbol, kind, shares, price, fee, day, note)
+    def record_trade(self, symbol, kind, shares, price, fee, day, note="", source="manual"):
+        candidate = ledger.Transaction(0, symbol, kind, shares, price, fee, day, note, source)
         ledger.replay(self.transactions.get(symbol, []) + [candidate])  # prüft den ganzen Verlauf
-        self.store.add_transaction(symbol, kind, shares, price, fee, day, note)
+        self.store.add_transaction(symbol, kind, shares, price, fee, day, note, source)
         self._ledger_changed()
         self.trade_recorded.emit(symbol, kind)
 
@@ -623,7 +974,8 @@ class Controller(QObject):
         if pl <= -100:
             raise ValueError("Der Gewinn/Verlust muss über -100 % liegen")
         price = self.quotes[symbol]["price"] / (1 + pl / 100)
-        self.record_trade(symbol, "buy", shares, price, 0.0, dt.date.today(), "Startbestand")
+        self.record_trade(symbol, "buy", shares, price, 0.0, dt.date.today(), ledger.OPENING_NOTE,
+                          ledger.OPENING_SOURCE)
 
     def delete_transaction(self, symbol, transaction_id):
         remaining = [t for t in self.transactions.get(symbol, []) if t.id != transaction_id]
@@ -637,9 +989,77 @@ class Controller(QObject):
     def _ledger_changed(self):
         self.reload_ledger()
         self.fx_history_tried.clear()  # ein neuer, womöglich älterer Kauf braucht evtl. mehr Historie
+        self.closes_tried.clear()
         self.refresh_fx()
+        self.refresh_closes()
         self.changed.emit()
         self.ledger_changed.emit()
+
+    # Anbindungen für Transaktionen von außen (zum Beispiel eToro), siehe sources.py
+    def known_symbols(self):
+        return set(self.symbols) | set(self.transactions)
+
+    def import_trades(self, source, trades, replace_openings=False, cursor="", notes=()):
+        """Bucht die Einträge einer Anbindung und gibt den sources.ImportPlan zurück: was neu ist, was schon
+        da war, was ein unbekanntes Kürzel hat und was den Verlauf ungültig machen würde (wird nicht gebucht).
+        Mit replace_openings ersetzen echte Käufe den Startbestand der betroffenen Aktien."""
+        plan = sources.plan_import(source, trades, self.store.transactions(), self.store.aliases(source),
+                                   self.known_symbols(), replace_openings)
+        before = set(self.symbols)
+        for symbol, trade in plan.new:
+            self.store.add_symbol(symbol)  # nimmt auch eine zuvor entfernte Aktie wieder auf
+            self.store.add_transaction(symbol, trade.kind, trade.shares, trade.price, trade.fee, trade.day,
+                                       trade.note, source, trade.external_id)
+        self.store.delete_transactions(plan.remove_ids)
+        self.symbols = self.store.symbols()
+        self.store.save_sync_state(source, cursor, dt.datetime.now(),
+                                   f"{len(plan.new)} neu, {plan.duplicates} schon vorhanden, "
+                                   f"{len(plan.rejected)} abgelehnt, {sum(plan.unmapped.values())} mit unbekanntem Kürzel"
+                                   + "".join(f"; {note}" for note in notes))
+        self._ledger_changed()
+        for symbol in self.symbols:
+            if symbol not in before:
+                self.load_quote(symbol)
+                self.load_events(symbol)
+                self.load_instrument(symbol)
+        self.history_changed.emit()
+        return plan
+
+    def sync_source(self, name, on_done, on_error, replace_openings=False):
+        """Holt neue Einträge von der Anbindung name (im Hintergrund) und bucht sie."""
+        source = self.sources[name]
+        state = self.store.sync_state(name)
+        cursor = state["cursor"] if state else ""
+
+        def done(batch):
+            on_done(self.import_trades(name, batch.trades, replace_openings, batch.cursor, batch.notes))
+        self.run(lambda: source.fetch(cursor), done, on_error)
+
+    # eToro (nur lesend), siehe etoro.py
+    def load_etoro(self):
+        """Meldet die eToro-Anbindung an, wenn Schlüssel gespeichert sind, sonst ab."""
+        keys = etoro.load_credentials(sd.DATA_DIR)
+        if keys:
+            self.sources["etoro"] = etoro.EtoroSource(etoro.EtoroClient(*keys))
+        else:
+            self.sources.pop("etoro", None)
+
+    def connect_etoro(self, api_key, user_key):
+        etoro.save_credentials(sd.DATA_DIR, api_key, user_key)
+        self.load_etoro()
+
+    def disconnect_etoro(self):
+        """Löscht nur die Schlüssel; die bereits übernommenen Transaktionen bleiben."""
+        etoro.delete_credentials(sd.DATA_DIR)
+        self.load_etoro()
+
+    def sync_etoro(self, on_done, on_error):
+        """Gleicht mit eToro ab; echte Käufe ersetzen dabei den Startbestand."""
+        self.sync_source("etoro", on_done, on_error, replace_openings=True)
+
+    def set_alias(self, source, source_symbol, symbol):
+        """Ordnet das Kürzel einer Anbindung einem Yahoo-Kürzel zu (gilt für spätere Importe)."""
+        self.store.set_alias(source, source_symbol.strip(), symbol.strip().upper())
 
 
 # ---------- Dialoge ----------
@@ -916,8 +1336,13 @@ class StockCard(QFrame):
         self.day.setToolTip(freshness_text(freshness))
         self.values["price"] = quote["price"]
         change = quote["change_pct"]
-        self.day.setText(f"{arrow(change)} {change:+.2f} %")
-        self.day.setStyleSheet(f"color: {sign_color(change)}; font-weight: 600;")
+        if round(change, 2) == 0:  # keine Veränderung, etwa weil die Börse noch nicht geöffnet hat
+            self.day.setText("–")
+            self.day.setStyleSheet(f"color: {MUTED}; font-weight: 600;")
+            change = None  # wie eine leere Zelle: beim Sortieren immer ganz unten
+        else:
+            self.day.setText(f"{arrow(change)} {change:+.2f} %")
+            self.day.setStyleSheet(f"color: {sign_color(change)}; font-weight: 600;")
         self.values["day"] = change
         self.set_market(quote.get("market_state"), stale)
         if position:
@@ -990,7 +1415,7 @@ class MainWindow(QWidget):
         self.portfolio_button.setObjectName("icon")
         self.portfolio_button.setToolTip("Portfolio-Übersicht")
         self.portfolio_button.setCursor(Qt.PointingHandCursor)
-        self.portfolio_button.clicked.connect(lambda: open_portfolio(self.ctl, self.open_detail))
+        self.portfolio_button.clicked.connect(lambda: open_portfolio(self.ctl, above=self))
 
         body = make_panel(self, "Watchlist", self.hide_docked,
                           extras=[self.portfolio_button, self.add_button, self.pin])
@@ -1004,7 +1429,10 @@ class MainWindow(QWidget):
             button = QPushButton(title)
             button.setObjectName("head")
             button.setCursor(Qt.PointingHandCursor)
-            button.setToolTip("Nach dieser Spalte sortieren")
+            if key in HEAD_TERMS:
+                explain(button, HEAD_TERMS[key], note="Ein Klick sortiert die Liste nach dieser Spalte.")
+            else:
+                button.setToolTip("Nach dieser Spalte sortieren")
             if width:
                 button.setFixedWidth(width)
             button.clicked.connect(lambda _=False, k=key: self.sort_by(k))
@@ -1252,13 +1680,18 @@ class TransactionRow(QFrame):
         row.setContentsMargins(16, 10, 8, 10)
         left = QVBoxLayout()
         left.setSpacing(2)
-        kind = "Kauf" if tx.kind == "buy" else "Verkauf"
+        opening = ledger.is_opening(tx)
+        kind = "Startbestand" if opening else "Kauf" if tx.kind == "buy" else "Verkauf"
         title = QLabel(f"{kind} · {tx.shares:g} Stk · {tx.price:.2f} {cur}")
         title.setStyleSheet("font-weight: 700;")
-        details = [tx.day.strftime("%d.%m.%Y")]
+        if opening:
+            explain(title, "startbestand")
+            details = [f"eingetragen {tx.day:%d.%m.%Y}", "Kaufdatum unbekannt"]
+        else:
+            details = [tx.day.strftime("%d.%m.%Y")]
         if tx.fee:
             details.append(f"Gebühr {tx.fee:.2f}")
-        if tx.note:
+        if tx.note and not opening:
             details.append(tx.note)
         sub = QLabel(" · ".join(details))
         sub.setWordWrap(True)
@@ -1266,10 +1699,16 @@ class TransactionRow(QFrame):
         left.addWidget(title)
         left.addWidget(sub)
         row.addLayout(left, 1)
+        imported = tx.source not in ("", "manual", ledger.OPENING_SOURCE)
+        if imported:  # Herkunft sichtbar machen: dieser Eintrag stammt von einer Anbindung, nicht von Hand
+            badge = QLabel(history.source_label(tx.source))
+            style_pill(badge, ACCENT)
+            row.addWidget(badge)
         sale = ctl.sales.get(symbol, {}).get(tx.id)
         if sale:
             gain = QLabel(f"{sale.gain:+.2f} {cur}")
             style_pill(gain, sign_color(sale.gain), strong=True)
+            explain(gain, "realisiert")
             row.addWidget(gain)
         delete = QPushButton("✕")
         delete.setObjectName("icon")
@@ -1278,7 +1717,9 @@ class TransactionRow(QFrame):
         delete.clicked.connect(lambda: FieldDialog(
             "Transaktion löschen",
             f"{kind} von {tx.shares:g} Stück am {tx.day:%d.%m.%Y} wirklich löschen? "
-            "Bestand und Gewinne werden neu berechnet.", [],
+            "Bestand und Gewinne werden neu berechnet."
+            + (f" Der Eintrag stammt von {history.source_label(tx.source)} und wird beim nächsten Abgleich "
+               "wieder angelegt." if imported else ""), [],
             lambda _values: ctl.delete_transaction(symbol, tx.id), ok_text="Löschen").run())
         row.addWidget(delete)
 
@@ -1295,6 +1736,10 @@ class TransactionsWindow(QWidget):
         self.summary.setWordWrap(True)
         self.summary.setStyleSheet(f"color: {MUTED};")
         body.addWidget(self.summary)
+        self.hint = QLabel()
+        self.hint.setWordWrap(True)
+        self.hint.setStyleSheet(f"color: {AMBER}; font-size: 11px;")
+        body.addWidget(self.hint)
         area, self.rows = scroll_area()
         self.rows.addStretch()
         body.addWidget(area, 1)
@@ -1319,6 +1764,20 @@ class TransactionsWindow(QWidget):
         if self.symbol in self.ctl.realized:
             parts.append(f"realisiert {self.ctl.realized[self.symbol]:+.2f} {cur}")
         self.summary.setText(" · ".join(parts) if transactions else "Noch keine Transaktionen.")
+        self.hint.setText(self.history_hint(history.summarize_history(transactions)))
+        self.hint.setVisible(bool(self.hint.text()))
+
+    def history_hint(self, summary):
+        """Erklärt, was die Liste (noch) nicht enthält, und nennt den Stand der Anbindungen."""
+        lines = []
+        if summary and summary.only_opening:
+            lines.append("Nur Startbestand: Das Kaufdatum ist unbekannt, deshalb gibt es noch keine echte Kaufhistorie. "
+                         "Sie entsteht mit neuen Käufen und Verkäufen und mit einer Anbindung wie eToro.")
+        for name, source in self.ctl.sources.items():
+            state = self.ctl.store.sync_state(name)
+            lines.append(f"{source.label}: " + (f"zuletzt abgeglichen {state['last_sync_at']:%d.%m. %H:%M} "
+                                                f"({state['message']})" if state else "noch nicht abgeglichen"))
+        return "\n".join(lines)
 
     def closeEvent(self, event):
         Dock.remove(self)
@@ -1333,6 +1792,8 @@ class TransactionsWindow(QWidget):
 # ---------- Detailfenster ----------
 
 class PriceChart(QWidget):
+    # Marken: Kauf grün (Dreieck nach oben), Verkauf rot (nach unten), Startbestand als Ring;
+    # dazu der Einstandskurs als gestrichelte Linie.
     """Liniendiagramm eines Kursverlaufs mit Hover-Anzeige; points = [(datetime, Kurs)] oder None."""
 
     def __init__(self):
@@ -1340,10 +1801,21 @@ class PriceChart(QWidget):
         self.setFixedHeight(150)
         self.setMouseTracking(True)
         self.points, self.note, self.hover = None, "Wird geladen …", None
+        self.markers, self.cost, self.hover_marker = [], None, None
 
     def show_points(self, points, note=""):
         self.points, self.note, self.hover = points, note, None
+        self.markers, self.cost, self.hover_marker = [], None, None
         self.update()
+
+    def set_overlay(self, markers, cost=None):
+        """Käufe und Verkäufe als Marken (history.Marker) und der Einstandskurs als gestrichelte Linie."""
+        self.markers, self.cost, self.hover_marker = list(markers), cost, None
+        self.update()
+
+    def _x(self, index):
+        rect = self._plot_rect()
+        return rect.left() + rect.width() * index / max(len(self.points) - 1, 1)
 
     def _plot_rect(self):
         return self.rect().adjusted(4, 6, -44, -18)  # rechts Platz für die Kurswerte, unten für die Daten
@@ -1353,10 +1825,12 @@ class PriceChart(QWidget):
             rect = self._plot_rect()
             share = (event.position().x() - rect.left()) / max(rect.width(), 1)
             self.hover = min(max(round(share * (len(self.points) - 1)), 0), len(self.points) - 1)
+            self.hover_marker = next((m for m in self.markers if abs(self._x(m.index) - event.position().x()) <= 8),
+                                     None)
             self.update()
 
     def leaveEvent(self, event):
-        self.hover = None
+        self.hover = self.hover_marker = None
         self.update()
 
     def _draw_guides(self, painter, rect, low, high):
@@ -1390,6 +1864,31 @@ class PriceChart(QWidget):
             painter.setPen(QColor(MUTED))
             painter.drawText(box, align | Qt.AlignVCenter, stamp.strftime(form))
 
+    def _draw_overlay(self, painter, rect, low, span, pos):
+        """Einstandslinie und Marken für Käufe und Verkäufe."""
+        if self.cost:
+            y = rect.bottom() - rect.height() * (self.cost - low) / span
+            painter.setPen(QPen(QColor(AMBER), 1, Qt.DashLine))
+            painter.drawLine(QPointF(rect.left(), y), QPointF(rect.right(), y))
+            painter.setPen(QColor(AMBER))
+            painter.drawText(QRectF(rect.left() + 2, y - 13, 120, 12), Qt.AlignLeft | Qt.AlignVCenter,
+                             f"Einstand {self.cost:.2f}")
+        for marker in self.markers:
+            x = self._x(marker.index)
+            y = min(max(rect.bottom() - rect.height() * (marker.price - low) / span, rect.top() + 6), rect.bottom() - 6)
+            color = QColor(GREEN if marker.kind == "buy" else RED)
+            size = 5.5 if marker is not self.hover_marker else 7.5
+            if marker.opening:
+                painter.setBrush(QColor(BG))
+                painter.setPen(QPen(QColor(ACCENT), 2))
+                painter.drawEllipse(QPointF(x, y), size - 1, size - 1)
+                continue
+            up = marker.kind == "buy"
+            tip = -size if up else size
+            painter.setBrush(color)
+            painter.setPen(QPen(QColor(BG), 1))
+            painter.drawPolygon(QPolygonF([QPointF(x, y + tip), QPointF(x - size, y - tip), QPointF(x + size, y - tip)]))
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
@@ -1400,6 +1899,8 @@ class PriceChart(QWidget):
             return
         prices = [p for _, p in self.points]
         low, high = min(prices), max(prices)
+        if self.cost:  # der Einstandskurs soll immer im Bild liegen
+            low, high = min(low, self.cost), max(high, self.cost)
         span = (high - low) or 1.0
         color = QColor(sign_color(prices[-1] - prices[0]))
 
@@ -1420,6 +1921,7 @@ class PriceChart(QWidget):
         painter.fillPath(fill, shade)
         painter.setPen(QPen(color, 1.8))
         painter.drawPath(path)
+        self._draw_overlay(painter, rect, low, span, pos)
         if self.hover is not None:
             stamp, price = self.points[self.hover]
             point = pos(self.hover)
@@ -1428,7 +1930,7 @@ class PriceChart(QWidget):
             painter.setBrush(color)
             painter.setPen(Qt.NoPen)
             painter.drawEllipse(point, 3.5, 3.5)
-            text = f"{stamp:%d.%m.%Y} · {price:.2f}"
+            text = self.hover_marker.text if self.hover_marker else f"{stamp:%d.%m.%Y} · {price:.2f}"
             box = QRectF(rect.left() + 2, rect.top() + 1, painter.fontMetrics().horizontalAdvance(text) + 8, 14)
             painter.setBrush(QColor(0, 0, 0, 150))
             painter.drawRoundedRect(box, 3, 3)
@@ -1509,20 +2011,40 @@ class DetailWindow(QWidget):
         column = QVBoxLayout(position_card)
         column.setContentsMargins(16, 14, 16, 14)
         column.setSpacing(6)
-        column.addWidget(caption_label("Position"))
+        column.addWidget(explain(caption_label("Position"), "position"))
         pl_row = QHBoxLayout()
-        self.pl_percent = QLabel()
-        self.pl_amount = QLabel()
+        self.pl_percent = explain(QLabel(), "gv_prozent")
+        self.pl_amount = explain(QLabel(), "gv")
         pl_row.addWidget(self.pl_percent)
         pl_row.addSpacing(8)
         pl_row.addWidget(self.pl_amount, 0, Qt.AlignBottom)
         pl_row.addStretch()
         column.addLayout(pl_row)
-        self.position_info = QLabel()
+        self.position_info = enable_term_links(QLabel())
         self.position_info.setWordWrap(True)
         self.position_info.setStyleSheet(f"color: {MUTED}; font-size: 12px;")
         column.addWidget(self.position_info)
         body.addWidget(position_card)
+
+        # Historie
+        history_card = QFrame()
+        history_card.setObjectName("plain")
+        column = QVBoxLayout(history_card)
+        column.setContentsMargins(16, 14, 16, 14)
+        column.setSpacing(6)
+        column.addWidget(explain(caption_label("Historie"), "historie"))
+        self.history_lines = QVBoxLayout()
+        self.history_lines.setSpacing(3)
+        column.addLayout(self.history_lines)
+        self.history_hint = QLabel()
+        self.history_hint.setWordWrap(True)
+        self.history_hint.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        column.addWidget(self.history_hint)
+        self.all_entries = QPushButton("Alle Einträge")
+        self.all_entries.setCursor(Qt.PointingHandCursor)
+        self.all_entries.clicked.connect(lambda: open_transactions(ctl, symbol))
+        column.addWidget(self.all_entries)
+        body.addWidget(history_card)
 
         # Nächster Termin
         event_card = QFrame()
@@ -1530,7 +2052,7 @@ class DetailWindow(QWidget):
         column = QVBoxLayout(event_card)
         column.setContentsMargins(16, 14, 16, 14)
         column.setSpacing(3)
-        column.addWidget(caption_label("Nächster Termin"))
+        column.addWidget(explain(caption_label("Nächster Termin"), "termin"))
         self.event_title = QLabel("Wird geladen …")
         self.event_title.setStyleSheet(f"color: {ACCENT}; font-size: 17px; font-weight: 700;")
         self.event_when = QLabel()
@@ -1553,6 +2075,8 @@ class DetailWindow(QWidget):
 
         ctl.changed.connect(self.refresh_view)
         ctl.trade_recorded.connect(self.on_trade)
+        ctl.ledger_changed.connect(self.refresh_history)
+        self.refresh_history()
         self.fresh_timer = QTimer(self)
         self.fresh_timer.timeout.connect(self.refresh_view)
         self.fresh_timer.start(15_000)
@@ -1573,6 +2097,7 @@ class DetailWindow(QWidget):
         def done(points):
             if self.alive and token == self.history_token:
                 self.chart.show_points(points)
+                self.update_overlay()
                 self.show_range_change(points)
 
         def fail(exc):
@@ -1580,6 +2105,42 @@ class DetailWindow(QWidget):
                 self.chart.show_points(None, f"Kursverlauf nicht ladbar: {exc}")
 
         self.ctl.run(lambda: sd.fetch_history(self.symbol, key), done, fail)
+
+    def update_overlay(self):
+        """Marken für Käufe und Verkäufe im gezeigten Zeitraum und der Einstandskurs."""
+        points = self.chart.points
+        if not points:
+            return
+        position = self.ctl.positions.get(self.symbol)
+        self.chart.set_overlay(history.chart_markers(self.ctl.transactions.get(self.symbol, []), points),
+                               position["cost"] if position else None)
+
+    def refresh_history(self):
+        """Die Karte „Historie“: die jüngsten Einträge und was die Historie noch nicht enthält."""
+        transactions = sorted(self.ctl.transactions.get(self.symbol, []), key=lambda t: (t.day, t.id), reverse=True)
+        while self.history_lines.count():
+            widget = self.history_lines.takeAt(0).widget()
+            if widget:
+                widget.deleteLater()
+        for tx in transactions[:5]:
+            line = QLabel(history.describe(tx))
+            line.setWordWrap(True)
+            line.setStyleSheet("font-size: 12px;")
+            self.history_lines.addWidget(line)
+        if len(transactions) > 5:
+            more = QLabel(f"… und {len(transactions) - 5} weitere")
+            more.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+            self.history_lines.addWidget(more)
+        summary = history.summarize_history(transactions)
+        if not summary:
+            self.history_hint.setText("Noch keine Einträge.")
+        elif summary.only_opening:
+            self.history_hint.setText("Nur Startbestand: Das Kaufdatum ist unbekannt. Echte Käufe und Verkäufe "
+                                      "erscheinen hier, sobald du sie einträgst oder eine Anbindung sie liefert.")
+        else:
+            self.history_hint.setText(f"{summary.count} Einträge seit {summary.first_day:%d.%m.%Y}"
+                                      + (f" · Gebühren {summary.fees:.2f}" if summary.fees else ""))
+        self.update_overlay()
 
     def show_range_change(self, points):
         """Zeigt, um wieviel der Kurs im gewählten Zeitraum gestiegen oder gefallen ist."""
@@ -1625,10 +2186,10 @@ class DetailWindow(QWidget):
             self.pl_percent.setStyleSheet(f"font-size: 24px; font-weight: 700; color: {color};")
             self.pl_amount.setText(f"{amount:+.2f} {cur}")
             self.pl_amount.setStyleSheet(f"font-size: 14px; font-weight: 600; color: {color};")
-            info = (f"{position['shares']:g} Stück · Einstand {position['cost']:.2f} · "
+            info = (f"{position['shares']:g} Stück · {term_link('Einstand', 'einstand')} {position['cost']:.2f} · "
                     f"Wert {quote['price'] * position['shares']:.2f} {cur}")
             if position["realized"]:
-                info += f" · realisiert {position['realized']:+.2f} {cur}"
+                info += f" · {term_link('realisiert', 'realisiert')} {position['realized']:+.2f} {cur}"
             self.position_info.setText(info)
         else:
             self.pl_percent.setText("–")
@@ -1637,7 +2198,8 @@ class DetailWindow(QWidget):
             info = "Keine Position hinterlegt."
             realized = self.ctl.realized.get(self.symbol)
             if realized:
-                info += f" Realisiert insgesamt {realized:+.2f} {quote['currency'] if quote else ''}"
+                info += (f" {term_link('Realisiert', 'realisiert')} insgesamt {realized:+.2f} "
+                         f"{quote['currency'] if quote else ''}")
             self.position_info.setText(info)
 
     def load(self):
@@ -1659,6 +2221,7 @@ class DetailWindow(QWidget):
         if events:
             title, when = sd.describe_event(events[0])
             self.event_title.setText(title)
+            explain(self.event_title, EVENT_TERMS.get(title, "termin"))
             self.event_when.setText(when)
             self.event_more.setText("\n".join("Danach: " + sd.format_event(e) for e in events[1:4]))
         else:
@@ -1676,7 +2239,8 @@ class DetailWindow(QWidget):
     def closeEvent(self, event):
         Dock.remove(self)
         self.alive = False
-        for signal, slot in ((self.ctl.changed, self.refresh_view), (self.ctl.trade_recorded, self.on_trade)):
+        for signal, slot in ((self.ctl.changed, self.refresh_view), (self.ctl.trade_recorded, self.on_trade),
+                             (self.ctl.ledger_changed, self.refresh_history)):
             try:
                 signal.disconnect(slot)
             except (RuntimeError, TypeError):
@@ -1711,7 +2275,9 @@ class NewsCard(QFrame):
 # ---------- Portfolio-Übersicht ----------
 
 PORTFOLIO_WINDOWS = {}
-PALETTE = [ACCENT, GREEN, AMBER, "#a78bfa", "#22d3ee", "#fb923c", "#f472b6", "#94a3b8"]
+_BASE_PALETTE = [ACCENT, GREEN, AMBER, "#a78bfa", "#22d3ee", "#fb923c", "#f472b6", "#94a3b8"]
+PALETTE = _BASE_PALETTE + [QColor(c).lighter(145).name() for c in _BASE_PALETTE]  # 16 unterscheidbare Farben
+ALLOCATION_ITEMS = len(PALETTE)  # so viele Einträge zeigt die Aufteilung einzeln; erst darüber steht "Übrige"
 ALLOCATIONS = (("position", "Position"), ("sector", "Branche"), ("country", "Land"), ("currency", "Währung"))
 SYMBOL_OF_BASE = {"EUR": "€"}
 
@@ -1733,13 +2299,18 @@ def signed_percent(value):
     return "–" if value is None else f"{0.0 if abs(value) < 0.005 else value:+.2f} %"
 
 
-def open_portfolio(ctl, open_symbol):
+def open_portfolio(ctl, above=None):
+    """Öffnet das Portfolio; mit above (dem Hauptfenster) sitzt es über diesem, sonst links daneben."""
     existing = PORTFOLIO_WINDOWS.get("window")
     if existing:
+        if above is not None and existing.dock_above is not above:
+            existing.dock_above = above
+            existing.fit_height()
         existing.raise_()
         existing.activateWindow()
         return
-    window = PortfolioWindow(ctl, open_symbol)
+    window = PortfolioWindow(ctl)
+    window.dock_above = above
     window.closed.connect(lambda: PORTFOLIO_WINDOWS.pop("window", None))
     PORTFOLIO_WINDOWS["window"] = window
     Dock.add(window)
@@ -1783,16 +2354,17 @@ class DonutChart(QWidget):
 class StatTile(QFrame):
     """Kennzahl mit Überschrift, großem Wert und einer kleinen Zusatzzeile."""
 
-    def __init__(self, caption):
+    def __init__(self, caption, term=None):
         super().__init__()
         self.setObjectName("plain")
         column = QVBoxLayout(self)
         column.setContentsMargins(14, 12, 14, 12)
         column.setSpacing(3)
-        column.addWidget(caption_label(caption))
+        label = caption_label(caption)
+        column.addWidget(explain(label, term) if term else label)
         self.value = QLabel("–")
         self.value.setStyleSheet("font-size: 17px; font-weight: 700;")
-        self.sub = QLabel()
+        self.sub = enable_term_links(QLabel())  # Zusatzzeilen enthalten erklärbare Wörter (Rich Text, Zeilen mit <br>)
         self.sub.setWordWrap(True)
         self.sub.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
         column.addWidget(self.value)
@@ -1805,99 +2377,150 @@ class StatTile(QFrame):
         self.sub.setText(sub)
 
 
-# Spalten der Positionstabelle: Schlüssel, Überschrift, Breite, Ausrichtung
-HOLDING_COLUMNS = (
-    ("symbol", "Symbol", 62, Qt.AlignLeft),
-    ("shares", "Stk", 50, Qt.AlignRight),
-    ("avg_cost", "Einstand", 66, Qt.AlignRight),
-    ("price", "Kurs", 66, Qt.AlignRight),
-    ("value", "Wert", 84, Qt.AlignRight),
-    ("pl", "G/V", 78, Qt.AlignRight),
-    ("pl_pct", "G/V %", 64, Qt.AlignRight),
-    ("share", "Anteil", 52, Qt.AlignRight),
-)
+class PerformanceChart(QWidget):
+    """Wert (Fläche) und investiertes Kapital (gestrichelt) des Portfolios über der Zeit;
+    points = [history.PerformancePoint]."""
 
-
-class HoldingRow(QFrame):
-    clicked = Signal(str)
-
-    def __init__(self, symbol):
+    def __init__(self):
         super().__init__()
-        self.symbol = symbol
-        self.setObjectName("card")
-        self.setCursor(Qt.PointingHandCursor)
-        self.setFixedHeight(30)
-        row = QHBoxLayout(self)
-        row.setContentsMargins(*ROW_MARGINS)
-        row.setSpacing(ROW_SPACING)
-        self.labels = {}
-        for key, _, width, align in HOLDING_COLUMNS:
-            label = QLabel()
-            label.setFixedWidth(width)
-            label.setAlignment(align | Qt.AlignVCenter)
-            self.labels[key] = label
-            row.addWidget(label)
-        self.labels["symbol"].setText(symbol)
-        self.labels["symbol"].setStyleSheet("font-weight: 700;")
+        self.setFixedHeight(150)
+        self.setMouseTracking(True)
+        self.points, self.hover = [], None
 
-    def set_holding(self, holding):
-        labels = self.labels
-        labels["symbol"].setToolTip(holding.name)
-        labels["shares"].setText(f"{holding.shares:g}")
-        labels["avg_cost"].setText(f"{holding.avg_cost:.2f}")
-        labels["price"].setText(f"{holding.price:.2f}")
-        labels["avg_cost"].setToolTip(f"in {holding.currency}")
-        labels["price"].setToolTip(f"in {holding.currency}")
-        labels["value"].setText(f"{holding.value:,.2f}")
-        color = sign_color(holding.unrealized)
-        labels["pl"].setText(signed_number(holding.unrealized))
-        labels["pl"].setStyleSheet(f"color: {color};")
-        labels["pl"].setToolTip(f"Kurs {signed_money(holding.price_effect)} · Währung {signed_money(holding.fx_effect)}")
-        labels["pl_pct"].setText(signed_percent(holding.pl_pct))
-        labels["pl_pct"].setStyleSheet(f"color: {color}; font-weight: 600;")
-        labels["share"].setText(f"{holding.share:.1f} %")
-        labels["share"].setStyleSheet(f"color: {MUTED};")
+    def show_series(self, points):
+        self.points, self.hover = list(points), None
+        self.update()
 
-    def mouseReleaseEvent(self, event):
-        if event.button() == Qt.LeftButton and self.rect().contains(event.position().toPoint()):
-            self.clicked.emit(self.symbol)
+    def _plot_rect(self):
+        return self.rect().adjusted(4, 6, -52, -18)  # rechts Platz für die Beträge, unten für die Daten
+
+    def _x(self, index):
+        rect = self._plot_rect()
+        return rect.left() + rect.width() * index / max(len(self.points) - 1, 1)
+
+    def mouseMoveEvent(self, event):
+        if len(self.points) >= 2:
+            rect = self._plot_rect()
+            share = (event.position().x() - rect.left()) / max(rect.width(), 1)
+            self.hover = min(max(round(share * (len(self.points) - 1)), 0), len(self.points) - 1)
+            self.update()
+
+    def leaveEvent(self, event):
+        self.hover = None
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        if len(self.points) < 2:
+            painter.setPen(QColor(MUTED))
+            painter.drawText(self.rect(), Qt.AlignCenter,
+                             "Noch kein Verlauf" if not self.points else "Erst ein Tag, noch kein Verlauf")
+            return
+        rect = self._plot_rect()
+        values = [p.value for p in self.points]
+        invested = [p.invested for p in self.points]
+        low, high = min(values + invested), max(values + invested)
+        pad = ((high - low) or max(high, 1.0) * 0.1) * 0.08
+        low, high = low - pad, high + pad
+        span = high - low
+
+        def y(amount):
+            return rect.bottom() - rect.height() * (amount - low) / span
+
+        guide = QColor(MUTED)
+        guide.setAlpha(60)
+        small = painter.font()
+        small.setPixelSize(10)
+        painter.setFont(small)
+        for step in range(4):
+            line_y = rect.bottom() - rect.height() * step / 3
+            painter.setPen(QPen(guide, 1, Qt.DotLine))
+            painter.drawLine(QPointF(rect.left(), line_y), QPointF(rect.right(), line_y))
+            painter.setPen(QColor(MUTED))
+            painter.drawText(QRectF(rect.right() + 4, line_y - 7, 48, 14), Qt.AlignLeft | Qt.AlignVCenter,
+                             f"{low + span * step / 3:,.0f}")
+        for index, align in ((0, Qt.AlignLeft), (len(self.points) - 1, Qt.AlignRight)):
+            box = QRectF(rect.left() if index == 0 else rect.right() - 80, rect.bottom() + 3, 80, 12)
+            painter.drawText(box, align | Qt.AlignVCenter, f"{self.points[index].day:%d.%m.%y}")
+
+        color = QColor(sign_color(self.points[-1].result))
+        path = QPainterPath(QPointF(self._x(0), y(values[0])))
+        for index in range(1, len(values)):
+            path.lineTo(QPointF(self._x(index), y(values[index])))
+        fill = QPainterPath(path)
+        fill.lineTo(rect.right(), rect.bottom())
+        fill.lineTo(rect.left(), rect.bottom())
+        fill.closeSubpath()
+        shade = QColor(color)
+        shade.setAlpha(36)
+        painter.fillPath(fill, shade)
+        cost = QPainterPath(QPointF(self._x(0), y(invested[0])))
+        for index in range(1, len(invested)):
+            cost.lineTo(QPointF(self._x(index), y(invested[index])))
+        painter.setPen(QPen(QColor(MUTED), 1.4, Qt.DashLine))
+        painter.drawPath(cost)
+        painter.setPen(QPen(color, 1.8))
+        painter.drawPath(path)
+        if self.hover is not None:
+            point = self.points[self.hover]
+            x = self._x(self.hover)
+            painter.setPen(QPen(QColor(MUTED), 1, Qt.DashLine))
+            painter.drawLine(QPointF(x, rect.top()), QPointF(x, rect.bottom()))
+            painter.setBrush(color)
+            painter.setPen(Qt.NoPen)
+            painter.drawEllipse(QPointF(x, y(point.value)), 3.5, 3.5)
+            text = (f"{point.day:%d.%m.%Y} · Wert {point.value:,.2f} · investiert {point.invested:,.2f} · "
+                    f"Ergebnis {signed_number(point.result)}")
+            box = QRectF(rect.left() + 2, rect.top() + 1, painter.fontMetrics().horizontalAdvance(text) + 8, 14)
+            painter.setBrush(QColor(0, 0, 0, 170))
+            painter.drawRoundedRect(box, 3, 3)
+            painter.setPen(QColor("#ffffff"))
+            painter.drawText(box, Qt.AlignCenter, text)
 
 
 class PortfolioWindow(QWidget):
-    """Gesamtwert, Ergebnis (unrealisiert, realisiert, Währungseffekt), Aufteilung und alle Positionen."""
+    """Gesamtwert, Ergebnis (unrealisiert, realisiert, Währungseffekt) und Aufteilung. Die einzelnen Positionen
+    stehen in der Watchlist."""
     closed = Signal()
 
-    def __init__(self, ctl, open_symbol):
+    WIDTH = 700  # solange es nicht über der Watchlist sitzt; dort gilt deren Breite
+    LEGEND_SPLIT = 5  # ab so vielen Einträgen steht die Legende in zwei Spalten
+
+    def __init__(self, ctl):
         super().__init__()
         self.setAttribute(Qt.WA_DeleteOnClose)
-        self.ctl, self.open_symbol = ctl, open_symbol
+        self.ctl = ctl
         self.dimension = "position"
         self.summary = None
-        self.rows = {}
+        self.dock_above = None
+        self.desired_height = 600
         body = make_panel(self, "Portfolio", self.close, pin=(ctl, "portfolio"))
-        area, content = scroll_area()
-        body.addWidget(area, 1)
+        self.area, content = scroll_area()
+        body.addWidget(self.area, 1)
 
         hero = QFrame()
         hero.setObjectName("plain")
         column = QVBoxLayout(hero)
         column.setContentsMargins(18, 14, 18, 14)
         column.setSpacing(2)
-        column.addWidget(caption_label(f"Gesamtwert in {BASE}"))
+        column.addWidget(explain(caption_label(f"Gesamtwert in {BASE}"), "gesamtwert"))
         self.total = QLabel("–")
         self.total.setStyleSheet("font-size: 32px; font-weight: 700;")
-        self.total_sub = QLabel()
+        self.total_sub = enable_term_links(QLabel())
         self.total_sub.setStyleSheet(f"color: {MUTED};")
         column.addWidget(self.total)
         column.addWidget(self.total_sub)
-        content.addWidget(hero)
-
-        tiles = QHBoxLayout()
-        tiles.setSpacing(8)
-        self.unrealized, self.realized, self.result = StatTile("Unrealisiert"), StatTile("Realisiert"), StatTile("Gesamt")
+        # Gesamtwert und die drei Kennzahlen stehen in einer Reihe, damit die Breite genutzt wird
+        top = QHBoxLayout()
+        top.setSpacing(8)
+        top.addWidget(hero, 2)
+        self.unrealized = StatTile("Unrealisiert", "unrealisiert")
+        self.realized = StatTile("Realisiert", "realisiert")
+        self.result = StatTile("Gesamt", "gesamtergebnis")
         for tile in (self.unrealized, self.realized, self.result):
-            tiles.addWidget(tile, 1)
-        content.addLayout(tiles)
+            top.addWidget(tile, 1)
+        content.addLayout(top)
 
         self.notes = QLabel()
         self.notes.setWordWrap(True)
@@ -1905,12 +2528,31 @@ class PortfolioWindow(QWidget):
         self.notes.hide()
         content.addWidget(self.notes)
 
+        performance_card = QFrame()
+        performance_card.setObjectName("plain")
+        column = QVBoxLayout(performance_card)
+        column.setContentsMargins(14, 12, 14, 12)
+        column.setSpacing(6)
+        head = QHBoxLayout()
+        head.addWidget(explain(caption_label("Verlauf"), "verlauf"))
+        head.addStretch()
+        self.performance_result = QLabel()
+        head.addWidget(self.performance_result)
+        column.addLayout(head)
+        self.performance_chart = PerformanceChart()
+        column.addWidget(self.performance_chart)
+        self.performance_note = QLabel()
+        self.performance_note.setWordWrap(True)
+        self.performance_note.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        column.addWidget(self.performance_note)
+        content.addWidget(performance_card)
+
         allocation_card = QFrame()
         allocation_card.setObjectName("plain")
         column = QVBoxLayout(allocation_card)
         column.setContentsMargins(14, 12, 14, 14)
         column.setSpacing(8)
-        column.addWidget(caption_label("Aufteilung"))
+        column.addWidget(explain(caption_label("Aufteilung"), "aufteilung"))
         segments = QHBoxLayout()
         segments.setSpacing(4)
         self.segment_group = QButtonGroup(self)
@@ -1931,38 +2573,18 @@ class PortfolioWindow(QWidget):
         chart_row.setSpacing(16)
         self.donut = DonutChart()
         chart_row.addWidget(self.donut, 0, Qt.AlignTop)
-        self.legend = QVBoxLayout()
-        self.legend.setSpacing(5)
+        self.legend = QGridLayout()
+        self.legend.setHorizontalSpacing(24)
+        self.legend.setVerticalSpacing(5)
         chart_row.addLayout(self.legend, 1)
         column.addLayout(chart_row)
         content.addWidget(allocation_card)
 
-        content.addWidget(caption_label("Positionen"))
-        header = QWidget()
-        head_row = QHBoxLayout(header)
-        head_row.setContentsMargins(*ROW_MARGINS)
-        head_row.setSpacing(ROW_SPACING)
-        for _, title, width, align in HOLDING_COLUMNS:
-            head = QLabel(title)
-            head.setFixedWidth(width)
-            head.setAlignment(align | Qt.AlignVCenter)
-            head.setStyleSheet(f"color: {MUTED}; font-size: 10px; font-weight: 700;")
-            head_row.addWidget(head)
-        content.addWidget(header)
-        self.holdings_layout = QVBoxLayout()
-        self.holdings_layout.setSpacing(4)
-        content.addLayout(self.holdings_layout)
-        self.empty = QLabel("Noch keine Position mit Kurs.\nLege über das Menü einer Aktie einen Startbestand an.")
-        self.empty.setAlignment(Qt.AlignCenter)
-        self.empty.setStyleSheet(f"color: {MUTED};")
-        content.addWidget(self.empty)
         content.addStretch()
 
         screen = QApplication.primaryScreen().availableGeometry()
-        row_width = ROW_MARGINS[0] + ROW_MARGINS[2] + sum(w for _, _, w, _ in HOLDING_COLUMNS) \
-            + ROW_SPACING * (len(HOLDING_COLUMNS) - 1)
-        # + Scrollleiste samt Rand (12), Innenrand des Panels (32), Rahmen (2), Schattenrand des Fensters (28)
-        self.setFixedSize(row_width + 12 + 32 + 2 + 28, min(820, screen.height() - 20))
+        self.screen_height = screen.height() - 20
+        self.setFixedWidth(self.WIDTH)
 
         # Viele Kursmeldungen kurz hintereinander (eine je Aktie) ergeben nur eine Aktualisierung.
         self.update_timer = QTimer(self)
@@ -1970,39 +2592,87 @@ class PortfolioWindow(QWidget):
         self.update_timer.setInterval(200)
         self.update_timer.timeout.connect(self.refresh)
         ctl.changed.connect(self.update_timer.start)
+        ctl.history_changed.connect(self.update_timer.start)
         self.refresh()
+
+    def refresh_performance(self):
+        """Verlauf von Wert und Investiert; die Zeile oben rechts zeigt das Ergebnis bis heute."""
+        series = self.ctl.performance()
+        self.performance_chart.show_series(series.points)
+        notes = []
+        if series.points:
+            last = series.points[-1]
+            self.performance_result.setText(f"{signed_money(last.result)} · {signed_percent(last.return_pct)}")
+            self.performance_result.setStyleSheet(f"color: {sign_color(last.result)}; font-size: 12px; font-weight: 600;")
+        else:
+            self.performance_result.setText("")
+        entries = [t for symbol in self.ctl.symbols for t in self.ctl.transactions.get(symbol, [])]
+        summary = history.summarize_history(entries)
+        if summary and summary.only_opening:
+            notes.append(f"Der Verlauf beginnt am {summary.first_day:%d.%m.%Y}, dem Tag der Eintragung: Frühere Käufe "
+                         "sind unbekannt. Er wächst mit neuen Käufen und Verkäufen und mit einer Anbindung wie eToro.")
+        elif summary:
+            notes.append(f"Verlauf ab {summary.first_day:%d.%m.%Y}, dem ersten Eintrag.")
+        if series.missing:
+            notes.append("Ohne Kurse oder Wechselkurse im Verlauf: " + ", ".join(series.missing))
+        self.performance_note.setText("\n".join(notes))
+        self.performance_note.setVisible(bool(notes))
 
     def refresh(self):
         summary = self.ctl.portfolio_summary()
         self.summary = summary
         self.total.setText(money(summary.value))
-        self.total_sub.setText(f"investiert {money(summary.invested)}")
+        self.total_sub.setText(f"{term_link('investiert', 'investiert')} {money(summary.invested)}")
 
         def split(price, fx_part):
-            return f"Kurs {signed_money(price)}\nWährung {signed_money(fx_part)}"
+            return (f"{term_link('Kurs', 'kursgewinn')} {signed_money(price)}<br>"
+                    f"{term_link('Währung', 'waehrungseffekt')} {signed_money(fx_part)}")
 
         self.unrealized.set(signed_money(summary.unrealized), sign_color(summary.unrealized),
-                            f"{signed_percent(summary.unrealized_pct)}\n"
+                            f"{signed_percent(summary.unrealized_pct)}<br>"
                             + split(summary.price_effect, summary.fx_effect))
         self.realized.set(signed_money(summary.realized), sign_color(summary.realized),
-                          "aus Verkäufen\n" + split(summary.realized_price, summary.realized_fx))
+                          "aus Verkäufen<br>" + split(summary.realized_price, summary.realized_fx))
         self.result.set(signed_money(summary.total_result), sign_color(summary.total_result),
-                        f"Rendite {signed_percent(summary.total_return_pct)}\n"
+                        f"{term_link('Rendite', 'gesamtrendite')} {signed_percent(summary.total_return_pct)}<br>"
                         f"auf {money(summary.total_invested)} eingesetzt")
         self.notes.setText("\n".join("⚠ " + warning for warning in summary.warnings))
         self.notes.setVisible(bool(summary.warnings))
+        self.refresh_performance()
         self.show_allocation(self.dimension)
-        self.sync_rows(summary.holdings)
+
+    # Fensterrahmen um den Inhalt: Kopfzeile, Ränder des Panels, Rahmen und Schattenrand
+    CHROME = 110
+
+    def update_desired_height(self):
+        # Umbrechende Texte brauchen mehr Höhe als die sizeHint sagt, deshalb die Höhe für die echte Breite
+        width = self.width() - 62  # Panel, Rahmen, Schattenrand und Scrollleiste
+        content = self.area.widget().layout().totalHeightForWidth(width)
+        self.desired_height = min(content + self.CHROME, self.screen_height)
+
+    def fit_height(self):
+        """Das Fenster ist so hoch wie sein Inhalt, höchstens so hoch wie der Bildschirm; das Dock kürzt es
+        weiter, wenn es über einem anderen Fenster sitzt."""
+        self.update_desired_height()
+        if not Dock.fits_above(self):
+            self.setFixedHeight(self.desired_height)
+        Dock.arrange()
 
     def show_allocation(self, dimension):
         self.dimension = dimension
         self.segments[dimension].setChecked(True)
-        slices = portfolio.allocation(self.summary.holdings, dimension) if self.summary else []
+        slices = portfolio.allocation(self.summary.holdings, dimension, ALLOCATION_ITEMS) if self.summary else []
         self.donut.set_slices(slices)
         while self.legend.count():
             item = self.legend.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
+        for index in range(self.legend.rowCount()):
+            self.legend.setRowStretch(index, 0)
+        self.legend.setColumnStretch(0, 1)
+        self.legend.setColumnStretch(1, 1)
+        columns = 2 if len(slices) > self.LEGEND_SPLIT else 1
+        per_column = -(-len(slices) // columns) or 1
         for index, (label, value, percent) in enumerate(slices):
             row = QWidget()
             line = QHBoxLayout(row)
@@ -2018,38 +2688,21 @@ class PortfolioWindow(QWidget):
             line.addWidget(dot)
             line.addWidget(name, 1)
             line.addWidget(amount)
-            self.legend.addWidget(row)
+            self.legend.addWidget(row, index % per_column, index // per_column)
         if not slices:
             note = QLabel("Keine Daten")
             note.setStyleSheet(f"color: {MUTED};")
-            self.legend.addWidget(note)
-        self.legend.addStretch()
-
-    def sync_rows(self, holdings):
-        ordered = sorted(holdings, key=lambda h: -h.value)
-        wanted = [h.symbol for h in ordered]
-        for symbol in list(self.rows):
-            if symbol not in wanted:
-                self.holdings_layout.removeWidget(self.rows[symbol])
-                self.rows.pop(symbol).deleteLater()
-        for holding in ordered:
-            if holding.symbol not in self.rows:
-                row = HoldingRow(holding.symbol)
-                row.clicked.connect(self.open_symbol)
-                self.rows[holding.symbol] = row
-            self.rows[holding.symbol].set_holding(holding)
-        for index, symbol in enumerate(wanted):
-            if self.holdings_layout.indexOf(self.rows[symbol]) != index:
-                self.holdings_layout.removeWidget(self.rows[symbol])
-                self.holdings_layout.insertWidget(index, self.rows[symbol])
-        self.empty.setVisible(not wanted)
+            self.legend.addWidget(note, 0, 0)
+        self.legend.setRowStretch(max(per_column if slices else 1, 1), 1)
+        self.fit_height()  # die Legende hat jetzt vielleicht mehr oder weniger Zeilen
 
     def closeEvent(self, event):
         Dock.remove(self)
-        try:
-            self.ctl.changed.disconnect(self.update_timer.start)
-        except (RuntimeError, TypeError):
-            pass
+        for signal in (self.ctl.changed, self.ctl.history_changed):
+            try:
+                signal.disconnect(self.update_timer.start)
+            except (RuntimeError, TypeError):
+                pass
         self.closed.emit()
         super().closeEvent(event)
 
@@ -2075,7 +2728,7 @@ def restore_pinned(ctl, main):
     for key in ctl.pinned:
         kind, _, symbol = key.partition(":")
         if kind == "portfolio":
-            open_portfolio(ctl, main.open_detail)
+            open_portfolio(ctl, above=main)
         elif symbol in ctl.symbols and kind == "detail":
             main.open_detail(symbol)
         elif symbol in ctl.symbols and kind == "tx":
@@ -2116,6 +2769,34 @@ def close_all_windows(ctl):
     ctl.shutdown()
 
 
+def sync_etoro_now(ctl, notify):
+    """Gleicht mit eToro ab und meldet das Ergebnis über notify(Titel, Text)."""
+    if "etoro" not in ctl.sources:
+        return notify("eToro", "Noch nicht verbunden. Im Menü „eToro verbinden …“ wählen.")
+
+    def done(plan):
+        unmapped = ", ".join(sorted(plan.unmapped))
+        notify("eToro abgeglichen", f"{len(plan.new)} neue Transaktionen, {plan.duplicates} schon vorhanden, "
+               f"{len(plan.rejected)} abgelehnt." + (f" Kürzel unbekannt: {unmapped}." if unmapped else ""))
+    ctl.sync_etoro(done, lambda exc: notify("eToro-Abgleich fehlgeschlagen", str(exc)))
+
+
+def connect_etoro_dialog(ctl, notify):
+    """Fragt API-Key und User-Key ab (api-portal.etoro.com, Leserecht genügt), speichert sie und gleicht ab."""
+    def save(values):
+        try:
+            ctl.connect_etoro(*values)
+        except OSError as exc:
+            raise ValueError(f"Speichern nicht möglich: {exc}")
+    dialog = FieldDialog("eToro verbinden",
+                         "Schlüssel aus api-portal.etoro.com (Einstellungen → Trading → API-Schlüssel). "
+                         "Ein Schlüssel mit Leserecht genügt; das Widget handelt nicht. Die Schlüssel liegen "
+                         "als Klartext in etoro.json im Datenordner.",
+                         [("API-Key", "", str), ("User-Key", "", str)], save, ok_text="Verbinden")
+    if dialog.run():
+        sync_etoro_now(ctl, notify)
+
+
 def main():
     lock = claim_single_instance()
     if lock is None:
@@ -2133,9 +2814,14 @@ def main():
     tray_menu = make_menu()
     tray_menu.addAction("Öffnen", lambda: open_widget(ctl, window))
     tray_menu.addAction("Alle Fenster schließen", lambda: close_widget(window))
-    tray_menu.addAction("Portfolio", lambda: open_portfolio(ctl, window.open_detail))
-    tray_menu.addAction("Beenden", app.quit)
+    tray_menu.addAction("Portfolio", lambda: open_portfolio(ctl, above=window))
     tray = QSystemTrayIcon(icon, app)
+    notify = lambda title, text: tray.showMessage(title, text, QSystemTrayIcon.Information, 8000)
+    tray_menu.addSeparator()
+    tray_menu.addAction("eToro verbinden …", lambda: connect_etoro_dialog(ctl, notify))
+    tray_menu.addAction("eToro abgleichen", lambda: sync_etoro_now(ctl, notify))
+    tray_menu.addSeparator()
+    tray_menu.addAction("Beenden", app.quit)
     tray.setToolTip("Aktien-Widget")
     tray.setContextMenu(tray_menu)
     tray.activated.connect(lambda reason: toggle_widget(ctl, window) if reason == QSystemTrayIcon.Trigger else None)
@@ -2145,6 +2831,8 @@ def main():
     if "--tray" not in sys.argv:
         open_widget(ctl, window)
     ctl.start()
+    if "etoro" in ctl.sources:
+        sync_etoro_now(ctl, notify)
     sys.exit(app.exec())
 
 

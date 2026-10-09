@@ -13,14 +13,20 @@ class FakeInfo(dict):
 class FakeTicker:
     created = []  # (Symbol, history-Aufrufe) der erzeugten Ticker, damit Tests die Abfragen prüfen können
 
-    def __init__(self, symbol, info=None, calendar=None, news=None, details=None, isin="-", frame=None):
+    def __init__(self, symbol, info=None, calendar=None, news=None, details=None, isin="-", frame=None, metadata=None):
         self.symbol, self.frame, self.history_calls = symbol, frame, []
         FakeTicker.created.append(self)
         self.fast_info = info if info is not None else FakeInfo(last_price=110.0, previous_close=100.0, currency="USD")
         self.calendar = calendar
+        self.metadata = metadata
         self.news = news or []
         self.info = details if details is not None else {}
         self._isin = isin
+
+    def get_history_metadata(self):
+        if self.metadata is None:
+            raise RuntimeError("keine Metadaten")
+        return self.metadata
 
     def history(self, **kwargs):
         self.history_calls.append(kwargs)
@@ -155,6 +161,70 @@ class QuoteTests(unittest.TestCase):
         self.assertAlmostEqual(quote["price"], 110.0)
         self.assertAlmostEqual(quote["change_pct"], 10.0)
         self.assertEqual(quote["currency"], "USD")
+
+    @staticmethod
+    def meta(start, last, tz="America/New_York"):
+        return {"currentTradingPeriod": {"regular": {"start": start}}, "regularMarketTime": last,
+                "exchangeTimezoneName": tz}
+
+    def test_change_is_measured_against_the_regular_close_not_the_after_hours_price(self):
+        """Regression GEV: fast_info["previous_close"] enthält die Nachbörse des Vortags (998,80), der offizielle
+        Schlusskurs war 997,09."""
+        info = FakeInfo(last_price=1000.0, previous_close=998.8, regular_market_previous_close=990.0, currency="USD")
+        patcher, _ = patch_yf(info=info)
+        with patcher:
+            self.assertAlmostEqual(sd.fetch_quote("X")["change_pct"], (1000 / 990 - 1) * 100)
+
+    def test_without_the_regular_close_the_old_previous_close_is_the_fallback(self):
+        info = FakeInfo(last_price=110.0, previous_close=100.0, regular_market_previous_close=None, currency="USD")
+        patcher, _ = patch_yf(info=info)
+        with patcher:
+            self.assertAlmostEqual(sd.fetch_quote("X")["change_pct"], 10.0)
+
+    def test_before_the_session_starts_there_is_no_change_yet(self):
+        # Freitag 9.10.2026, 10:00 New York; Sitzung beginnt 13:30 UTC, letzter Handel gestern
+        now = dt.datetime(2026, 10, 9, 14, 0, tzinfo=dt.timezone.utc).timestamp()
+        start = dt.datetime(2026, 10, 9, 13, 30, tzinfo=dt.timezone.utc).timestamp()
+        last = start - 15 * 3600
+        info = FakeInfo(last_price=999.35, previous_close=998.8, regular_market_previous_close=997.09, currency="USD")
+        patcher, _ = patch_yf(info=info, metadata=self.meta(start, last))
+        with patcher, mock.patch.object(sd.time, "time", lambda: start - 3600):
+            self.assertEqual(sd.fetch_quote("X")["change_pct"], 0.0)
+        with patcher, mock.patch.object(sd.time, "time", lambda: now):  # Sitzung läuft schon
+            self.assertAlmostEqual(sd.fetch_quote("X")["change_pct"], (999.35 / 997.09 - 1) * 100)
+
+    def test_pandas_timestamps_in_the_metadata_work_like_epoch_seconds(self):
+        """yfinance 1.7 liefert Timestamps statt Zahlen."""
+        import pandas as pd
+        start = pd.Timestamp("2026-10-09 09:30", tz="America/New_York")
+        last = pd.Timestamp("2026-10-08 16:00", tz="America/New_York")
+        info = FakeInfo(last_price=999.35, previous_close=998.8, regular_market_previous_close=997.09, currency="USD")
+        patcher, _ = patch_yf(info=info, metadata=self.meta(start, last))
+        with patcher, mock.patch.object(sd.time, "time", lambda: start.timestamp() - 7200):
+            self.assertEqual(sd.fetch_quote("X")["change_pct"], 0.0)
+
+    def test_on_the_weekend_the_change_of_the_last_session_stays(self):
+        saturday = dt.datetime(2026, 10, 10, 12, 0, tzinfo=dt.timezone.utc).timestamp()
+        start = saturday + 3600 * 25  # die Metadaten nennen schon den nächsten Handelstag
+        info = FakeInfo(last_price=110.0, previous_close=100.0, regular_market_previous_close=100.0, currency="USD")
+        patcher, _ = patch_yf(info=info, metadata=self.meta(start, saturday - 40 * 3600))
+        with patcher, mock.patch.object(sd.time, "time", lambda: saturday):
+            self.assertAlmostEqual(sd.fetch_quote("X")["change_pct"], 10.0)
+
+    def test_quote_reports_the_market_state_of_its_listing(self):
+        for yahoo, ours in (("REGULAR", "open"), ("PRE", "extended"), ("POST", "extended"),
+                            ("POSTPOST", "closed"), ("CLOSED", "closed")):
+            patcher, _ = patch_yf(details={"marketState": yahoo})
+            with patcher:
+                self.assertEqual(sd.fetch_quote("X")["market_state"], ours, yahoo)
+
+    def test_unknown_or_missing_market_state_is_none_and_never_breaks_the_quote(self):
+        for details in ({}, {"marketState": "SOMETHING_NEW"}):
+            patcher, _ = patch_yf(details=details)
+            with patcher:
+                quote = sd.fetch_quote("X")
+            self.assertIsNone(quote["market_state"])
+            self.assertAlmostEqual(quote["price"], 110.0)
 
     def test_quote_names_its_source(self):
         patcher, _ = patch_yf()

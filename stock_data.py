@@ -4,6 +4,8 @@ Datenquelle: Yahoo Finance über yfinance (kein API-Key, keine KI nötig).
 """
 import datetime as dt
 import os
+import time
+import zoneinfo
 
 import yfinance as yf
 
@@ -25,16 +27,64 @@ EVENT_SHORT = {"Quartalszahlen": "Zahlen", "Ex-Dividende": "Ex-Div.", "Dividende
 
 # ---------- Kurse, Termine, News ----------
 
+# Handelsstatus der Notierung bei Yahoo (marketState) -> "open", "extended" (Vor-/Nachbörse) oder "closed"
+MARKET_STATES = {"REGULAR": "open", "PRE": "extended", "POST": "extended",
+                 "PREPRE": "closed", "POSTPOST": "closed", "CLOSED": "closed"}
+
+
+def fetch_market_state(ticker):
+    """Handelsstatus der Notierung dieses Symbols; None, wenn Yahoo ihn nicht liefert. Ein Fehler hier
+    darf den Kurs nicht verhindern."""
+    try:
+        return MARKET_STATES.get(ticker.info.get("marketState"))
+    except Exception:
+        return None
+
+
+def previous_close(info):
+    """Schlusskurs der letzten regulären Sitzung vor der laufenden. fast_info["previous_close"] nimmt dagegen den
+    letzten Kurs des Vortags samt Nachbörse und weicht davon ab; er bleibt nur als Ersatz."""
+    try:
+        regular = info["regular_market_previous_close"]
+    except KeyError:
+        regular = None
+    return regular if regular not in (None, 0) else info["previous_close"]
+
+
+def _epoch(value):
+    """Sekunden seit 1970; yfinance liefert je nach Version Zeitstempel (pandas) oder ganze Zahlen."""
+    return value.timestamp() if hasattr(value, "timestamp") else float(value)
+
+
+def session_not_started(ticker, now=None):
+    """Wahr, wenn die reguläre Sitzung dieses Handelstages noch nicht begonnen hat (Vorbörse, Wochentag). Dann ist
+    der letzte Kurs der Schlusskurs der letzten Sitzung, und heute gibt es noch keine Veränderung. Am Wochenende und
+    bei fehlenden Metadaten gilt das nicht: dort zeigt die Veränderung die letzte Sitzung."""
+    try:
+        meta = ticker.get_history_metadata()
+        start = _epoch(meta["currentTradingPeriod"]["regular"]["start"])
+        last = _epoch(meta["regularMarketTime"])
+        now = time.time() if now is None else now
+        local = dt.datetime.fromtimestamp(now, zoneinfo.ZoneInfo(meta["exchangeTimezoneName"]))
+        return now < start and last < start and local.weekday() < 5
+    except Exception:
+        return False
+
+
 def fetch_quote(symbol):
-    info = yf.Ticker(symbol).fast_info
-    price, prev = info["last_price"], info["previous_close"]
+    ticker = yf.Ticker(symbol)
+    info = ticker.fast_info
+    price, prev = info["last_price"], previous_close(info)
     if price is None or prev in (None, 0):
         raise ValueError("keine Kursdaten")
+    if session_not_started(ticker):
+        prev = price
     return {
         "price": float(price),
         "change_pct": (float(price) / float(prev) - 1) * 100,
         "currency": info["currency"] or "",
         "source": SOURCE,
+        "market_state": fetch_market_state(ticker),  # wird nicht gespeichert: ein alter Status wäre irreführend
     }
 
 
@@ -58,6 +108,15 @@ def fetch_history(symbol, range_key=DEFAULT_RANGE):
     if len(points) < 2:
         raise ValueError("keine Kursverlaufsdaten")
     return points
+
+
+def fetch_daily_closes(symbol, start):
+    """Tagesschlusskurse ab start als {Datum: Kurs}; Grundlage für den Verlauf des Portfolios."""
+    frame = yf.Ticker(symbol).history(start=start.isoformat(), interval="1d", auto_adjust=False)
+    closes = {stamp.date(): float(value) for stamp, value in frame["Close"].dropna().items() if value > 0}
+    if not closes:
+        raise ValueError("keine Kursverlaufsdaten")
+    return closes
 
 
 def fx_pair(currency, base):

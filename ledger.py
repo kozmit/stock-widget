@@ -13,6 +13,7 @@ from dataclasses import dataclass
 
 EPS = 1e-9
 OPENING_NOTE = "Startbestand"  # Käufe mit dieser Notiz sind übernommene Bestände ohne bekanntes Kaufdatum
+OPENING_SOURCE = "opening"     # Herkunft solcher Einträge; alte Daten erkennt man noch an der Notiz
 
 
 @dataclass(frozen=True)
@@ -25,6 +26,12 @@ class Transaction:
     fee: float
     day: dt.date
     note: str = ""
+    source: str = "manual"      # "manual", "opening" (Startbestand) oder der Name einer Anbindung wie "etoro"
+    external_id: str = ""       # Kennung beim Anbieter; leer bei manuellen Einträgen
+
+
+def is_opening(tx):
+    return tx.source == OPENING_SOURCE or tx.note.startswith(OPENING_NOTE)
 
 
 @dataclass(frozen=True)
@@ -95,7 +102,7 @@ def replay(transactions):
         validate(tx)
         if tx.kind == "buy":
             lots.append([tx.shares, (tx.shares * tx.price + tx.fee) / tx.shares, tx.day,
-                         tx.note.startswith(OPENING_NOTE)])
+                         is_opening(tx)])
             continue
         held = sum(lot[0] for lot in lots)
         if tx.shares > held + EPS:

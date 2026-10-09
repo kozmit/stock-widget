@@ -20,6 +20,7 @@ sd.LEGACY_FILE = os.path.join(tmp, "watchlist.json")
 sd.fetch_quote = lambda symbol: {"price": 100.0, "change_pct": 1.0, "currency": "USD"}
 sd.fetch_events = lambda symbol: []
 sd.fetch_news = lambda symbol, count=15: []
+sd.fetch_daily_closes = lambda symbol, start: {start: 100.0}
 
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication

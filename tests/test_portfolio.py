@@ -172,7 +172,7 @@ class SnapshotAndInstrumentTests(unittest.TestCase):
         old.close()
         upgraded = Store(old_path)
         self.addCleanup(upgraded.close)
-        self.assertEqual(upgraded.meta("schema_version"), "3")
+        self.assertEqual(upgraded.meta("schema_version"), "4")
         self.assertEqual(upgraded.symbols(), ["GEV"])
         self.assertEqual(upgraded.opening_realized(), {"GEV": 5.0})
         self.assertEqual(upgraded.transactions()[0].shares, 7.36)
@@ -217,6 +217,117 @@ class FxStoreTests(unittest.TestCase):
 
     def test_empty_database_has_no_rates(self):
         self.assertEqual((self.store.fx_rates(), self.store.fx_latest()), ({}, {}))
+
+
+class SourceStoreTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.path = os.path.join(self.dir.name, "test.db")
+        self.store = Store(self.path)
+        self.addCleanup(self.store.close)
+
+    def add(self, source="manual", external_id=None, symbol="AAA", day=dt.date(2026, 1, 5)):
+        return self.store.add_transaction(symbol, "buy", 1, 10, 0, day, "", source, external_id)
+
+    def test_new_transactions_default_to_manual_without_external_id(self):
+        self.store.add_transaction("AAA", "buy", 1, 10, 0, dt.date(2026, 1, 5))
+        [t] = self.store.transactions()
+        self.assertEqual((t.source, t.external_id), ("manual", ""))
+
+    def test_source_and_external_id_roundtrip(self):
+        self.add("etoro", "ET-1")
+        [t] = self.store.transactions()
+        self.assertEqual((t.source, t.external_id), ("etoro", "ET-1"))
+
+    def test_the_same_external_id_cannot_be_booked_twice(self):
+        import sqlite3
+        self.add("etoro", "ET-1")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.add("etoro", "ET-1", day=dt.date(2026, 1, 6))
+
+    def test_the_same_id_from_another_source_and_many_manual_rows_are_fine(self):
+        self.add("etoro", "1")
+        self.add("trading212", "1")
+        self.add()
+        self.add()
+        self.assertEqual(len(self.store.transactions()), 4)
+
+    def test_known_external_ids_of_one_source(self):
+        self.add("etoro", "1")
+        self.add("etoro", "2")
+        self.add("trading212", "3")
+        self.add()
+        self.assertEqual(self.store.external_ids("etoro"), {"1", "2"})
+
+    def test_delete_several_transactions_at_once(self):
+        ids = [self.add(day=dt.date(2026, 1, d)) for d in (5, 6, 7)]
+        self.store.delete_transactions(ids[:2])
+        self.assertEqual([t.id for t in self.store.transactions()], [ids[2]])
+
+    def test_legacy_import_marks_opening_balances(self):
+        path = os.path.join(self.dir.name, "watchlist.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"symbols": ["GEV"], "positions": {"GEV": {"shares": 7.36, "cost": 547.62, "realized": 0}}}, f)
+        self.store.import_legacy(path)
+        self.assertEqual(self.store.transactions()[0].source, "opening")
+
+    def test_daily_closes_roundtrip_and_replace(self):
+        self.store.save_closes("AAA", {dt.date(2026, 1, 5): 100.0, dt.date(2026, 1, 6): 101.0}, "Yahoo Finance")
+        self.store.save_closes("AAA", {dt.date(2026, 1, 6): 102.0}, "Yahoo Finance")
+        self.store.save_closes("BBB", {dt.date(2026, 1, 5): 5.0}, "Yahoo Finance")
+        self.assertEqual(self.store.closes(), {"AAA": {dt.date(2026, 1, 5): 100.0, dt.date(2026, 1, 6): 102.0},
+                                               "BBB": {dt.date(2026, 1, 5): 5.0}})
+
+    def test_aliases_are_kept_per_source(self):
+        self.store.set_alias("etoro", "AAPL.US", "AAPL")
+        self.store.set_alias("etoro", "AAPL.US", "AAPL2")
+        self.store.set_alias("trading212", "AAPL.US", "AAPL")
+        self.assertEqual(self.store.aliases("etoro"), {"AAPL.US": "AAPL2"})
+        self.assertEqual(self.store.aliases("other"), {})
+
+    def test_sync_state_roundtrip_and_replace(self):
+        self.assertIsNone(self.store.sync_state("etoro"))
+        self.store.save_sync_state("etoro", "c1", dt.datetime(2026, 10, 9, 12, 0, 0), "3 neu")
+        self.store.save_sync_state("etoro", "c2", dt.datetime(2026, 10, 9, 13, 0, 0), "0 neu")
+        self.assertEqual(self.store.sync_state("etoro"),
+                         {"cursor": "c2", "last_sync_at": dt.datetime(2026, 10, 9, 13, 0, 0), "message": "0 neu"})
+
+    def test_database_from_schema_version_3_is_upgraded_and_opening_rows_are_recognised(self):
+        import sqlite3
+        old_path = os.path.join(self.dir.name, "v3.db")
+        old = sqlite3.connect(old_path)
+        old.executescript("""
+            CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE watchlist (symbol TEXT PRIMARY KEY, sort INTEGER NOT NULL,
+                opening_realized REAL NOT NULL DEFAULT 0);
+            CREATE TABLE transactions (id INTEGER PRIMARY KEY AUTOINCREMENT, symbol TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK (kind IN ('buy', 'sell')), shares REAL NOT NULL, price REAL NOT NULL,
+                fee REAL NOT NULL DEFAULT 0, executed_on TEXT NOT NULL, note TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL);
+            INSERT INTO meta VALUES ('schema_version', '3'), ('legacy_imported', '2026-10-08');
+            INSERT INTO watchlist VALUES ('GEV', 1, 0);
+            INSERT INTO transactions (symbol, kind, shares, price, fee, executed_on, note, created_at)
+                VALUES ('GEV', 'buy', 7.36, 547.62, 0, '2026-10-08', 'Startbestand (aus dem Widget)', '2026-10-08T22:00:00'),
+                       ('GEV', 'buy', 1, 900, 0, '2026-10-08', 'Nachkauf', '2026-10-08T23:00:00');
+        """)
+        old.commit()
+        old.close()
+        upgraded = Store(old_path)
+        self.addCleanup(upgraded.close)
+        self.assertEqual(upgraded.meta("schema_version"), "4")
+        first, second = upgraded.transactions()
+        self.assertEqual((first.source, second.source), ("opening", "manual"))
+        self.assertEqual((first.shares, second.price), (7.36, 900))
+        upgraded.add_transaction("GEV", "buy", 1, 10, 0, dt.date(2026, 1, 5), "", "etoro", "X")  # neue Spalten benutzbar
+        self.assertEqual(upgraded.external_ids("etoro"), {"X"})
+
+    def test_upgrading_twice_changes_nothing(self):
+        self.add("etoro", "1")
+        self.store.close()
+        again = Store(self.path)
+        self.addCleanup(again.close)
+        self.assertEqual([(t.source, t.external_id) for t in again.transactions()], [("etoro", "1")])
 
 
 if __name__ == "__main__":
