@@ -873,14 +873,10 @@ class WindowTests(AppTestCase):
         super().setUp()
         self.main = w.MainWindow(self.ctl)
 
-    def test_detail_buttons_follow_the_position_state(self):
+    def test_position_tile_has_no_buttons_the_position_changes_only_via_the_watchlist_menu(self):
         self.main.open_detail("AAPL")
-        buttons = self.main.details["AAPL"].buttons
-        self.assertEqual((buttons["start"].isEnabled(), buttons["buy"].isEnabled(),
-                          buttons["sell"].isEnabled(), buttons["history"].isEnabled()),
-                         (True, True, False, True))
-        self.ctl.record_trade("AAPL", "buy", 10, 100, 0, TODAY)
-        self.assertEqual((buttons["start"].isEnabled(), buttons["sell"].isEnabled()), (False, True))
+        tile = self.main.details["AAPL"].position_card
+        self.assertEqual(tile.findChildren(QPushButton), [])
 
     def test_detail_shows_profit_cost_and_value(self):
         self.ctl.record_trade("AAPL", "buy", 10, 80, 0, TODAY)
@@ -951,6 +947,19 @@ class WindowTests(AppTestCase):
             detail = self.main.details["AAPL"]
             self.assertTrue(wait_until(lambda: "offline" in detail.chart.note))
             self.assertIsNone(detail.chart.points)
+
+    def test_clicking_a_selected_row_deselects_it_and_closes_its_detail_window(self):
+        card = self.main.cards["AAPL"]
+        card.clicked.emit("AAPL")
+        detail = self.main.details["AAPL"]
+        self.assertTrue(card.property("open"))
+        card.clicked.emit("AAPL")
+        self.assertNotIn("AAPL", self.main.details)
+        self.assertFalse(card.property("open"))
+        self.assertFalse(detail.isVisible())
+        self.assertNotIn(detail, w.Dock.windows)
+        card.clicked.emit("AAPL")  # und noch einmal öffnen geht wieder
+        self.assertIn("AAPL", self.main.details)
 
     def test_card_is_highlighted_while_its_detail_window_is_open(self):
         card, other = self.main.cards["AAPL"], self.main.cards["MSFT"]
@@ -1155,6 +1164,88 @@ class AddSymbolUiTests(AppTestCase):
         wait_until(lambda: False, 1200)
         driver.check()
         self.assertEqual(self.ctl.symbols, ["AAPL", "MSFT", "DELL"])
+
+
+class PinnedBoxTests(AppTestCase):
+    """Angeheftete Boxen: Reißzwecke oben rechts, Zustand in der Datenbank, Öffnen beim Start."""
+
+    def setUp(self):
+        super().setUp()
+        self.main = w.MainWindow(self.ctl)
+
+    def open_everything(self):
+        self.main.show_docked()
+        self.main.open_detail("AAPL")
+        w.open_transactions(self.ctl, "AAPL")
+        w.open_portfolio(self.ctl, self.main.open_detail)
+        return {"main": self.main, "detail:AAPL": self.main.details["AAPL"], "tx:AAPL": w.TX_WINDOWS["AAPL"],
+                "portfolio": w.PORTFOLIO_WINDOWS["window"]}
+
+    def test_every_box_has_a_pin_button_that_starts_unpinned(self):
+        for key, window in self.open_everything().items():
+            self.assertFalse(window.pin_button.isChecked(), key)
+            self.assertIn("Anheften", window.pin_button.toolTip())
+
+    def test_pin_button_sits_right_before_the_close_button(self):
+        self.main.open_detail("AAPL")
+        window = self.main.details["AAPL"]
+        header = [b for b in window.findChildren(QPushButton) if b.objectName() == "icon"][:2]
+        self.assertIs(header[0], window.pin_button)
+        self.assertEqual(header[1].text(), "✕")
+
+    def test_clicking_the_pin_saves_it_and_clicking_again_removes_it(self):
+        windows = self.open_everything()
+        for window in windows.values():
+            window.pin_button.click()
+        self.assertEqual(sorted(self.ctl.pinned), sorted(windows))
+        again = w.Controller()  # ein Neustart liest dieselbe Datenbank
+        self.addCleanup(again.shutdown)
+        self.addCleanup(again.store.close)
+        self.assertEqual(sorted(again.pinned), sorted(windows))
+        windows["detail:AAPL"].pin_button.click()
+        self.assertNotIn("detail:AAPL", self.ctl.store.meta(self.ctl.PINS_KEY))
+
+    def test_pinned_state_is_shown_when_the_box_opens_again(self):
+        self.ctl.set_pinned("detail:AAPL", True)
+        self.main.open_detail("AAPL")
+        self.assertTrue(self.main.details["AAPL"].pin_button.isChecked())
+
+    def test_restore_opens_all_pinned_boxes_and_nothing_else(self):
+        for key in ("main", "detail:AAPL", "tx:MSFT", "portfolio"):
+            self.ctl.set_pinned(key, True)
+        w.restore_pinned(self.ctl, self.main)
+        self.assertTrue(self.main.isVisible())
+        self.assertEqual(set(self.main.details), {"AAPL"})
+        self.assertEqual(set(w.TX_WINDOWS), {"MSFT"})
+        self.assertIn("window", w.PORTFOLIO_WINDOWS)
+
+    def test_restore_is_idempotent_and_skips_unknown_symbols(self):
+        for key in ("detail:GONE", "tx:GONE", "detail:AAPL"):
+            self.ctl.set_pinned(key, True)
+        w.restore_pinned(self.ctl, self.main)
+        w.restore_pinned(self.ctl, self.main)
+        self.assertEqual(set(self.main.details), {"AAPL"})
+        self.assertEqual(len([x for x in w.Dock.windows if isinstance(x, w.DetailWindow)]), 1)
+        self.assertEqual(w.TX_WINDOWS, {})
+
+    def test_closing_a_pinned_box_keeps_it_pinned(self):
+        self.ctl.set_pinned("detail:AAPL", True)
+        self.main.open_detail("AAPL")
+        self.main.details["AAPL"].close()
+        self.assertIn("detail:AAPL", self.ctl.pinned)
+
+    def test_removing_a_stock_unpins_its_boxes(self):
+        for key in ("detail:AAPL", "tx:AAPL", "detail:MSFT"):
+            self.ctl.set_pinned(key, True)
+        self.ctl.remove("AAPL")
+        self.assertEqual(self.ctl.pinned, ["detail:MSFT"])
+
+    def test_broken_stored_value_means_nothing_is_pinned(self):
+        self.ctl.store.set_meta(self.ctl.PINS_KEY, "kaputt{")
+        again = w.Controller()
+        self.addCleanup(again.shutdown)
+        self.addCleanup(again.store.close)
+        self.assertEqual(again.pinned, [])
 
 
 class SingleInstanceTests(unittest.TestCase):

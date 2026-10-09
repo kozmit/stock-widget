@@ -5,13 +5,15 @@ Oberfläche mit Qt (PySide6): rahmenlose Fenster mit runden Ecken, alle Fenster 
 Start: python stock_widget.py   (mit --tray startet es nur als Icon im Infobereich)
 """
 import datetime as dt
+import json
 import socket
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
-from PySide6.QtCore import QEasingCurve, QEvent, QObject, QPointF, QRectF, QRectF, Qt, QTimer, QUrl, QVariantAnimation, Signal
+from PySide6.QtCore import (QEasingCurve, QEvent, QObject, QPointF, QRectF, QSize, Qt, QTimer, QUrl, QVariantAnimation,
+                            Signal)
 from PySide6.QtGui import QColor, QCursor, QDesktopServices, QIcon, QPainter, QPainterPath, QPen, QPixmap
-from PySide6.QtWidgets import (QApplication, QDialog, QFrame, QGraphicsDropShadowEffect, QGridLayout,
+from PySide6.QtWidgets import (QApplication, QDialog, QFrame, QGraphicsDropShadowEffect,
                                QHBoxLayout, QLabel, QLineEdit, QMenu, QPushButton, QScrollArea, QSystemTrayIcon, QVBoxLayout, QWidget)
 
 import ledger
@@ -126,9 +128,31 @@ class DragHeader(QWidget):
             self.window().windowHandle().startSystemMove()
 
 
-def make_panel(window, title, on_close, extras=(), always_on_top=False):
+def pin_icon():
+    """Reißzwecke: grau, wenn die Box nicht angeheftet ist, blau, wenn sie es ist."""
+    icon = QIcon()
+    for color, state in ((MUTED, QIcon.Off), (ACCENT, QIcon.On)):
+        pixmap = QPixmap(32, 32)
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.translate(16, 15)
+        painter.rotate(40)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(color))
+        painter.drawRoundedRect(QRectF(-4.5, -13, 9, 11), 2, 2)
+        painter.drawRoundedRect(QRectF(-8, -3, 16, 3.5), 1.5, 1.5)
+        painter.setPen(QPen(QColor(color), 2.4, Qt.SolidLine, Qt.RoundCap))
+        painter.drawLine(QPointF(0, 1), QPointF(0, 12))
+        painter.end()
+        icon.addPixmap(pixmap, QIcon.Normal, state)
+    return icon
+
+
+def make_panel(window, title, on_close, extras=(), always_on_top=False, pin=None):
     """Macht aus window ein rahmenloses, rundes Fenster mit Schatten und Kopfzeile.
-    Gibt das Layout für den Inhalt zurück."""
+    pin = (Controller, Schlüssel) fügt oben rechts die Reißzwecke hinzu: angeheftete Boxen öffnen sich
+    beim Start des Widgets von selbst. Gibt das Layout für den Inhalt zurück."""
     flags = Qt.FramelessWindowHint | Qt.Tool
     if PIN["on"] or always_on_top:
         flags |= Qt.WindowStaysOnTopHint
@@ -159,6 +183,18 @@ def make_panel(window, title, on_close, extras=(), always_on_top=False):
     row.addStretch()
     for widget in extras:
         row.addWidget(widget)
+    if pin:
+        ctl, key = pin
+        window.pin_button = pin_button = QPushButton()
+        pin_button.setObjectName("icon")
+        pin_button.setIcon(pin_icon())
+        pin_button.setIconSize(QSize(16, 16))
+        pin_button.setCheckable(True)
+        pin_button.setChecked(ctl.is_pinned(key))
+        pin_button.setToolTip("Anheften: öffnet sich beim Start des Widgets automatisch")
+        pin_button.setCursor(Qt.PointingHandCursor)
+        pin_button.clicked.connect(lambda checked=False: ctl.set_pinned(key, pin_button.isChecked()))
+        row.addWidget(pin_button)
     close = QPushButton("✕")
     close.setObjectName("icon")
     close.setCursor(Qt.PointingHandCursor)
@@ -292,6 +328,7 @@ class Controller(QObject):
         self.store = Store(sd.DB_FILE)
         self.store.import_legacy(sd.LEGACY_FILE)
         self.symbols = self.store.symbols()
+        self.pinned = self._load_pins()
         self.quotes, self.events = {}, {}
         self.transactions, self.positions, self.realized, self.sales = {}, {}, {}, {}
         self.states, self.opening, self.removed_holdings = {}, {}, []
@@ -310,6 +347,28 @@ class Controller(QObject):
     def start(self):
         self.refresh()
         self.timer.start(REFRESH_SECONDS * 1000)
+
+    # Angeheftete Boxen: Schlüssel "main", "detail:SYMBOL", "tx:SYMBOL" und "portfolio", in der Datenbank gemerkt
+    PINS_KEY = "pinned_windows"
+
+    def _load_pins(self):
+        try:
+            data = json.loads(self.store.meta(self.PINS_KEY) or "[]")
+        except ValueError:
+            return []
+        return [key for key in data if isinstance(key, str)] if isinstance(data, list) else []
+
+    def is_pinned(self, key):
+        return key in self.pinned
+
+    def set_pinned(self, key, on):
+        if on == (key in self.pinned):
+            return
+        if on:
+            self.pinned.append(key)
+        else:
+            self.pinned.remove(key)
+        self.store.set_meta(self.PINS_KEY, json.dumps(self.pinned))
 
     def run(self, work, done, fail=None):
         def task():
@@ -545,6 +604,8 @@ class Controller(QObject):
         self.symbols = self.store.symbols()
         for cache in (self.quotes, self.events, self.quote_times, self.quote_errors, self.instruments):
             cache.pop(symbol, None)
+        for key in (f"detail:{symbol}", f"tx:{symbol}"):
+            self.set_pinned(key, False)
         self._ledger_changed()
 
     # Transaktionen: die Methoden werfen ValueError bei ungültigen Eingaben
@@ -900,7 +961,7 @@ class MainWindow(QWidget):
         self.portfolio_button.clicked.connect(lambda: open_portfolio(self.ctl, self.open_detail))
 
         body = make_panel(self, "Watchlist", self.hide_docked,
-                          extras=[self.portfolio_button, self.add_button, self.pin])
+                          extras=[self.portfolio_button, self.add_button, self.pin], pin=(ctl, "main"))
 
         self.header = QWidget()
         header = QHBoxLayout(self.header)
@@ -1003,7 +1064,7 @@ class MainWindow(QWidget):
         for symbol in self.ctl.symbols:
             if symbol not in self.cards:
                 card = StockCard(symbol)
-                card.clicked.connect(self.open_detail)
+                card.clicked.connect(self.toggle_detail)
                 card.menu_requested.connect(self.show_menu)
                 self.cards[symbol] = card
                 self.list.insertWidget(self.list.count() - 1, card)
@@ -1111,6 +1172,14 @@ class MainWindow(QWidget):
         self.details.pop(symbol, None)
         self.mark_open(symbol)
 
+    def toggle_detail(self, symbol):
+        """Klick auf eine Zeile: öffnet das Detailfenster, ein zweiter Klick schließt es wieder."""
+        existing = self.details.get(symbol)
+        if existing:
+            existing.close()  # das Schließen meldet sich über on_detail_closed ab und löscht die Markierung
+        else:
+            self.open_detail(symbol)
+
     def open_detail(self, symbol):
         existing = self.details.get(symbol)
         if existing:
@@ -1189,7 +1258,7 @@ class TransactionsWindow(QWidget):
         super().__init__()
         self.setAttribute(Qt.WA_DeleteOnClose)
         self.ctl, self.symbol = ctl, symbol
-        body = make_panel(self, f"{symbol}: Transaktionen", self.close)
+        body = make_panel(self, f"{symbol}: Transaktionen", self.close, pin=(ctl, f"tx:{symbol}"))
         self.summary = QLabel()
         self.summary.setWordWrap(True)
         self.summary.setStyleSheet(f"color: {MUTED};")
@@ -1343,7 +1412,7 @@ class DetailWindow(QWidget):
         self.setAttribute(Qt.WA_DeleteOnClose)
         self.ctl, self.symbol = ctl, symbol
         self.alive = True
-        frame = make_panel(self, symbol, self.close)
+        frame = make_panel(self, symbol, self.close, pin=(ctl, f"detail:{symbol}"))
         # Die ganze Box scrollt, nicht nur die News: aller Inhalt liegt in einer gemeinsamen Scrollfläche.
         area, body = scroll_area()
         body.setContentsMargins(0, 0, 4, 0)
@@ -1421,18 +1490,6 @@ class DetailWindow(QWidget):
         self.position_info.setWordWrap(True)
         self.position_info.setStyleSheet(f"color: {MUTED}; font-size: 12px;")
         column.addWidget(self.position_info)
-        buttons = QGridLayout()
-        buttons.setSpacing(6)
-        self.buttons = {}
-        for index, (text, mode) in enumerate((("Startbestand", "start"), ("Aufstocken", "buy"),
-                                              ("Verkleinern", "sell"), ("Transaktionen", "history"))):
-            button = QPushButton(text)
-            button.setCursor(Qt.PointingHandCursor)
-            button.clicked.connect(lambda _checked=False, m=mode: open_transactions(ctl, symbol)
-                                   if m == "history" else trade_dialog(ctl, symbol, m))
-            buttons.addWidget(button, index // 2, index % 2)
-            self.buttons[mode] = button
-        column.addLayout(buttons)
         body.addWidget(position_card)
 
         # Nächster Termin
@@ -1550,8 +1607,6 @@ class DetailWindow(QWidget):
             if realized:
                 info += f" Realisiert insgesamt {realized:+.2f} {quote['currency'] if quote else ''}"
             self.position_info.setText(info)
-        self.buttons["start"].setEnabled(not position)
-        self.buttons["sell"].setEnabled(bool(position))
 
     def load(self):
         events = news = error = None
@@ -1787,7 +1842,7 @@ class PortfolioWindow(QWidget):
         self.dimension = "position"
         self.summary = None
         self.rows = {}
-        body = make_panel(self, "Portfolio", self.close)
+        body = make_panel(self, "Portfolio", self.close, pin=(ctl, "portfolio"))
         area, content = scroll_area()
         body.addWidget(area, 1)
 
@@ -1983,6 +2038,20 @@ def claim_single_instance(port=LOCK_PORT):
     return lock
 
 
+def restore_pinned(ctl, main):
+    """Öffnet alle angehefteten Boxen, die gerade nicht offen sind; die Watchlist zuerst, damit sie rechts sitzt."""
+    for key in sorted(ctl.pinned, key=lambda k: k != "main"):
+        kind, _, symbol = key.partition(":")
+        if kind == "main":
+            main.show_docked()
+        elif kind == "portfolio":
+            open_portfolio(ctl, main.open_detail)
+        elif symbol in ctl.symbols and kind == "detail":
+            main.open_detail(symbol)
+        elif symbol in ctl.symbols and kind == "tx":
+            open_transactions(ctl, symbol)
+
+
 def close_all_windows(ctl):
     """Schließt beim Beenden alle Fenster geordnet, sonst räumt Python sie in zufälliger Reihenfolge ab."""
     for window in list(Dock.windows):
@@ -2005,19 +2074,24 @@ def main():
     window = MainWindow(ctl)
     app.aboutToQuit.connect(lambda: close_all_windows(ctl))
 
+    def open_widget():
+        window.show_docked()
+        restore_pinned(ctl, window)
+
     tray_menu = make_menu()
-    tray_menu.addAction("Öffnen", window.show_docked)
+    tray_menu.addAction("Öffnen", open_widget)
     tray_menu.addAction("Portfolio", lambda: open_portfolio(ctl, window.open_detail))
     tray_menu.addAction("Beenden", app.quit)
     tray = QSystemTrayIcon(icon, app)
     tray.setToolTip("Aktien-Widget")
     tray.setContextMenu(tray_menu)
-    tray.activated.connect(lambda reason: (window.hide_docked() if window.isVisible() else window.show_docked())
+    tray.activated.connect(lambda reason: (window.hide_docked() if window.isVisible() else open_widget())
                            if reason == QSystemTrayIcon.Trigger else None)
     tray.show()
 
     if "--tray" not in sys.argv:
         window.show_docked()
+    restore_pinned(ctl, window)  # angeheftete Boxen sind auch beim Start im Infobereich gleich da
     ctl.start()
     sys.exit(app.exec())
 
