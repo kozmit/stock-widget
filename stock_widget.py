@@ -23,6 +23,7 @@ import history
 import ledger
 import portfolio
 import etoro
+import alerts
 import consensus as cons
 import events as evt
 import fundamentals as fund
@@ -40,6 +41,7 @@ REFRESH_SECONDS = 60
 STALE_SECONDS = 3 * REFRESH_SECONDS          # so lange gilt ein Kurs ohne neuen Abruf als aktuell
 INSTRUMENT_MAX_AGE = dt.timedelta(days=7)    # danach werden die Stammdaten neu geladen
 NEWS_MAX_AGE = dt.timedelta(minutes=10)      # so lange gelten geladene News für den Feed als frisch
+TARGETS_MAX_AGE = dt.timedelta(hours=12)     # so oft werden Kursziele für Benachrichtigungen neu geladen
 NEWS_FETCH_COUNT = 40                        # so viele News werden geholt; der Filter lässt davon nur einen Teil übrig
 NOT_LOADED = object()                        # Marke: die News einer Aktie sind noch nicht angekommen
 
@@ -668,6 +670,8 @@ class Controller(QObject):
     fundamentals_changed = Signal(str)  # Kennzahlen einer Aktie wurden geladen (oder der Abruf schlug fehl)
     news_changed = Signal(str)  # die News einer Aktie wurden geladen (oder der Abruf schlug fehl)
     tax_changed = Signal()  # Einstellungen oder Eingaben der Steuerschätzung wurden geändert
+    alerts_changed = Signal()  # Regeln, Einstellungen oder Alarmprotokoll haben sich geändert
+    alert_fired = Signal(str, str)  # Titel und Text einer neuen Benachrichtigung
     terms_changed = Signal(str)  # die Suchbegriffe einer Aktie (News-Filter) wurden gesammelt
     trade_recorded = Signal(str, str)  # Symbol, "buy" oder "sell"
     status = Signal(str)
@@ -691,6 +695,13 @@ class Controller(QObject):
         self.fundamentals = self.store.fundamentals()  # Kennzahlen je Aktie: {"data", "source", "fetched_at"}
         self.fundamentals_errors, self.fundamentals_loading = {}, set()
         self.news_cache, self.news_loading = {}, set()  # News je Aktie: {"news", "error", "fetched_at"}
+        self.targets, self.targets_loading = {}, set()  # Kursziele je Aktie für Benachrichtigungen
+        self.alert_rules, self.alert_settings = [], alerts.Settings()
+        self.alert_timer = QTimer(self)  # prüft die Regeln kurz nach neuen Daten, nicht nach jedem einzelnen Signal
+        self.alert_timer.setSingleShot(True)
+        self.alert_timer.setInterval(1500)
+        self.alert_timer.timeout.connect(self.check_alerts)
+        self.reload_alerts()
         self.terms = self.store.search_terms()  # Suchbegriffe je Aktie: {"terms", "source", "fetched_at"}
         self.terms_loading = set()
         self.load_persisted()
@@ -704,6 +715,8 @@ class Controller(QObject):
         self.slow_pool = ThreadPoolExecutor(max_workers=1)  # das Sprachmodell braucht Sekunden: eine Aktie nach der anderen
         self.closed = False
         self._result.connect(self._deliver)
+        for signal in (self.changed, self.news_changed):
+            signal.connect(self.schedule_alert_check)
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
 
@@ -955,6 +968,7 @@ class Controller(QObject):
             if self.needs_instrument(symbol):
                 self.load_instrument(symbol)
             self.load_terms(symbol)
+        self.refresh_alert_data()
 
     def load_terms(self, symbol):
         """Sammelt die Suchbegriffe, wenn sie fehlen oder veraltet sind. Ein Fehlschlag wird je Start nicht
@@ -1031,6 +1045,169 @@ class Controller(QObject):
                 self.instruments[symbol] = {**info, "fetched_at": now}
                 self.changed.emit()
         self.run(lambda: sd.fetch_instrument(symbol), done)
+
+    # Benachrichtigungen (siehe alerts.py): Regeln und Alarmprotokoll liegen in der Datenbank, die Einstellungen in meta
+    ALERT_SETTINGS_KEY = "alert_settings"
+    ALERT_TARGETS_KEY = "alert_targets"
+
+    def reload_alerts(self):
+        self.alert_rules = [alerts.Rule(r[0], r[1], r[2], r[3], r[4], bool(r[5]), bool(r[6]), bool(r[7]))
+                            for r in self.store.rules()]
+        self.alert_settings = alerts.Settings.from_dict(self._meta_json(self.ALERT_SETTINGS_KEY))
+
+    def _alerts_changed(self):
+        self.reload_alerts()
+        self.alerts_changed.emit()
+        self.schedule_alert_check()
+
+    def add_rule(self, kind, symbol, threshold, days):
+        """Legt eine Regel an; ValueError bei ungültigen Angaben. Gibt die Nummer der Regel zurück."""
+        kind, symbol, threshold, days = alerts.check_rule(kind, symbol, threshold, days)
+        if symbol and symbol not in self.symbols:
+            raise ValueError(f"{symbol} steht nicht in der Watchlist")
+        rule_id = self.store.add_rule(kind, symbol, threshold, days, dt.datetime.now())
+        self._alerts_changed()
+        return rule_id
+
+    def update_rule(self, rule_id, symbol, threshold, days):
+        rule = next((r for r in self.alert_rules if r.id == rule_id), None)
+        if rule is None:
+            raise ValueError("Die Regel gibt es nicht mehr")
+        _, symbol, threshold, days = alerts.check_rule(rule.kind, symbol, threshold, days)
+        if symbol and symbol not in self.symbols:
+            raise ValueError(f"{symbol} steht nicht in der Watchlist")
+        self.store.update_rule(rule_id, symbol, threshold, days)
+        self._alerts_changed()
+
+    def delete_rule(self, rule_id):
+        self.store.delete_rule(rule_id)
+        self._alerts_changed()
+
+    def set_rule_enabled(self, rule_id, enabled):
+        self.store.set_rule_state(rule_id, enabled=enabled)
+        self._alerts_changed()
+
+    def set_alert_settings(self, settings):
+        self.store.set_meta(self.ALERT_SETTINGS_KEY, json.dumps(settings.to_dict()))
+        self._alerts_changed()
+
+    def alert_log(self, limit=200):
+        return self.store.alert_log(limit)
+
+    def unread_alerts(self):
+        return self.store.unread_alerts()
+
+    def mark_alerts_read(self):
+        self.store.mark_alerts_read()
+        self.alerts_changed.emit()
+
+    def alert_context(self, now=None):
+        """Der aktuelle Datenstand für die Regeln (siehe alerts.Context)."""
+        now = now or dt.datetime.now().astimezone()
+        quotes = {s: q for s, q in self.quotes.items() if s in self.symbols}
+        fresh = {s for s in quotes if (f := self.freshness(s)) and not f["stale"]}
+        loaded = {s: self.news_cache[s]["news"] for s in self.symbols
+                  if (self.news_cache.get(s) or {}).get("news") is not None}
+        references = self._meta_json(self.ALERT_TARGETS_KEY)
+        targets = {s: {"mean": t["mean"], "currency": t["currency"], "reference": references.get(s)}
+                   for s, t in self.targets.items() if s in self.symbols}
+        return alerts.Context(now, quotes, fresh, [s for s in self.symbols if s in self.positions], list(self.symbols),
+                              {s: self.calendar_events(s, now.date()) for s in self.symbols},
+                              newsfeed.merge(loaded, self.news_terms), set(loaded), targets)
+
+    def test_rule(self, rule):
+        """Prüft eine Regel jetzt, ohne etwas zu melden oder zu speichern: alerts.Evaluation mit der Erklärung."""
+        import dataclasses
+        return alerts.evaluate(dataclasses.replace(rule, armed=True), self.alert_context())
+
+    def digest_preview(self):
+        """Die Zusammenfassung, wie sie jetzt aussähe: (Titel, Text)."""
+        import dataclasses
+        settings = self.alert_settings
+        if settings.digest_mode == "off":
+            settings = dataclasses.replace(settings, digest_mode="daily")
+        return alerts.build_digest(settings, self.alert_context())
+
+    def schedule_alert_check(self):
+        """Prüft die Regeln gleich (gebündelt), wenn es Regeln oder eine Zusammenfassung gibt."""
+        if not self.closed and (self.alert_rules or self.alert_settings.digest_mode != "off"):
+            self.alert_timer.start()
+
+    def check_alerts(self, now=None):
+        """Prüft alle Regeln und die fällige Zusammenfassung; meldet Neues über alert_fired. Doppelmeldungen verhindert
+        das Protokoll: derselbe Schlüssel wird nie zweimal gemeldet. Die Regeln news und analyst merken beim ersten Mal
+        nur den Ist-Zustand, damit sie nicht alles Bestehende auf einmal melden. Gibt [(Titel, Text)] zurück."""
+        if self.closed or not self.alert_settings.enabled:
+            return []
+        settings, ctx, fired = self.alert_settings, self.alert_context(now), []
+        references, references_changed = self._meta_json(self.ALERT_TARGETS_KEY), False
+        for rule in self.alert_rules:
+            if not rule.enabled or not settings.type_enabled(rule.kind):
+                continue
+            result = alerts.evaluate(rule, ctx)
+            if rule.kind in alerts.PRICE_KINDS and result.armed != rule.armed:
+                self.store.set_rule_state(rule.id, armed=result.armed)
+            silent = rule.kind in alerts.BASELINE_KINDS and not rule.baselined
+            if silent and not result.ready:
+                continue
+            for hit in result.hits:
+                logged = self.store.log_alert(rule.id, hit.key, hit.symbol, hit.title, hit.text, ctx.now, silent)
+                if logged and not silent:
+                    fired.append((hit.title, hit.text))
+            if silent:
+                self.store.set_rule_state(rule.id, baselined=True)
+            if result.references:
+                references.update(result.references)
+                references_changed = True
+        if references_changed:
+            self.store.set_meta(self.ALERT_TARGETS_KEY, json.dumps(references))
+        key = alerts.digest_key(settings, ctx.now)
+        if key and not self.store.alert_logged(key):
+            held = [s for s in ctx.positions if s in ctx.fresh]
+            if not ctx.positions or len(held) >= max(1, len(ctx.positions) // 2):  # sonst fehlen die Kurse noch: später
+                title, text = alerts.build_digest(settings, ctx)
+                if self.store.log_alert(None, key, None, title, text, ctx.now):
+                    fired.append((title, text))
+        if fired or references_changed or self.alert_rules:
+            self.reload_alerts()
+            self.alerts_changed.emit()
+        for title, text in fired:
+            self.alert_fired.emit(title, alerts.short(text))
+        return fired
+
+    def refresh_alert_data(self):
+        """Lädt, was aktive Regeln brauchen: News für news-Regeln, Kursziele für analyst-Regeln."""
+        if not self.alert_settings.enabled:
+            return
+        for rule in self.alert_rules:
+            if not rule.enabled or not self.alert_settings.type_enabled(rule.kind) or rule.kind not in ("news", "analyst"):
+                continue
+            watched = [rule.symbol] if rule.symbol in self.symbols else ([] if rule.symbol else
+                                                                          [s for s in self.symbols if s in self.positions])
+            for symbol in watched:
+                if rule.kind == "news":
+                    self.load_news(symbol)
+                else:
+                    self.load_targets(symbol)
+
+    def load_targets(self, symbol, now=None):
+        """Lädt das Kursziel der Analysten (für analyst-Regeln), höchstens alle TARGETS_MAX_AGE."""
+        entry, now = self.targets.get(symbol), now or dt.datetime.now()
+        if symbol in self.targets_loading or (entry and now - entry["fetched_at"] < TARGETS_MAX_AGE):
+            return False
+        self.targets_loading.add(symbol)
+
+        def done(found):
+            self.targets_loading.discard(symbol)
+            if symbol in self.symbols and found:
+                self.targets[symbol] = {"mean": found["mean"], "currency": found.get("currency", ""),
+                                        "fetched_at": dt.datetime.now()}
+                self.schedule_alert_check()
+
+        def failed(exc):
+            self.targets_loading.discard(symbol)
+        self.run(lambda: sd.fetch_targets(symbol), done, failed)
+        return True
 
     # Steuerschätzung (siehe tax.py): Einstellungen und Eingaben je Jahr liegen in der Tabelle meta
     TAX_SETTINGS_KEY = "tax_settings"
@@ -1863,6 +2040,12 @@ class MainWindow(QWidget):
         self.news_button.setCursor(Qt.PointingHandCursor)
         self.news_button.clicked.connect(lambda: open_news(self.ctl, open_symbol=self.open_detail))
 
+        self.alerts_button = QPushButton("🔔")
+        self.alerts_button.setObjectName("icon")
+        self.alerts_button.setToolTip("Alarme und Benachrichtigungen")
+        self.alerts_button.setCursor(Qt.PointingHandCursor)
+        self.alerts_button.clicked.connect(lambda: open_alerts(self.ctl, open_symbol=self.open_detail))
+
         self.watchlist_button = QPushButton("☆")
         self.watchlist_button.setObjectName("icon")
         self.watchlist_button.setToolTip("Watchlist öffnen oder schließen")
@@ -1874,8 +2057,8 @@ class MainWindow(QWidget):
                               pin=(ctl, "watchlist"))
         else:
             body = make_panel(self, "Positionen", self.hide_docked,
-                              extras=[self.news_button, self.calendar_button, self.portfolio_button, self.watchlist_button,
-                                    self.pin])
+                              extras=[self.alerts_button, self.news_button, self.calendar_button, self.portfolio_button,
+                                    self.watchlist_button, self.pin])
 
         self.header = QWidget()
         header = QHBoxLayout(self.header)
@@ -3532,6 +3715,299 @@ class TaxWindow(QWidget):
         super().closeEvent(event)
 
 
+# ---------- Benachrichtigungen ----------
+
+ALERT_WINDOWS = {}
+ALERT_NAMES = {"price_above": "Kursalarm (steigt)", "price_below": "Kursalarm (fällt)", "day_move": "Tagesbewegung",
+               "earnings": "Termin-Erinnerung", "news": "Wichtige News", "analyst": "Kursziel-Änderung"}
+ALERT_TERMS = {"price_above": "alarm_kurs", "price_below": "alarm_kurs", "day_move": "alarm_tagesbewegung",
+               "earnings": "alarm_termin", "news": "alarm_news", "analyst": "alarm_analyst"}
+ON_OFF = [("an", True), ("aus", False)]
+
+
+def parse_whole_days(text):
+    value = sd.parse_number(text)
+    if value != int(value):
+        raise ValueError("Bitte eine ganze Zahl eingeben")
+    return int(value)
+
+
+def rule_dialog(ctl, kind, rule=None):
+    """Dialog zum Anlegen einer Regel der Art kind oder zum Ändern von rule."""
+    editing = rule is not None
+    price = kind in alerts.PRICE_KINDS
+    symbols = [(s, s) for s in ctl.symbols]
+    options = symbols if price else [("alle Positionen", None)] + symbols
+    current = rule.symbol if editing else (symbols[0][1] if price and symbols else None)
+    fields = [("Aktie", Choice(options, current))]
+    if price:
+        fields.append(("Kurs", f"{rule.threshold:g}" if editing else "", sd.parse_number))
+    elif kind in ("day_move", "analyst"):
+        fields.append(("Schwelle in %", f"{rule.threshold:g}" if editing else "5", sd.parse_number))
+    elif kind == "earnings":
+        fields.append(("Tage vorher", str(rule.days) if editing else "3", parse_whole_days))
+
+    def apply(values):
+        symbol, *rest = values
+        number = rest[0] if rest else None
+        threshold = number if kind != "earnings" else None
+        days = number if kind == "earnings" else None
+        if editing:
+            ctl.update_rule(rule.id, symbol, threshold, days)
+        else:
+            ctl.add_rule(kind, symbol, threshold, days)
+    hints = {"price_above": "Meldet, sobald der Kurs die Schwelle erreicht oder übersteigt.",
+             "price_below": "Meldet, sobald der Kurs die Schwelle erreicht oder unterschreitet.",
+             "day_move": "Meldet, wenn die Aktie heute um mindestens so viele Prozent steigt oder fällt.",
+             "earnings": "Meldet Termine aus dem Kalender, die in so vielen Tagen oder früher anstehen.",
+             "news": "Meldet neue wichtige News der letzten 24 Stunden.",
+             "analyst": "Meldet, wenn sich das Durchschnitts-Kursziel um so viele Prozent verändert."}
+    return FieldDialog(f"{ALERT_NAMES[kind]}: " + ("ändern" if editing else "neue Regel"), hints[kind], fields, apply,
+                       ok_text="Speichern" if editing else "Anlegen").run()
+
+
+def alert_settings_dialog(ctl):
+    settings = ctl.alert_settings
+    fields = [("Benachrichtigungen insgesamt", Choice(ON_OFF, settings.enabled))]
+    fields += [(ALERT_NAMES[kind], Choice(ON_OFF, settings.type_enabled(kind))) for kind in alerts.KINDS]
+    fields += [("Zusammenfassung", Choice([(label, mode) for mode, label in alerts.DIGEST_MODES.items()],
+                                          settings.digest_mode)),
+               ("Uhrzeit (Stunde)", str(settings.digest_hour), parse_whole_days),
+               ("Wochentag (wöchentlich)", Choice([(name, number) for number, name in enumerate(alerts.WEEKDAY_NAMES)],
+                                                  settings.digest_weekday))]
+
+    def apply(values):
+        enabled, *rest = values
+        flags, (mode, hour, weekday) = rest[:len(alerts.KINDS)], rest[len(alerts.KINDS):]
+        if not 0 <= hour <= 23:
+            raise ValueError("Die Stunde liegt zwischen 0 und 23")
+        ctl.set_alert_settings(alerts.Settings(enabled, tuple(zip(alerts.KINDS, flags)), mode, hour, weekday))
+    return FieldDialog("Benachrichtigungen: Einstellungen",
+                       "Einzelne Arten lassen sich abschalten. Die Regeln bleiben dabei erhalten.", fields, apply,
+                       ok_text="Speichern", field_width=170).run()
+
+
+def digest_dialog(ctl):
+    title, text = ctl.digest_preview()
+    return FieldDialog(title, text, [], ok_text="OK", cancel=False).run()
+
+
+def delete_rule_dialog(ctl, rule):
+    return FieldDialog("Regel löschen", f"„{rule.describe()}“ wirklich löschen?", [],
+                       lambda _values: ctl.delete_rule(rule.id), ok_text="Löschen").run()
+
+
+def open_alerts(ctl, open_symbol=None):
+    existing = ALERT_WINDOWS.get("window")
+    if existing:
+        existing.raise_()
+        existing.activateWindow()
+        return
+    window = AlertsWindow(ctl, open_symbol)
+    window.closed.connect(lambda: ALERT_WINDOWS.pop("window", None))
+    ALERT_WINDOWS["window"] = window
+    Dock.add(window)
+    window.show()
+
+
+class AlertRuleRow(QFrame):
+    """Eine Regel: Beschreibung, Schalter, Test (zeigt, was sie jetzt melden würde), Ändern und Löschen."""
+
+    def __init__(self, ctl, rule):
+        super().__init__()
+        self.ctl, self.rule = ctl, rule
+        self.setObjectName("plain")
+        column = QVBoxLayout(self)
+        column.setContentsMargins(14, 10, 10, 10)
+        column.setSpacing(4)
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        left = QVBoxLayout()
+        left.setSpacing(0)
+        self.title = QLabel(rule.describe())
+        self.title.setWordWrap(True)
+        self.title.setStyleSheet("font-weight: 700;" + ("" if rule.enabled else f" color: {MUTED};"))
+        explain(self.title, ALERT_TERMS[rule.kind])
+        left.addWidget(self.title)
+        self.state = QLabel(self.state_text())
+        self.state.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        left.addWidget(self.state)
+        row.addLayout(left, 1)
+        self.toggle = QPushButton("an" if rule.enabled else "aus")
+        self.toggle.setObjectName("segment")
+        self.toggle.setCheckable(True)
+        self.toggle.setChecked(rule.enabled)
+        self.toggle.setToolTip("Regel ein- oder ausschalten")
+        self.toggle.clicked.connect(lambda: ctl.set_rule_enabled(rule.id, self.toggle.isChecked()))
+        self.test_button = QPushButton("Testen")
+        self.test_button.setToolTip("Zeigt, was diese Regel jetzt melden würde. Es wird nichts gemeldet oder gespeichert.")
+        self.test_button.clicked.connect(self.run_test)
+        self.edit_button = QPushButton("✎")
+        self.edit_button.setObjectName("icon")
+        self.edit_button.setToolTip("Regel ändern")
+        self.edit_button.clicked.connect(lambda: rule_dialog(ctl, rule.kind, rule))
+        self.delete_button = QPushButton("✕")
+        self.delete_button.setObjectName("icon")
+        self.delete_button.setToolTip("Regel löschen")
+        self.delete_button.clicked.connect(lambda: delete_rule_dialog(ctl, rule))
+        for button in (self.toggle, self.test_button, self.edit_button, self.delete_button):
+            row.addWidget(button, 0, Qt.AlignTop)
+        column.addLayout(row)
+        self.result = QLabel()
+        self.result.setWordWrap(True)
+        self.result.hide()
+        column.addWidget(self.result)
+
+    def state_text(self):
+        rule = self.rule
+        if not rule.enabled:
+            return "ausgeschaltet"
+        if rule.kind in alerts.PRICE_KINDS:
+            return "wartet auf die Schwelle" if rule.armed else "hat gemeldet, scharft sich wieder, wenn der Kurs zurückkehrt"
+        if rule.kind in alerts.BASELINE_KINDS and not rule.baselined:
+            return "merkt sich zuerst den Ist-Zustand"
+        return "aktiv"
+
+    def run_test(self):
+        evaluation = self.ctl.test_rule(self.rule)
+        head = "Würde jetzt melden:" if evaluation.would_fire else "Würde jetzt nichts melden."
+        self.result.setText(head + "\n" + "\n".join(evaluation.lines))
+        self.result.setStyleSheet(f"color: {AMBER if evaluation.would_fire else MUTED}; font-size: 12px;")
+        self.result.show()
+
+
+class AlertLogRow(QFrame):
+    """Ein gemeldeter Alarm im Verlauf."""
+    clicked = Signal(str)
+
+    def __init__(self, entry):
+        super().__init__()
+        self.entry = entry
+        self.setObjectName("card")
+        column = QVBoxLayout(self)
+        column.setContentsMargins(14, 8, 14, 8)
+        column.setSpacing(2)
+        top = QHBoxLayout()
+        self.title = QLabel(entry["title"])
+        self.title.setStyleSheet("font-weight: 700;")
+        self.title.setWordWrap(True)
+        top.addWidget(self.title, 1)
+        self.badge = QLabel("neu")
+        style_pill(self.badge, ACCENT, strong=True)
+        self.badge.setVisible(not entry["read"])
+        top.addWidget(self.badge, 0, Qt.AlignTop)
+        column.addLayout(top)
+        self.text = QLabel(entry["text"])
+        self.text.setWordWrap(True)
+        self.text.setStyleSheet(f"color: {MUTED};")
+        column.addWidget(self.text)
+        self.when = QLabel(f"{entry['fired_at']:%d.%m.%Y %H:%M}")
+        self.when.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        column.addWidget(self.when)
+        if entry["symbol"]:
+            self.setCursor(Qt.PointingHandCursor)
+
+    def mouseReleaseEvent(self, event):
+        if self.entry["symbol"] and event.button() == Qt.LeftButton and self.rect().contains(event.position().toPoint()):
+            self.clicked.emit(self.entry["symbol"])
+
+
+class AlertsWindow(QWidget):
+    """Regeln einrichten, testen und ausschalten sowie der Verlauf der gemeldeten Alarme."""
+    closed = Signal()
+
+    def __init__(self, ctl, open_symbol=None):
+        super().__init__()
+        self.setAttribute(Qt.WA_DeleteOnClose)
+        self.ctl, self.open_symbol = ctl, open_symbol
+        body = make_panel(self, "Alarme", self.close, pin=(ctl, "alerts"))
+        controls = QHBoxLayout()
+        controls.setSpacing(6)
+        self.add_button = QPushButton("+ Regel")
+        self.add_menu = make_menu()
+        self.add_actions = {}
+        for kind in alerts.KINDS:
+            self.add_actions[kind] = self.add_menu.addAction(ALERT_NAMES[kind],
+                                                              lambda k=kind: QTimer.singleShot(0, lambda: rule_dialog(ctl, k)))
+        self.add_button.setMenu(self.add_menu)
+        self.settings_button = QPushButton("Einstellungen")
+        self.settings_button.clicked.connect(lambda: alert_settings_dialog(ctl))
+        self.digest_button = QPushButton("Zusammenfassung")
+        self.digest_button.setToolTip("Zeigt, wie die Zusammenfassung jetzt aussähe")
+        self.digest_button.clicked.connect(lambda: digest_dialog(ctl))
+        for button in (self.add_button, self.settings_button, self.digest_button):
+            controls.addWidget(button)
+        controls.addStretch()
+        body.addLayout(controls)
+        self.status = QLabel()
+        self.status.setWordWrap(True)
+        self.status.setStyleSheet(f"color: {AMBER}; font-size: 12px;")
+        body.addWidget(self.status)
+        area, self.content = scroll_area()
+        body.addWidget(area, 1)
+        self.sections = QVBoxLayout()
+        self.sections.setSpacing(6)
+        self.content.addLayout(self.sections)
+        self.content.addStretch()
+        screen = QApplication.primaryScreen().availableGeometry()
+        self.setFixedSize(580, min(780, screen.height() - 20))
+        self.update_timer = QTimer(self)
+        self.update_timer.setSingleShot(True)
+        self.update_timer.setInterval(200)
+        self.update_timer.timeout.connect(self.refresh)
+        ctl.alerts_changed.connect(self.update_timer.start)
+        self.refresh()
+
+    def _heading(self, text, term=None):
+        label = caption_label(text)
+        self.sections.addWidget(explain(label, term) if term else label)
+
+    def refresh(self):
+        clear_layout(self.sections)
+        settings = self.ctl.alert_settings
+        self.status.setVisible(not settings.enabled)
+        self.status.setText("Alle Benachrichtigungen sind ausgeschaltet (Einstellungen).")
+        self._heading("Regeln", "benachrichtigungen")
+        if self.ctl.alert_rules:
+            for rule in self.ctl.alert_rules:
+                row = AlertRuleRow(self.ctl, rule)
+                if not settings.type_enabled(rule.kind):
+                    row.state.setText("diese Art ist in den Einstellungen ausgeschaltet")
+                self.sections.addWidget(row)
+        else:
+            note = QLabel("Noch keine Regeln. Mit „+ Regel“ legst du zum Beispiel einen Kursalarm an.")
+            note.setWordWrap(True)
+            note.setStyleSheet(f"color: {MUTED};")
+            self.sections.addWidget(note)
+        digest = alerts.DIGEST_MODES[settings.digest_mode]
+        self._heading("Zusammenfassung", "zusammenfassung")
+        info = QLabel(f"Zusammenfassung: {digest}" + (f", ab {settings.digest_hour}:00 Uhr" if settings.digest_mode != "off" else "")
+                      + (f" am {alerts.WEEKDAY_NAMES[settings.digest_weekday]}" if settings.digest_mode == "weekly" else ""))
+        info.setStyleSheet(f"color: {MUTED};")
+        self.sections.addWidget(info)
+        self._heading("Verlauf")
+        log = self.ctl.alert_log()
+        if not log:
+            note = QLabel("Noch keine Meldungen.")
+            note.setStyleSheet(f"color: {MUTED};")
+            self.sections.addWidget(note)
+        for entry in log:
+            row = AlertLogRow(entry)
+            if self.open_symbol:
+                row.clicked.connect(self.open_symbol)
+            self.sections.addWidget(row)
+
+    def closeEvent(self, event):
+        Dock.remove(self)
+        self.ctl.mark_alerts_read()
+        try:
+            self.ctl.alerts_changed.disconnect(self.update_timer.start)
+        except (RuntimeError, TypeError):
+            pass
+        self.closed.emit()
+        super().closeEvent(event)
+
+
 # ---------- Termine ----------
 
 STATUS_COLORS = {"confirmed": GREEN, "expected": AMBER, "speculative": "#a78bfa", "occurred": MUTED}
@@ -4438,6 +4914,8 @@ def restore_pinned(ctl, main):
             open_news(ctl, open_symbol=main.open_detail)
         elif kind == "tax":
             open_tax(ctl)
+        elif kind == "alerts":
+            open_alerts(ctl, open_symbol=main.open_detail)
         elif kind == "calendar" and (not symbol or symbol in ctl.symbols):
             open_calendar(ctl, symbol or None, open_symbol=main.open_detail)
         elif symbol in ctl.symbols and kind == "detail":
@@ -4529,6 +5007,7 @@ def main():
     tray_menu.addAction("Termine", lambda: open_calendar(ctl, open_symbol=window.open_detail))
     tray_menu.addAction("News", lambda: open_news(ctl, open_symbol=window.open_detail))
     tray_menu.addAction("Steuer", lambda: open_tax(ctl))
+    tray_menu.addAction("Alarme", lambda: open_alerts(ctl, open_symbol=window.open_detail))
     tray = QSystemTrayIcon(icon, app)
     notify = lambda title, text: tray.showMessage(title, text, QSystemTrayIcon.Information, 8000)
     tray_menu.addSeparator()
@@ -4538,6 +5017,13 @@ def main():
     tray_menu.addAction("Beenden", app.quit)
     tray.setToolTip("Aktien-Widget")
     tray.setContextMenu(tray_menu)
+    ctl.alert_fired.connect(notify)
+    tray.messageClicked.connect(lambda: open_alerts(ctl, open_symbol=window.open_detail))
+
+    def show_unread():
+        unread = ctl.unread_alerts()
+        tray.setToolTip("Aktien-Widget" + (f" · {unread} neue Meldung{'en' if unread != 1 else ''}" if unread else ""))
+    ctl.alerts_changed.connect(show_unread)
     tray.activated.connect(lambda reason: toggle_widget(ctl, window) if reason == QSystemTrayIcon.Trigger else None)
     tray.show()
 

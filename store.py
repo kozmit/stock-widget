@@ -114,6 +114,28 @@ CREATE TABLE IF NOT EXISTS search_terms (
     source TEXT NOT NULL,
     fetched_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS alert_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,
+    symbol TEXT,
+    threshold REAL,
+    days INTEGER,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    armed INTEGER NOT NULL DEFAULT 1,
+    baselined INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS alert_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    rule_id INTEGER,
+    dedupe_key TEXT NOT NULL UNIQUE,
+    symbol TEXT,
+    title TEXT NOT NULL,
+    text TEXT NOT NULL,
+    fired_at TEXT NOT NULL,
+    silent INTEGER NOT NULL DEFAULT 0,
+    read INTEGER NOT NULL DEFAULT 0
+);
 CREATE INDEX IF NOT EXISTS events_symbol ON events (symbol);
 CREATE UNIQUE INDEX IF NOT EXISTS events_external ON events (source, symbol, external_id) WHERE external_id IS NOT NULL;
 """
@@ -124,7 +146,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS events_external ON events (source, symbol, ext
 # 5: Termine (Ereigniskalender) mit Art, Zeitraum, Status, Quelle und Relevanz.
 # 6: Kennzahlen (Fundamentaldaten) je Aktie mit Quelle und Zeitpunkt des Abrufs.
 # 7: Suchbegriffe je Aktie (zum Filtern der News) mit Quelle und Zeitpunkt.
-SCHEMA_VERSION = "7"
+# 8: Benachrichtigungsregeln und das Protokoll der gemeldeten Alarme (mit Schlüssel gegen Doppelmeldungen).
+SCHEMA_VERSION = "8"
 EVENT_FIELDS = ("symbol", "kind", "title", "day", "end", "precision", "status", "relevance", "note", "source_url")
 INSTRUMENT_FIELDS = ("name", "exchange", "currency", "sector", "industry", "country", "isin")
 DEFAULT_SYMBOLS = ["AAPL", "MSFT", "DELL"]
@@ -262,6 +285,63 @@ class Store:
             "FROM instruments")
         return {r[0]: {**dict(zip(INSTRUMENT_FIELDS, r[1:8])), "source": r[8],
                        "fetched_at": dt.datetime.fromisoformat(r[9])} for r in rows}
+
+    # -- Benachrichtigungen (siehe alerts.py) --
+    RULE_COLUMNS = "id, kind, symbol, threshold, days, enabled, armed, baselined"
+
+    def add_rule(self, kind, symbol, threshold, days, now):
+        cursor = self.db.execute(
+            "INSERT INTO alert_rules (kind, symbol, threshold, days, created_at) VALUES (?, ?, ?, ?, ?)",
+            (kind, symbol, threshold, days, now.isoformat(timespec="seconds")))
+        self.db.commit()
+        return cursor.lastrowid
+
+    def update_rule(self, rule_id, symbol, threshold, days):
+        """Ändert die Angaben einer Regel; sie ist danach wieder scharf."""
+        self.db.execute("UPDATE alert_rules SET symbol = ?, threshold = ?, days = ?, armed = 1 WHERE id = ?",
+                        (symbol, threshold, days, rule_id))
+        self.db.commit()
+
+    def delete_rule(self, rule_id):
+        self.db.execute("DELETE FROM alert_rules WHERE id = ?", (rule_id,))
+        self.db.commit()
+
+    def set_rule_state(self, rule_id, enabled=None, armed=None, baselined=None):
+        for column, value in (("enabled", enabled), ("armed", armed), ("baselined", baselined)):
+            if value is not None:
+                self.db.execute(f"UPDATE alert_rules SET {column} = ? WHERE id = ?", (int(value), rule_id))
+        self.db.commit()
+
+    def rules(self):
+        """Alle Regeln als Zeilen (id, kind, symbol, threshold, days, enabled, armed, baselined), älteste zuerst."""
+        return [tuple(row) for row in self.db.execute(f"SELECT {self.RULE_COLUMNS} FROM alert_rules ORDER BY id")]
+
+    def log_alert(self, rule_id, key, symbol, title, text, now, silent=False):
+        """Trägt einen Alarm ins Protokoll ein. False, wenn der Schlüssel schon vorkommt (Doppelmeldung)."""
+        cursor = self.db.execute(
+            "INSERT OR IGNORE INTO alert_log (rule_id, dedupe_key, symbol, title, text, fired_at, silent, read) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (rule_id, key, symbol, title, text, now.isoformat(timespec="seconds"), int(silent), int(silent)))
+        self.db.commit()
+        return cursor.rowcount == 1
+
+    def alert_logged(self, key):
+        return self.db.execute("SELECT 1 FROM alert_log WHERE dedupe_key = ?", (key,)).fetchone() is not None
+
+    def alert_log(self, limit=200):
+        """Die gemeldeten Alarme, neueste zuerst (ohne die still gemerkten)."""
+        rows = self.db.execute(
+            "SELECT id, rule_id, symbol, title, text, fired_at, read FROM alert_log WHERE silent = 0 "
+            "ORDER BY id DESC LIMIT ?", (limit,))
+        return [{"id": r[0], "rule_id": r[1], "symbol": r[2], "title": r[3], "text": r[4],
+                 "fired_at": dt.datetime.fromisoformat(r[5]), "read": bool(r[6])} for r in rows]
+
+    def unread_alerts(self):
+        return self.db.execute("SELECT COUNT(*) FROM alert_log WHERE silent = 0 AND read = 0").fetchone()[0]
+
+    def mark_alerts_read(self):
+        self.db.execute("UPDATE alert_log SET read = 1 WHERE read = 0")
+        self.db.commit()
 
     # -- Kennzahlen (Fundamentaldaten) --
     def save_fundamentals(self, symbol, data, source, fetched_at):

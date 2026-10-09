@@ -1353,7 +1353,15 @@ class TermPopupTests(unittest.TestCase):
         self.page = QWidget()
         self.page.resize(700, 500)
         self.page.show()
-        self.addCleanup(self.page.close)
+        self.addCleanup(self.drop_page)
+
+    def drop_page(self):
+        """Löscht die Testseite samt ihrer Labels und deren Zeitgebern: ein noch laufender Hover-Zeitgeber würde sonst
+        im nächsten Test die Erklärung für ein altes Label öffnen."""
+        self.popup.close_term()
+        self.page.close()
+        self.page.deleteLater()
+        QApplication.sendPostedEvents(None, QEvent.DeferredDelete)
 
     def label(self, key="kgv", text="KGV", note="", x=20, y=20):
         label = QLabel(text, self.page)

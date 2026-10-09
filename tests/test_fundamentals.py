@@ -316,7 +316,7 @@ class StoreTests(unittest.TestCase):
         again = Store(self.path)
         self.addCleanup(again.close)
         self.assertEqual(again.fundamentals(), {})
-        self.assertEqual(again.meta("schema_version"), "7")
+        self.assertEqual(again.meta("schema_version"), "8")
 
 
 class ControllerTests(AppTestCase):

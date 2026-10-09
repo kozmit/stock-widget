@@ -154,6 +154,42 @@ GLOSSARY = _terms(
                                         "Minuten her ist oder der letzte Abruf fehlgeschlagen ist.",
          interpretation="Der letzte bekannte Kurs bleibt sichtbar, aber gelb und kursiv. Werte, die auf ihm beruhen, "
                         "sind dann nicht aktuell."),
+    # ---- Benachrichtigungen ----
+    Term("benachrichtigungen", "Benachrichtigungen (Alarme)",
+         "Regeln, die dich im Infobereich der Taskleiste melden, wenn etwas Bestimmtes eintritt: ein Kurs, eine "
+         "Tagesbewegung, ein bevorstehender Termin, eine wichtige News oder ein neues Kursziel.",
+         interpretation="Eine Regel meldet nur, wenn ihre Bedingung erfüllt ist, und jede Sache nur einmal. Kursalarme "
+                        "melden beim Überschreiten und sind erst wieder scharf, wenn der Kurs zurückgekehrt ist. Mit "
+                        "„Testen“ siehst du, was eine Regel jetzt melden würde. Mit veralteten Kursen wird nie "
+                        "gemeldet. Meldungen stehen zusätzlich im Verlauf."),
+    Term("alarm_kurs", "Kursalarm",
+         "Meldet, wenn der Kurs einer Aktie eine Schwelle erreicht: darüber oder darunter, in der Währung der Aktie.",
+         unit="Währung der Aktie",
+         interpretation="Nach der Meldung ist die Regel erst wieder scharf, wenn der Kurs die Schwelle wieder verlassen "
+                        "hat. So kommt nicht bei jedem Aktualisieren dieselbe Meldung."),
+    Term("alarm_tagesbewegung", "Tagesbewegung",
+         "Meldet, wenn eine Aktie am selben Tag um mindestens so viele Prozent gestiegen oder gefallen ist.",
+         unit="Prozent", interpretation="Je Aktie und Tag höchstens eine Meldung."),
+    Term("alarm_termin", "Termin-Erinnerung",
+         "Meldet, wenn ein Termin aus dem Kalender in so vielen Tagen oder früher bevorsteht.",
+         unit="Tage im Voraus",
+         interpretation="Die Meldung nennt auch den Status des Termins. Ein erwarteter oder spekulativer Termin wird nie "
+                        "als bestätigt gemeldet."),
+    Term("alarm_news", "Wichtige News",
+         "Meldet neue News der letzten 24 Stunden, die der News-Feed als wichtig einstuft: Zahlen, Prognose, Übernahme, "
+         "Zulassung, Rechtliches oder Führung.",
+         interpretation="Die Einstufung ist eine grobe Stichwort-Regel. Beim Anlegen der Regel wird der Bestand der "
+                        "News nur gemerkt, nicht gemeldet."),
+    Term("alarm_analyst", "Kursziel-Änderung",
+         "Meldet, wenn sich das durchschnittliche Kursziel der Analysten um mindestens so viele Prozent verändert hat.",
+         unit="Prozent",
+         interpretation="Verglichen wird mit dem Wert bei der letzten Meldung. Kursziele sind Schätzungen und folgen oft "
+                        "dem Kurs."),
+    Term("zusammenfassung", "Zusammenfassung",
+         "Eine tägliche oder wöchentliche Meldung: wie sich deine Positionen bewegt haben, welche Termine anstehen und wie "
+         "viele wichtige News es gab.",
+         interpretation="Sie kommt einmal je Tag oder Woche, ab der gewählten Uhrzeit, und nur, wenn die Kurse aktuell "
+                        "sind. Ist das Widget zur Uhrzeit nicht gelaufen, kommt sie beim nächsten Start."),
     # ---- Steuer ----
     Term("steuerbericht", "Steuerbericht",
          "Eine Schätzung der Steuer auf deine Aktienverkäufe eines Kalenderjahres, Schritt für Schritt gerechnet. Jede "
